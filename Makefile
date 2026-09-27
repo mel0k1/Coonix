@@ -29,7 +29,7 @@ USERS := shell hello forktest mtest fstest
 ULIBC := $(BUILD)/libc/string.o $(BUILD)/libc/stdio.o
 UELF  := $(USERS:%=$(BUILD)/user/%.elf)
 
-.PHONY: all iso disk run run-headless run-disk run-disk-headless clean
+.PHONY: all iso disk run run-headless run-disk run-disk-headless run-q35 run-q35-headless clean
 
 # keep linked user binaries around (make deletes intermediates otherwise)
 .PRECIOUS: $(UELF) $(BUILD)/user/%.o
@@ -126,3 +126,8 @@ clean:
 	rm -rf $(BUILD) $(ISO)
 
 -include $(KOBJ:.o=.d) $(ULIBC:.o=.d)
+run-q35: iso disk
+	$(QEMU) -M q35 -m 2G -cdrom $(ISO) -drive file=$(DISK),format=raw,if=none,id=hd0 -device ide-hd,drive=hd0,bus=ahci.0 -display gtk
+
+run-q35-headless: iso disk
+	$(QEMU) -M q35 -m 2G -cdrom $(ISO) -drive file=$(DISK),format=raw,if=none,id=hd0 -device ide-hd,drive=hd0,bus=ahci.0 -display none -serial stdio

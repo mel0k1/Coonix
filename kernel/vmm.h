@@ -6,6 +6,7 @@
 #define VMM_PRESENT 0x001
 #define VMM_WRITE   0x002
 #define VMM_USER    0x004
+#define VMM_PCD     0x010   // cache-disable (MMIO regions)
 #define VMM_NX      (1ULL << 63)
 // software pte bit (bit 9, cpu ignores it): page is cow-shared
 #define VMM_COW     0x200
@@ -19,6 +20,9 @@ uint64_t vmm_get_pte(uint64_t pml4, uint64_t vaddr);
 // change protection flags of a mapped range
 void vmm_mprotect(uint64_t pml4, uint64_t vaddr, uint64_t pages, uint64_t flags);
 void vmm_switch(uint64_t pml4);
+
+// map an MMIO physical range (cache-disabled) into the kernel half
+void *mmio_map(uint64_t phys, uint64_t size);
 
 // free all user-half pages + tables + the pml4 itself
 void vmm_destroy_user(uint64_t pml4);

@@ -121,6 +121,19 @@ void vmm_switch(uint64_t pml4_phys) {
     __asm__ volatile("mov %0, %%cr3" :: "r"(pml4_phys) : "memory");
 }
 
+// map an MMIO region into the kernel half, cache-disabled; hhdm covers it
+// when limine pre-mapped the hole, otherwise we add mappings on demand
+void *mmio_map(uint64_t phys, uint64_t size) {
+    for (uint64_t p = 0; p < size; p += PAGE_SIZE) {
+        uint64_t a = phys + p;
+        uint64_t va = (uint64_t)phys2virt(a) & ~0xfffULL;
+        if (!(vmm_get_pte(vmm_kernel_pml4(), va) & VMM_PRESENT))
+            vmm_map(vmm_kernel_pml4(), va, a & ~0xfffULL,
+                    VMM_PRESENT | VMM_WRITE | VMM_PCD);
+    }
+    return phys2virt(phys);
+}
+
 void vmm_destroy_user(uint64_t pml4_phys) {
     // walk user half (entries 0..255), drop refs on leaves and tables;
     // shared cow pages just decrement via pmm_free

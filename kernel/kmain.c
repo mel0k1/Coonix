@@ -17,7 +17,9 @@
 #include "tmpfs.h"
 #include "initramfs.h"
 #include "ata.h"
+#include "ahci.h"
 #include "ext2.h"
+#include "blkdev.h"
 
 // --- limine boot protocol requests ---
 
@@ -147,18 +149,28 @@ void kmain(void) {
     console_puts("heap ok\n");
 
     vfs_init();
-    uint64_t sectors = ata_init();
-    if (sectors) {
-        console_puts("ata0 master: ");
-        console_puts(ata_model());
+    // ahci first (q35 has no legacy ide), then ata pio (pc machine)
+    int ahci_ok = ahci_init();
+    if (ahci_ok == 0 && root_disk.ready) {
+        console_puts("disk: ");
+        console_puts(root_disk.name);
         console_puts(", ");
-        print_num(sectors >> 11);
-        console_puts(" MB, lba48\n");
+        print_num(root_disk.sectors >> 11);
+        console_puts(" MB, ahci dma\n");
     } else {
-        console_puts("ata: no disk on primary master\n");
+        uint64_t sectors = ata_init();
+        if (sectors && root_disk.ready) {
+            console_puts("disk: ");
+            console_puts(root_disk.name);
+            console_puts(", ");
+            print_num(root_disk.sectors >> 11);
+            console_puts(" MB, pio lba48\n");
+        } else {
+            console_puts("disk: none found\n");
+        }
     }
 
-    if (sectors && ext2_mount_root() == 0) {
+    if (root_disk.ready && ext2_mount_root() == 0) {
         console_puts("vfs: ext2 root mounted from disk\n");
     } else {
         tmpfs_mount();
