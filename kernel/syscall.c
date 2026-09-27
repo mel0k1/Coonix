@@ -3,83 +3,110 @@
 #include "kbd.h"
 #include "console.h"
 #include "string.h"
-#include "elf.h"
 #include "vmm.h"
 #include "gdt.h"
-
-// user programs for execve (objcopy'ed, see Makefile)
-extern const uint8_t _binary_shell_elf_start[];
-extern const uint8_t _binary_shell_elf_end[];
-extern const uint8_t _binary_hello_elf_start[];
-extern const uint8_t _binary_hello_elf_end[];
-
-static struct prog {
-    const char *name;
-    const uint8_t *start, *end;
-} progs[] = {
-    { "shell", _binary_shell_elf_start, _binary_shell_elf_end },
-    { "hello", _binary_hello_elf_start, _binary_hello_elf_end },
-    { 0, 0, 0 }
-};
-
-static const uint8_t *prog_find(const char *name, uint64_t *size) {
-    for (struct prog *p = progs; p->name; p++)
-        if (!strcmp(p->name, name)) {
-            *size = p->end - p->start;
-            return p->start;
-        }
-    return 0;
-}
+#include "vfs.h"
 
 // every handler sets r->rax and returns current frame rsp;
 // blocking ones return a switched rsp instead
 
+static struct file *fd_get(int fd) {
+    if (fd < 0 || fd >= FILE_MAX)
+        return 0;
+    return current->fds[fd];
+}
+
 static uint64_t sys_write(struct regs *r) {
+    struct file *f = fd_get((int)r->rdi);
     const char *buf = (const char *)r->rsi;
     uint64_t len = r->rdx;
-    for (uint64_t i = 0; i < len; i++)
-        console_putc(buf[i]);
-    r->rax = len;
+    if (!f) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
+    if (!f->vn) { // console
+        for (uint64_t i = 0; i < len; i++)
+            console_putc(buf[i]);
+        r->rax = len;
+        return (uint64_t)r;
+    }
+    long n = vfs_write(f, buf, len);
+    r->rax = n < 0 ? -1ULL : (uint64_t)n;
     return (uint64_t)r;
 }
 
 static uint64_t sys_read(struct regs *r) {
+    struct file *f = fd_get((int)r->rdi);
     char *buf = (char *)r->rsi;
-    char c = kbd_getchar();
-    if (c < 0) {
-        // sleep until keypress; int 0x80 replays on wake
-        current->wait_reason = WAIT_KBD;
-        current->state = T_BLOCKED;
-        return task_schedule((uint64_t)r);
+    if (!f) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
     }
-    buf[0] = c;
-    r->rax = 1;
+    if (!f->vn) { // console: blocking single-char read
+        char c = kbd_getchar();
+        if (c < 0) {
+            // sleep until keypress; int 0x80 replays on wake
+            current->wait_reason = WAIT_KBD;
+            current->state = T_BLOCKED;
+            return task_schedule((uint64_t)r);
+        }
+        buf[0] = c;
+        r->rax = 1;
+        return (uint64_t)r;
+    }
+    long n = vfs_read(f, buf, r->rdx);
+    r->rax = n < 0 ? -1ULL : (uint64_t)n;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_open(struct regs *r) {
+    const char *path = (const char *)r->rdi;
+    struct vnode *vn = vfs_resolve(path);
+    if (!vn) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
+    struct file *f = vfs_open(vn);
+    if (!f) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
+    int fd = task_fd_alloc(f);
+    if (fd < 0) {
+        vfs_close(f);
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
+    r->rax = fd;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_close(struct regs *r) {
+    int fd = (int)r->rdi;
+    struct file *f = fd_get(fd);
+    if (!f) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
+    current->fds[fd] = 0;
+    vfs_close(f);
+    r->rax = 0;
     return (uint64_t)r;
 }
 
 static uint64_t sys_execve(struct regs *r) {
     const char *name = (const char *)r->rdi;
-    uint64_t size;
-    const uint8_t *image = prog_find(name, &size);
-    if (!image) {
+    struct vnode *vn = vfs_resolve_prog(name);
+    if (!vn) {
         r->rax = -1ULL;
         return (uint64_t)r;
     }
-    uint64_t entry = elf_load_user(current->pml4, image, size);
-    if (!entry) {
+    uint64_t fr = task_exec_current(vn);
+    if (!fr) {
         r->rax = -1ULL;
         return (uint64_t)r;
     }
-    // fresh user image: rebuild iret frame on our kernel stack
-    struct regs *fr = (struct regs *)current->rsp;
-    memset(fr, 0, sizeof(*fr));
-    fr->rip = entry;
-    fr->cs = SEL_UCODE | 3;
-    fr->rflags = 0x202;
-    fr->rsp = USER_STACK_TOP - 16;
-    fr->ss = SEL_UDATA | 3;
-    r->rax = 0;
-    return (uint64_t)fr;
+    return fr;
 }
 
 static uint64_t sys_wait4(struct regs *r) {
@@ -104,6 +131,8 @@ uint64_t syscall_dispatch(struct regs *r) {
     switch (r->rax) {
     case SYS_read:    return sys_read(r);
     case SYS_write:   return sys_write(r);
+    case SYS_open:    return sys_open(r);
+    case SYS_close:   return sys_close(r);
     case SYS_getpid:  r->rax = current->pid; return (uint64_t)r;
     case SYS_fork: {
         struct task *c = task_fork(r);

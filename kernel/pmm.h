@@ -5,7 +5,10 @@
 void pmm_init(void);
 void *pmm_alloc(void);           // 1 page, dirty
 void *pmm_alloc_zeroed(void);    // 1 page, zeroed via hhdm
-void pmm_free(void *page);
+void pmm_free(void *page);       // drops one reference, frees at zero
+
+void pmm_ref(void *page);        // +1 sharer (copy-on-write fork)
+int pmm_refcount(void *page);    // sharers of a page
 
 uint64_t pmm_total_mem(void);    // bytes usable
 uint64_t pmm_free_mem(void);     // bytes free

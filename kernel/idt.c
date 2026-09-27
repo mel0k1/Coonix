@@ -4,6 +4,8 @@
 #include "console.h"
 #include "serial.h"
 #include "string.h"
+#include "task.h"
+#include "vmm.h"
 
 struct idt_entry {
     uint16_t offset_low;
@@ -88,8 +90,44 @@ static void print_hex64(uint64_t v) {
     serial_puts(buf);
 }
 
+static void print_dec(uint64_t v) {
+    char buf[21];
+    int i = 20;
+    buf[i] = 0;
+    if (!v) buf[--i] = '0';
+    while (v) { buf[--i] = '0' + v % 10; v /= 10; }
+    console_puts(&buf[i]);
+    serial_puts(&buf[i]);
+}
+
 // returns the (possibly switched) kernel rsp to iretq from
 uint64_t isr_handler(struct regs *r) {
+    if (r->int_no == 14) {
+        uint64_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        // cow faults are handled quietly
+        if (vmm_page_fault(r, cr2))
+            return (uint64_t)r;
+        // user-space fault (or kernel touching a bad user pointer): kill task
+        if ((r->cs & 3) || cr2 < 0x800000000000ULL) {
+            console_set_fg(0xff5555);
+            console_puts("\nsegfault: pid ");
+            print_dec(current->pid);
+            console_puts(" wrote 0x");
+            print_hex64(cr2);
+            console_puts("\n");
+            console_set_fg(CONSOLE_FG);
+            return task_exit_current(139); // 128 + SIGSEGV
+        }
+        console_set_fg(0xff5555);
+        console_puts("\npage fault in kernel at rip 0x");
+        print_hex64(r->rip);
+        console_puts(" cr2 0x");
+        print_hex64(cr2);
+        console_puts("\n");
+        panic("page fault");
+    }
+
     if (r->int_no < 32) {
         uint64_t cr2;
         __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));

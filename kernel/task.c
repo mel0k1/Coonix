@@ -8,33 +8,17 @@
 #include "elf.h"
 #include "pit.h"
 #include "gdt.h"
+#include "heap.h"
 
 struct task task_table[TASK_MAX];
 struct task *current;
 
-// embedded user programs (objcopy'ed, see Makefile)
-extern const uint8_t _binary_shell_elf_start[];
-extern const uint8_t _binary_shell_elf_end[];
-extern const uint8_t _binary_hello_elf_start[];
-extern const uint8_t _binary_hello_elf_end[];
-
-static struct prog {
-    const char *name;
-    const uint8_t *start, *end;
-} progs[] = {
-    { "shell", _binary_shell_elf_start, _binary_shell_elf_end },
-    { "hello", _binary_hello_elf_start, _binary_hello_elf_end },
-    { 0, 0, 0 }
+// static console fds: fd 0 = kbd in, 1/2 = console out
+static struct file console_fds[3] = {
+    { .vn = 0, .refs = 1, .is_console = 1 },
+    { .vn = 0, .refs = 1, .is_console = 1 },
+    { .vn = 0, .refs = 1, .is_console = 1 },
 };
-
-static const uint8_t *prog_find(const char *name, uint64_t *size) {
-    for (struct prog *p = progs; p->name; p++)
-        if (!strcmp(p->name, name)) {
-            *size = p->end - p->start;
-            return p->start;
-        }
-    return 0;
-}
 
 struct task *task_find_free(void) {
     for (int i = 0; i < TASK_MAX; i++)
@@ -57,6 +41,13 @@ static void map_kstack(struct task *t) {
         // is shared on pml4 level, so mapping into current pml4 is enough
         vmm_map(vmm_kernel_pml4(), va + i * PAGE_SIZE, (uint64_t)p,
                 VMM_PRESENT | VMM_WRITE);
+    }
+}
+
+static void fds_init(struct task *t) {
+    for (int i = 0; i < 3; i++) {
+        t->fds[i] = &console_fds[i];
+        console_fds[i].refs++;
     }
 }
 
@@ -83,31 +74,7 @@ struct task *task_spawn_kernel(void (*entry)(void)) {
 }
 
 void task_unmap_user(struct task *t) {
-    // walk user pml4 entries 0..255, free pages
-    uint64_t *pml4 = phys2virt(t->pml4);
-    for (int i = 0; i < 256; i++) {
-        if (!(pml4[i] & VMM_PRESENT))
-            continue;
-        uint64_t *pdp = phys2virt(pml4[i] & 0x000ffffffffff000ULL);
-        for (int j = 0; j < 512; j++) {
-            if (!(pdp[j] & VMM_PRESENT))
-                continue;
-            uint64_t *pd = phys2virt(pdp[j] & 0x000ffffffffff000ULL);
-            for (int k = 0; k < 512; k++) {
-                if (!(pd[k] & VMM_PRESENT))
-                    continue;
-                uint64_t *pt = phys2virt(pd[k] & 0x000ffffffffff000ULL);
-                for (int m = 0; m < 512; m++) {
-                    if (pt[m] & VMM_PRESENT)
-                        pmm_free((void *)(pt[m] & 0x000ffffffffff000ULL));
-                }
-                pmm_free((void *)(pd[k] & 0x000ffffffffff000ULL));
-            }
-            pmm_free((void *)(pdp[j] & 0x000ffffffffff000ULL));
-        }
-        pmm_free((void *)(pml4[i] & 0x000ffffffffff000ULL));
-        pml4[i] = 0;
-    }
+    vmm_destroy_user(t->pml4);
 }
 
 static void user_stack_setup(uint64_t pml4) {
@@ -121,12 +88,11 @@ static void user_stack_setup(uint64_t pml4) {
     }
 }
 
-struct task *task_spawn_user(const char *prog, struct task *parent) {
-    uint64_t size;
-    const uint8_t *image = prog_find(prog, &size);
-    if (!image)
+struct task *task_spawn_user(const char *path, struct task *parent) {
+    void *image;
+    long size = vfs_read_file(path, &image);
+    if (size < 0)
         return 0;
-
 
     struct task *t = task_find_free();
     if (!t)
@@ -139,15 +105,15 @@ struct task *task_spawn_user(const char *prog, struct task *parent) {
     t->pml4 = pml4;
     map_kstack(t);
 
-
     uint64_t entry = elf_load_user(t->pml4, image, size);
+    kfree(image);
 
     if (!entry) {
         t->state = T_FREE;
         return 0;
     }
     user_stack_setup(t->pml4);
-
+    fds_init(t);
 
     // iret frame for ring 3 entry
     struct regs *r = (struct regs *)(t->kstack_top - sizeof(struct regs));
@@ -162,7 +128,69 @@ struct task *task_spawn_user(const char *prog, struct task *parent) {
     return t;
 }
 
-// fork: clone current task with full page copy
+// exec current task with a new image from a vnode (execve / disk exec)
+uint64_t task_exec_current(struct vnode *vn) {
+    if (!vn || vn->type != VNODE_FILE)
+        return 0;
+    void *image = kmalloc(vn->size ? vn->size : 1);
+    if (!image)
+        return 0;
+    long size = vn->ops->read(vn, image, 0, vn->size);
+    if (size < 0) {
+        kfree(image);
+        return 0;
+    }
+
+    uint64_t old_cr3 = vmm_kernel_pml4();
+    uint64_t pml4 = vmm_create_pml4();
+    uint64_t entry = elf_load_user(pml4, image, size);
+    kfree(image);
+
+    if (!entry) {
+        // elf loader may have left us on the new pml4 — go back, then cleanup
+        vmm_switch(old_cr3);
+        vmm_destroy_user(pml4);
+        return 0;
+    }
+
+    // drop old image (we are on the new pml4 already), keep going on new one
+    vmm_destroy_user(current->pml4);
+    current->pml4 = pml4;
+    user_stack_setup(pml4);
+    task_close_fds(current, 1);
+
+    // fresh iret frame on our kernel stack
+    struct regs *fr = (struct regs *)current->rsp;
+    memset(fr, 0, sizeof(*fr));
+    fr->rip = entry;
+    fr->cs = SEL_UCODE | 3;
+    fr->rflags = 0x202;
+    fr->rsp = USER_STACK_TOP - 16;
+    fr->ss = SEL_UDATA | 3;
+    return (uint64_t)fr;
+}
+
+int task_fd_alloc(struct file *f) {
+    for (int i = 0; i < FILE_MAX; i++)
+        if (!current->fds[i]) {
+            current->fds[i] = f;
+            return i;
+        }
+    return -1;
+}
+
+void task_close_fds(struct task *t, int keep_console) {
+    for (int i = 0; i < FILE_MAX; i++) {
+        if (!t->fds[i])
+            continue;
+        if (keep_console && t->fds[i]->is_console)
+            continue;
+        vfs_close(t->fds[i]);
+        t->fds[i] = 0;
+    }
+}
+
+// fork: clone address space via copy-on-write
 struct task *task_fork(struct regs *frame) {
     struct task *c = task_find_free();
     if (!c)
@@ -187,8 +215,10 @@ struct task *task_fork(struct regs *frame) {
                 VMM_PRESENT | VMM_WRITE);
     }
 
-    // copy user address space (pml4 entries 0..255)
+    // cow-share user address space (pml4 entries 0..255): writable pages
+    // become read-only + COW in both tasks, faults privatize them later
     uint64_t *src_pml4 = phys2virt(current->pml4);
+    int downgraded = 0;
     for (int i = 0; i < 256; i++) {
         if (!(src_pml4[i] & VMM_PRESENT))
             continue;
@@ -204,20 +234,32 @@ struct task *task_fork(struct regs *frame) {
                 for (int m = 0; m < 512; m++) {
                     if (!(spt[m] & VMM_PRESENT))
                         continue;
-                    uint64_t src_phys = spt[m] & 0x000ffffffffff000ULL;
-                    void *newpage = pmm_alloc();
-                    if (!newpage)
-                        return 0;
-                    memcpy(phys2virt((uint64_t)newpage), phys2virt(src_phys), PAGE_SIZE);
-                    // build child pt path
+                    uint64_t pte = spt[m];
+                    uint64_t phys = pte & 0x000ffffffffff000ULL;
                     uint64_t va = ((uint64_t)i << 39) | ((uint64_t)j << 30) |
                                   ((uint64_t)k << 21) | ((uint64_t)m << 12);
-                    vmm_map(c->pml4, va, (uint64_t)newpage,
-                            (spt[m] & 0xffe) | (spt[m] & VMM_NX) | VMM_PRESENT);
+                    uint64_t flags = pte & 0xfff;   // incl. soft COW bit
+                    if (pte & VMM_WRITE) {
+                        flags &= ~VMM_WRITE;
+                        flags |= VMM_COW;
+                        spt[m] = (pte & ~VMM_WRITE) | VMM_COW; // parent too
+                        downgraded = 1;
+                    }
+                    vmm_map(pml4, va, phys, flags);
+                    pmm_ref((void *)phys);
                 }
             }
         }
     }
+    if (downgraded)
+        vmm_switch(current->pml4);   // flush stale RW tlb entries
+
+    // inherit open files
+    for (int i = 0; i < FILE_MAX; i++)
+        if (current->fds[i]) {
+            c->fds[i] = current->fds[i];
+            c->fds[i]->refs++;
+        }
 
     // child frame: copy of parent's, rax=0
     struct regs *cr = (struct regs *)(c->kstack_top - sizeof(struct regs));
@@ -228,7 +270,8 @@ struct task *task_fork(struct regs *frame) {
 }
 
 uint64_t task_exit_current(int code) {
-    task_unmap_user(current);
+    task_close_fds(current, 0);
+    vmm_destroy_user(current->pml4);
     current->exit_code = code;
     current->state = T_ZOMBIE;
     // wake parent if waiting
@@ -260,8 +303,15 @@ uint64_t task_schedule(uint64_t old_rsp) {
             break;
         }
     }
-    if (!next)
-        return current ? current->rsp : 0;
+    if (!next) {
+        // nobody ready: if we were running, keep running (idle spin);
+        // blocked/zombie current must never resume -> park on idle task
+        if (current->state == T_RUNNING)
+            return current->rsp;
+        next = &task_table[0];
+        if (next == current)
+            return current->rsp;
+    }
 
     if (current && current->state == T_RUNNING)
         current->state = T_READY; // preempted, will resume later

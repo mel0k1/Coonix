@@ -18,6 +18,7 @@ static int nregions;
 
 static uint8_t *bitmap;         // 1 bit per page, set = used
 static uint64_t bitmap_pages;
+static uint16_t *refs;          // sharers per page (cow fork)
 static uint64_t base, pages_total, pages_used;
 
 static inline int bit_test(uint64_t page) {
@@ -65,8 +66,9 @@ void pmm_init(void) {
     pages_total = (max - base) >> 12;
     uint64_t bitmap_bytes = (pages_total + 7) / 8;
     bitmap_pages = (bitmap_bytes + PAGE_SIZE - 1) >> 12;
+    uint64_t refs_bytes = pages_total * sizeof(uint16_t);
 
-    // place bitmap in the tail of the biggest usable region
+    // place bitmap + refcount array in the tail of the biggest usable region
     int best = -1;
     uint64_t best_len = 0;
     for (int i = 0; i < nregions; i++) {
@@ -75,12 +77,15 @@ void pmm_init(void) {
             best = i;
         }
     }
-    if (best < 0 || usable[best].len < bitmap_bytes)
+    if (best < 0 || usable[best].len < bitmap_bytes + refs_bytes)
         panic("pmm: no room for bitmap");
 
     uint64_t bitmap_phys = (usable[best].base + usable[best].len - bitmap_bytes) & ~0xfffULL;
+    uint64_t refs_phys = bitmap_phys - ((refs_bytes + PAGE_SIZE - 1) & ~0xfffULL);
     bitmap = phys2virt(bitmap_phys);
     memset(bitmap, 0xff, bitmap_bytes);
+    refs = phys2virt(refs_phys);
+    memset(refs, 0, refs_bytes);
 
     // free pages of all usable regions except bitmap pages
     for (int i = 0; i < nregions; i++) {
@@ -91,17 +96,18 @@ void pmm_init(void) {
             bit_clear(idx);
         }
     }
-    // mark bitmap pages used
-    for (uint64_t p = bitmap_phys; p < bitmap_phys + bitmap_pages * PAGE_SIZE; p += PAGE_SIZE)
+    // mark bitmap + refs pages used
+    for (uint64_t p = refs_phys; p < bitmap_phys + bitmap_pages * PAGE_SIZE; p += PAGE_SIZE)
         bit_set((p - base) >> 12);
 
-    pages_used = bitmap_pages;
+    pages_used = (bitmap_phys + bitmap_pages * PAGE_SIZE - refs_phys) / PAGE_SIZE;
 }
 
 void *pmm_alloc(void) {
     for (uint64_t p = 0; p < pages_total; p++) {
         if (!bit_test(p)) {
             bit_set(p);
+            refs[p] = 1;
             pages_used++;
             return (void *)(base + p * PAGE_SIZE);
         }
@@ -118,10 +124,26 @@ void *pmm_alloc_zeroed(void) {
 
 void pmm_free(void *page) {
     uint64_t p = ((uint64_t)page - base) >> 12;
+    if (refs[p] > 1) {
+        refs[p]--;         // still shared (cow), keep allocated
+        return;
+    }
+    refs[p] = 0;
     if (bit_test(p)) {
         bit_clear(p);
         pages_used--;
     }
+}
+
+void pmm_ref(void *page) {
+    uint64_t p = ((uint64_t)page - base) >> 12;
+    if (refs[p] < 0xffff)
+        refs[p]++;
+}
+
+int pmm_refcount(void *page) {
+    uint64_t p = ((uint64_t)page - base) >> 12;
+    return refs[p];
 }
 
 uint64_t pmm_total_mem(void) {
