@@ -122,6 +122,54 @@ static uint64_t sys_close(struct regs *r) {
     return (uint64_t)r;
 }
 
+// release a page range [s, e) inside a region: writeback shared file pages,
+// unmap, free frames (the file ref itself is dropped by the caller)
+static void mmap_release_range(struct mmap_region *m, uint64_t s, uint64_t e) {
+    if (m->file && (m->flags & MAP_SHARED)) {
+        for (uint64_t va = s; va < e; va += PAGE_SIZE) {
+            uint64_t pte = vmm_get_pte(current->pml4, va);
+            if ((pte & VMM_PRESENT) && (pte & PTE_DIRTY)) {
+                uint64_t foff = m->off + (va - m->start);
+                m->file->vn->ops->write(m->file->vn,
+                                        phys2virt(pte & 0x000ffffffffff000ULL),
+                                        foff, PAGE_SIZE);
+            }
+        }
+    }
+    for (uint64_t va = s; va < e; va += PAGE_SIZE) {
+        uint64_t phys = vmm_get_phys(current->pml4, va);
+        vmm_unmap(current->pml4, va);
+        if (phys)
+            pmm_free((void *)phys);
+    }
+}
+
+// split regions so that boundaries exist at s and e (no page changes);
+// keeps the list sorted. returns 0 ok, -1 out of memory
+static int mmap_ensure_bounds(uint64_t s, uint64_t e) {
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t at = pass == 0 ? s : e;
+        for (struct mmap_region *m = current->mmaps; m; m = m->next) {
+            if (!(m->start < at && at < m->end))
+                continue;
+            struct mmap_region *right = kmalloc(sizeof(*right));
+            if (!right)
+                return -1;
+            *right = *m;                      // same file/flags/prot
+            right->start = at;
+            right->off += at - m->start;
+            right->end = m->end;
+            m->end = at;
+            right->next = m->next;
+            m->next = right;
+            if (right->file)
+                right->file->refs++;          // both halves own a ref
+            m = right;   // 'at' can't also be inside right
+        }
+    }
+    return 0;
+}
+
 // mmap: anon args arrive in rdi/rsi/rdx/r10, fd in r8, offset in r9
 static uint64_t sys_mmap(struct regs *r) {
     uint64_t addr = r->rdi, len = r->rsi, prot = r->rdx, flags = r->r10;
@@ -129,7 +177,6 @@ static uint64_t sys_mmap(struct regs *r) {
     uint64_t off = r->r9;
     struct file *file = 0;
     uint64_t pml4 = current->pml4;
-
     if (!len || len > 0x40000000) {          // cap at 1 GiB per call
         r->rax = -1ULL;
         return (uint64_t)r;
@@ -173,12 +220,34 @@ static uint64_t sys_mmap(struct regs *r) {
         start = hint;
     }
 
-    // overlaps are always a bug, fixed or not
-    for (struct mmap_region *m = current->mmaps; m; m = m->next)
-        if (start < m->end && m->start < start + len) {
+    // overlaps are a bug unless MAP_FIXED, which carves out its range
+    // (linux semantics: only [start, start+len) is replaced, the rest of
+    // a straddling region stays)
+    if (flags & MAP_FIXED) {
+        if (mmap_ensure_bounds(start, start + len) < 0) {
             r->rax = -1ULL;
             return (uint64_t)r;
         }
+        for (struct mmap_region **pp = &current->mmaps; *pp;) {
+            struct mmap_region *m = *pp;
+            if (m->start >= start + len || m->end <= start) {
+                pp = &m->next;
+                continue;
+            }
+            // fully inside thanks to the bounds above
+            mmap_release_range(m, m->start, m->end);
+            *pp = m->next;
+            if (m->file)
+                vfs_close(m->file);
+            kfree(m);
+        }
+    } else {
+        for (struct mmap_region *m = current->mmaps; m; m = m->next)
+            if (start < m->end && m->start < start + len) {
+                r->rax = -1ULL;
+                return (uint64_t)r;
+            }
+    }
 
     // anonymous: map eagerly, zeroed. file-backed: record only, pages
     // appear on #PF (task_mmap_fault)
@@ -225,40 +294,27 @@ static uint64_t sys_munmap(struct regs *r) {
         return (uint64_t)r;
     }
     len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (!len)
+        len = PAGE_SIZE;
 
-    for (struct mmap_region **pp = &current->mmaps; *pp; pp = &(*pp)->next) {
-        struct mmap_region *m = *pp;
-        if (m->start != addr || m->end != addr + len)
-            continue;   // only whole-region munmap is supported
-
-        // shared file mapping: flush dirty pages back to the file
-        if (m->file && (m->flags & MAP_SHARED)) {
-            for (uint64_t va = m->start; va < m->end; va += PAGE_SIZE) {
-                uint64_t pte = vmm_get_pte(current->pml4, va);
-                if ((pte & VMM_PRESENT) && (pte & PTE_DIRTY)) {
-                    uint64_t foff = m->off + (va - m->start);
-                    m->file->vn->ops->write(m->file->vn,
-                                            phys2virt(pte & 0x000ffffffffff000ULL),
-                                            foff, PAGE_SIZE);
-                }
-            }
-        }
-
-        // unmap and release physical pages
-        for (uint64_t va = m->start; va < m->end; va += PAGE_SIZE) {
-            uint64_t phys = vmm_get_phys(current->pml4, va);
-            vmm_unmap(current->pml4, va);
-            if (phys)
-                pmm_free((void *)phys);
-        }
-        if (m->file)
-            vfs_close(m->file);
-        *pp = m->next;
-        kfree(m);
-        r->rax = 0;
+    // carve region boundaries, then drop every region inside [addr, addr+len)
+    if (mmap_ensure_bounds(addr, addr + len) < 0) {
+        r->rax = -1ULL;
         return (uint64_t)r;
     }
-    r->rax = -1ULL;
+    for (struct mmap_region **pp = &current->mmaps; *pp;) {
+        struct mmap_region *m = *pp;
+        if (m->start >= addr + len || m->end <= addr) {
+            pp = &m->next;
+            continue;
+        }
+        mmap_release_range(m, m->start, m->end);
+        *pp = m->next;
+        if (m->file)
+            vfs_close(m->file);
+        kfree(m);
+    }
+    r->rax = 0;
     return (uint64_t)r;
 }
 
@@ -274,6 +330,15 @@ static uint64_t sys_mprotect(struct regs *r) {
         vflags |= VMM_WRITE;
     if (!(prot & PROT_EXEC))
         vflags |= VMM_NX;
+    // lazy pages filled later must inherit the new perms too
+    uint64_t end = addr + pages * PAGE_SIZE;
+    if (mmap_ensure_bounds(addr, end) < 0) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
+    for (struct mmap_region *m = current->mmaps; m; m = m->next)
+        if (m->start >= addr && m->end <= end)
+            m->prot = prot;
     vmm_mprotect(current->pml4, addr, pages, vflags);
     r->rax = 0;
     return (uint64_t)r;
@@ -434,6 +499,8 @@ static uint64_t sys_fstat(struct regs *r) {
         st->size = f->vn->size;
         st->blksize = 1024;
         st->nlink = 1;
+        st->dev = f->vn->dev;
+        st->ino = f->vn->ino;
     }
     r->rax = 0;
     return (uint64_t)r;
@@ -474,6 +541,52 @@ static uint64_t sys_set_tid_address(struct regs *r) {
     return (uint64_t)r;
 }
 
+// SYS_newfstatat: dirfd + path ("" or AT_EMPTY_PATH => stat the fd itself)
+static uint64_t sys_newfstatat(struct regs *r) {
+    struct stat_k *st = (struct stat_k *)r->rdx;
+    const char *path = (const char *)r->rsi;
+    int empty = !path || !path[0] || (r->r10 & 0x1000);   // AT_EMPTY_PATH
+    if (!st || (!empty && !path)) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
+    struct vnode *vn = 0;
+    if (empty) {
+        struct file *f = fd_get((int)r->rdi);
+        if (f)
+            vn = f->vn;
+    } else {
+        vn = vfs_resolve(path);
+    }
+    if (!vn || vn->type != VNODE_FILE) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
+    memset(st, 0, sizeof(*st));
+    st->mode = 0x8000 | 0644;      // S_IFREG
+    st->size = vn->size;
+    st->blksize = 1024;
+    st->nlink = 1;
+    st->dev = vn->dev;
+    st->ino = vn->ino;
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_pread64(struct regs *r) {
+    struct file *f = fd_get((int)r->rdi);
+    uint8_t *buf = (uint8_t *)r->rsi;
+    uint64_t count = r->rdx;
+    uint64_t off = r->r10;   // arg4 lives in r10
+    if (!f || !f->vn) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
+    long n = f->vn->ops->read(f->vn, buf, off, count);
+    r->rax = n < 0 ? -1ULL : (uint64_t)n;
+    return (uint64_t)r;
+}
+
 static uint64_t sys_getrandom(struct regs *r) {
     uint8_t *buf = (uint8_t *)r->rdi;
     uint64_t len = r->rsi;
@@ -491,7 +604,10 @@ static uint64_t sys_openat(struct regs *r) {
     struct regs tmp = *r;
     tmp.rdi = r->rsi;   // path
     tmp.rsi = r->rdx;   // flags
-    return sys_open(&tmp);
+    (void)sys_open(&tmp);
+    // sys_open returned a frame rsp; the result itself is in tmp.rax
+    r->rax = tmp.rax;
+    return (uint64_t)r;
 }
 
 static uint64_t sys_wait4(struct regs *r) {
@@ -521,6 +637,8 @@ uint64_t syscall_dispatch(struct regs *r) {
     case SYS_openat:  return sys_openat(r);
     case SYS_close:   return sys_close(r);
     case SYS_fstat:   return sys_fstat(r);
+    case SYS_fstatat: return sys_newfstatat(r);
+    case SYS_pread64: return sys_pread64(r);
     case SYS_mmap:    return sys_mmap(r);
     case SYS_mprotect: return sys_mprotect(r);
     case SYS_munmap:  return sys_munmap(r);
@@ -546,5 +664,5 @@ uint64_t syscall_dispatch(struct regs *r) {
     default:
         r->rax = -1ULL;
         return (uint64_t)r;
-    }
+}
 }

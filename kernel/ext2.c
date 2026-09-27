@@ -226,6 +226,8 @@ static struct e2_node *node_get(uint32_t ino) {
     n->vn.size = n->inode.size_lo;
     n->vn.ops = &e2_ops;
     n->vn.fs_data = n;
+    n->vn.ino = ino;
+    n->vn.dev = 0x0302;   // fake makedev(3,2), stable per-fs id
     return n;
 }
 
@@ -631,7 +633,6 @@ static struct vnode *e2_create(struct vnode *dir, const char *name) {
     tmp.vn.type = VNODE_FILE;
     tmp.vn.ops = &e2_ops;
     tmp.vn.fs_data = &tmp;
-
     if (dirent_insert(d, ino, 1, name) < 0) {
         // roll the inode allocation back
         uint8_t *bm = blk_rw(((const struct e2_bgd *)blk_get(fs.bgd_block))->inode_bitmap);

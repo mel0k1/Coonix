@@ -24,6 +24,8 @@ struct vnode {
     uint64_t size;         // files: bytes; dirs: 0
     struct vfs_ops *ops;
     void *fs_data;         // fs-private inode
+    uint64_t ino;          // fs inode number (st_ino)
+    uint64_t dev;          // per-fs device id (st_dev)
 };
 
 // open file description, shared across fork

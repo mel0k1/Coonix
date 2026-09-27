@@ -106,6 +106,8 @@ def main():
     print(run("cat /test.txt"))
     print("=== glibc_hello ===")
     print(run("glibc_hello", 12))
+    print("=== hello_dyn ===")
+    print(run("hello_dyn", 15))
     print("=== ls / ===")
     print(run("ls"))
 

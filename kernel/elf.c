@@ -1,5 +1,6 @@
 #include "elf.h"
 #include "vmm.h"
+#include "heap.h"
 #include "pmm.h"
 #include "kernel.h"
 #include "console.h"
@@ -21,6 +22,7 @@ struct elf64_phdr {
 } __attribute__((packed));
 
 #define PT_LOAD 1
+#define PT_INTERP 3
 #define PF_X 1
 #define PF_W 2
 
@@ -38,6 +40,8 @@ uint64_t elf_load_user_info(uint64_t pml4, const void *elf, size_t size,
 
     if (info) {
         info->entry = 0;
+        info->jump = 0;
+        info->base = 0;
         info->image_end = 0;
         info->phdr_va = 0;
         info->phent = 0;
@@ -51,8 +55,14 @@ uint64_t elf_load_user_info(uint64_t pml4, const void *elf, size_t size,
     uint64_t top = 0;
     uint64_t base_va = 0;   // va of the segment covering the phdrs
     int have_base = 0;
+    uint64_t interp_off = 0, interp_sz = 0;   // PT_INTERP path string
     const struct elf64_phdr *ph = (const void *)((const uint8_t *)elf + eh->phoff);
     for (int i = 0; i < eh->phnum; i++) {
+        if (ph[i].type == PT_INTERP) {
+            interp_off = ph[i].offset;
+            interp_sz = ph[i].filesz;
+            continue;
+        }
         if (ph[i].type != PT_LOAD)
             continue;
         // remember the lowest segment: the phdrs live inside it
@@ -90,6 +100,63 @@ uint64_t elf_load_user_info(uint64_t pml4, const void *elf, size_t size,
         info->phdr_va = have_base ? base_va + eh->phoff : 0;
         info->phent = eh->phentsize;
         info->phnum = eh->phnum;
+    }
+
+    // dynamic program: load the interpreter too, jump to it instead
+    if (interp_off && interp_off + interp_sz <= size) {
+        const char *path = (const char *)elf + interp_off;
+        // keep it simple: the only interp we support is the linux default
+        static const char ld_path[] = "/lib64/ld-linux-x86-64.so.2";
+        uint64_t plen = sizeof(ld_path) - 1;
+        if (interp_sz < plen || __builtin_memcmp(path, ld_path, plen + 1) != 0) {
+            vmm_switch(old);
+            return 0;
+        }
+        // ld.so itself is an elf file the caller hands us via the vfs
+        void *ldimg = 0;
+        extern long vfs_read_file(const char *path, void **outbuf);
+        long ldsz = vfs_read_file(ld_path, &ldimg);
+        if (ldsz <= 0) {
+            vmm_switch(old);
+            return 0;
+        }
+        const struct elf64_hdr *le = ldimg;
+        const struct elf64_phdr *lph =
+            (const void *)((const uint8_t *)ldimg + le->phoff);
+        for (int i = 0; i < le->phnum; i++) {
+            if (lph[i].type != PT_LOAD)
+                continue;
+            uint64_t flags = VMM_PRESENT | VMM_USER | VMM_NX;
+            if (lph[i].flags & PF_W)
+                flags |= VMM_WRITE;
+            if (lph[i].flags & PF_X)
+                flags &= ~VMM_NX;
+            uint64_t start = INTERP_BASE + (lph[i].vaddr & ~0xfffULL);
+            uint64_t end = INTERP_BASE +
+                ((lph[i].vaddr + lph[i].memsz + 0xfff) & ~0xfffULL);
+            uint64_t wflags = flags | VMM_WRITE;
+            for (uint64_t va = start; va < end; va += PAGE_SIZE) {
+                void *page = pmm_alloc_zeroed();
+                if (!page) {
+                    kfree(ldimg);
+                    vmm_switch(old);
+                    return 0;
+                }
+                vmm_map(pml4, va, (uint64_t)page, wflags);
+            }
+            if (lph[i].filesz)
+                memcpy((void *)(INTERP_BASE + lph[i].vaddr),
+                       (const uint8_t *)ldimg + lph[i].offset, lph[i].filesz);
+            uint64_t iend = INTERP_BASE +
+                ((lph[i].vaddr + lph[i].memsz + 0xfff) & ~0xfffULL);
+            if (iend > top)
+                top = iend;
+        }
+        if (info) {
+            info->base = INTERP_BASE;
+            info->jump = INTERP_BASE + le->entry;
+        }
+        kfree(ldimg);
     }
     return eh->entry;
 }

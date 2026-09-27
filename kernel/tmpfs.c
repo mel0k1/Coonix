@@ -17,6 +17,7 @@ struct tnode {
 
 static struct tnode *troot;
 static int nnodes;
+static uint64_t tino;   // monotonic inode id for st_ino
 
 static struct vfs_ops tmpfs_ops;
 
@@ -135,6 +136,8 @@ static struct tnode *tnode_new(const char *name, int type, struct tnode *parent)
     t->vn.type = type;
     t->vn.ops = &tmpfs_ops;
     t->vn.fs_data = t;
+    t->vn.ino = ++tino;
+    t->vn.dev = 0x0009;   // distinct from ext2, stable per-fs id
     if (parent) {
         t->sibling = parent->child;
         parent->child = t;

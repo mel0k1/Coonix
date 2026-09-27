@@ -8,6 +8,8 @@
 #define SYS_open    2
 #define SYS_close   3
 #define SYS_fstat   5
+#define SYS_pread64 17
+#define SYS_fstatat 262
 #define SYS_mmap    9
 #define SYS_mprotect 10
 #define SYS_munmap  11

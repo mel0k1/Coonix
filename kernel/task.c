@@ -145,17 +145,18 @@ void task_mmap_clone(struct task *dst, const struct task *src) {
 // cow check says "not mine"
 int task_mmap_fault(struct regs *r, uint64_t cr2) {
     (void)r;
-    if (!current || (cr2 & 0xfff))
+    if (!current)
         return 0;
+    uint64_t page = cr2 & ~(PAGE_SIZE - 1);
     for (struct mmap_region *m = current->mmaps; m; m = m->next) {
-        if (cr2 < m->start || cr2 >= m->end)
+        if (page < m->start || page >= m->end)
             continue;
         if (!m->file)
             return 0;   // anon regions are mapped eagerly
         void *p = pmm_alloc_zeroed();
         if (!p)
             return 0;
-        uint64_t foff = m->off + (cr2 - m->start);
+        uint64_t foff = m->off + (page - m->start);
         long n = m->file->vn->ops->read(m->file->vn,
                                         phys2virt((uint64_t)p), foff,
                                         PAGE_SIZE);
@@ -166,7 +167,7 @@ int task_mmap_fault(struct regs *r, uint64_t cr2) {
             vflags |= VMM_WRITE;
         if (!(m->prot & 0x4))
             vflags |= VMM_NX;
-        vmm_map(current->pml4, cr2, (uint64_t)p, vflags);
+        vmm_map(current->pml4, page, (uint64_t)p, vflags);
         return 1;
     }
     return 0;
@@ -217,18 +218,18 @@ static uint64_t user_stack_build_args(uint64_t pml4, const char *prog,
 
     // envp: a minimal PATH
     const char *env = "PATH=/bin";
-    uint64_t elen = strlen(env) + 1;
+    uint64_t elen = 10;   // "PATH=/bin\0"
     sp -= elen;
     memcpy((void *)sp, env, elen);
     uint64_t env0 = sp;
 
     sp &= ~0xfULL;
 
-    // arg block: argc, argv[0], NULL, envp[0], NULL, 14 auxv pairs, AT_NULL
+    // arg block: argc, argv[0], NULL, envp[0], NULL, 15 auxv pairs, AT_NULL
     uint64_t block = 8 * 1         // argc
-                   + 8 * 2         // argv: ptr + NULL
+                   + 8 * 3         // argv: ptr + NULL
                    + 8 * 2         // envp: ptr + NULL
-                   + 8 * 2 * 14    // auxv pairs
+                   + 8 * 2 * 15    // auxv pairs
                    + 8 * 2;        // AT_NULL
     sp -= block;
     sp &= ~0xfULL;
@@ -244,7 +245,8 @@ static uint64_t user_stack_build_args(uint64_t pml4, const char *prog,
     AUXV(4, ei ? ei->phent : 0);      // AT_PHENT
     AUXV(5, ei ? ei->phnum : 0);      // AT_PHNUM
     AUXV(6, 4096);        // AT_PAGESZ
-    AUXV(9, ei ? ei->entry : 0);      // AT_ENTRY
+    AUXV(7, ei ? ei->base : 0);       // AT_BASE: ld.so load base
+    AUXV(9, ei ? ei->entry : 0);      // AT_ENTRY: program entry
     AUXV(11, 0);          // AT_UID
     AUXV(12, 0);          // AT_EUID
     AUXV(13, 0);          // AT_GID
@@ -302,7 +304,7 @@ struct task *task_spawn_user(const char *path, struct task *parent) {
     // iret frame for ring 3 entry
     struct regs *r = (struct regs *)(t->kstack_top - sizeof(struct regs));
     memset(r, 0, sizeof(*r));
-    r->rip = entry;
+    r->rip = ei.jump ? ei.jump : entry;
     r->cs = SEL_UCODE | 3;
     r->rflags = 0x202;
     r->rsp = entry_rsp;
@@ -362,7 +364,7 @@ uint64_t task_exec_current_named(struct vnode *vn, const char *name) {
     // fresh iret frame on our kernel stack
     struct regs *fr = (struct regs *)current->rsp;
     memset(fr, 0, sizeof(*fr));
-    fr->rip = entry;
+    fr->rip = ei.jump ? ei.jump : entry;
     fr->cs = SEL_UCODE | 3;
     fr->rflags = 0x202;
     fr->rsp = entry_rsp;
