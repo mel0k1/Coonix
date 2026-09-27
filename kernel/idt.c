@@ -108,6 +108,9 @@ uint64_t isr_handler(struct regs *r) {
         // cow faults are handled quietly
         if (vmm_page_fault(r, cr2))
             return (uint64_t)r;
+        // lazy fill of file-backed mappings
+        if (task_mmap_fault(r, cr2))
+            return (uint64_t)r;
         // user-space fault (or kernel touching a bad user pointer): kill task
         if ((r->cs & 3) || cr2 < 0x800000000000ULL) {
             console_set_fg(0xff5555);

@@ -50,7 +50,7 @@ static inline long wait(int *status) {
     return _sys(61, 0, (long)status, 0);
 }
 
-// 5-arg syscall: kernel reads args 4/5 from r10/r8 like linux
+// 6-arg syscall: kernel reads args 4/5/6 from r10/r8/r9 like linux
 static inline long _sys6(long n, long a, long b, long c, long d, long e) {
     long ret;
     register long _d __asm__("r10") = d;
@@ -58,6 +58,18 @@ static inline long _sys6(long n, long a, long b, long c, long d, long e) {
     __asm__ volatile("int $0x80"
                      : "=a"(ret)
                      : "a"(n), "D"(a), "S"(b), "d"(c), "r"(_d), "r"(_e)
+                     : "memory");
+    return ret;
+}
+
+static inline long _sys7(long n, long a, long b, long c, long d, long e, long f) {
+    long ret;
+    register long _d __asm__("r10") = d;
+    register long _e __asm__("r8") = e;
+    register long _f __asm__("r9") = f;
+    __asm__ volatile("int $0x80"
+                     : "=a"(ret)
+                     : "a"(n), "D"(a), "S"(b), "d"(c), "r"(_d), "r"(_e), "r"(_f)
                      : "memory");
     return ret;
 }
@@ -95,8 +107,10 @@ static inline void *sbrk(long delta) {
     return nw == cur + delta ? (void *)cur : (void *)-1;
 }
 
-static inline void *mmap(void *addr, unsigned long len, int prot, int flags) {
-    long ret = _sys6(9, (long)addr, (long)len, prot, flags, -1);
+// linux-style mmap: fd ignored for anonymous, off must be page aligned
+static inline void *mmap(void *addr, unsigned long len, int prot, int flags,
+                         int fd, unsigned long off) {
+    long ret = _sys7(9, (long)addr, (long)len, prot, flags, fd, (long)off);
     return ret < 0 ? MAP_FAILED : (void *)ret;
 }
 

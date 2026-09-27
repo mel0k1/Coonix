@@ -9,6 +9,10 @@
 #include "pit.h"
 #include "gdt.h"
 #include "heap.h"
+#include "vfs.h"
+
+#define MAP_SHARED 0x01
+#define PTE_DIRTY  0x040
 
 struct task task_table[TASK_MAX];
 struct task *current;
@@ -77,12 +81,28 @@ void task_unmap_user(struct task *t) {
     vmm_destroy_user(t->pml4);
 }
 
-// -- brk + mmap reservations ----------------------------------------------
+// -- mmap reservations ----------------------------------------------
 
-void task_mmap_reset(struct task *t) {
+// write dirty pages of a shared file mapping back to the file, then drop
+// the region list. page freeing stays with vmm_destroy_user.
+void task_mmap_teardown(struct task *t) {
     struct mmap_region *m = t->mmaps;
     while (m) {
         struct mmap_region *nx = m->next;
+        if (m->file) {
+            if (m->flags & MAP_SHARED) {
+                for (uint64_t va = m->start; va < m->end; va += PAGE_SIZE) {
+                    uint64_t pte = vmm_get_pte(t->pml4, va);
+                    if ((pte & VMM_PRESENT) && (pte & PTE_DIRTY)) {
+                        uint64_t foff = m->off + (va - m->start);
+                        m->file->vn->ops->write(m->file->vn,
+                                                phys2virt(pte & 0x000ffffffffff000ULL),
+                                                foff, PAGE_SIZE);
+                    }
+                }
+            }
+            vfs_close(m->file);
+        }
         kfree(m);
         m = nx;
     }
@@ -90,17 +110,50 @@ void task_mmap_reset(struct task *t) {
 }
 
 void task_mmap_clone(struct task *dst, const struct task *src) {
-    task_mmap_reset(dst);
+    task_mmap_teardown(dst);
     struct mmap_region **tail = &dst->mmaps;
     for (const struct mmap_region *m = src->mmaps; m; m = m->next) {
         struct mmap_region *c = kmalloc(sizeof(*c));
         if (!c)
             return;
         *c = *m;
+        if (m->file)
+            m->file->refs++;   // child holds its own reference
         c->next = 0;
         *tail = c;
         tail = &c->next;
     }
+}
+
+// lazy fill of a file-backed mapping; called from the #PF path after the
+// cow check says "not mine"
+int task_mmap_fault(struct regs *r, uint64_t cr2) {
+    (void)r;
+    if (!current || (cr2 & 0xfff))
+        return 0;
+    for (struct mmap_region *m = current->mmaps; m; m = m->next) {
+        if (cr2 < m->start || cr2 >= m->end)
+            continue;
+        if (!m->file)
+            return 0;   // anon regions are mapped eagerly
+        void *p = pmm_alloc_zeroed();
+        if (!p)
+            return 0;
+        uint64_t foff = m->off + (cr2 - m->start);
+        long n = m->file->vn->ops->read(m->file->vn,
+                                        phys2virt((uint64_t)p), foff,
+                                        PAGE_SIZE);
+        if (n < 0)
+            n = 0;   // beyond eof: page stays zero
+        uint64_t vflags = VMM_PRESENT | VMM_USER;
+        if (m->prot & 0x2)
+            vflags |= VMM_WRITE;
+        if (!(m->prot & 0x4))
+            vflags |= VMM_NX;
+        vmm_map(current->pml4, cr2, (uint64_t)p, vflags);
+        return 1;
+    }
+    return 0;
 }
 
 static void user_stack_setup(uint64_t pml4) {
@@ -182,12 +235,13 @@ uint64_t task_exec_current(struct vnode *vn) {
         return 0;
     }
 
-    // drop old image (we are on the new pml4 already), keep going on new one
+    // write back shared mappings, then drop old image (we are on the new
+    // pml4 already); pte walk must happen while the old pml4 still exists
+    task_mmap_teardown(current);
     vmm_destroy_user(current->pml4);
     current->pml4 = pml4;
     current->brk_base = (image_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     current->brk_cur = current->brk_base;
-    task_mmap_reset(current);
     user_stack_setup(pml4);
     task_close_fds(current, 1);
 
@@ -308,7 +362,7 @@ struct task *task_fork(struct regs *frame) {
 
 uint64_t task_exit_current(int code) {
     task_close_fds(current, 0);
-    task_mmap_reset(current);
+    task_mmap_teardown(current);
     vmm_destroy_user(current->pml4);
     current->exit_code = code;
     current->state = T_ZOMBIE;

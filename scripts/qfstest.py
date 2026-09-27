@@ -96,8 +96,12 @@ def main():
 
     print("=== BOOT ===")
     print(boot)
+    print("=== mtest ===")
+    print(run("mtest", 15))
     print("=== fstest ===")
     print(run("fstest", 15))
+    print("=== cat /shared.txt ===")
+    print(run("cat /shared.txt"))
     print("=== cat /test.txt ===")
     print(run("cat /test.txt"))
     print("=== ls / ===")

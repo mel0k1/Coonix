@@ -25,6 +25,8 @@
 #define PROT_WRITE 0x2
 #define PROT_EXEC  0x4
 
+#define PTE_DIRTY  0x040
+
 static struct file *fd_get(int fd) {
     if (fd < 0 || fd >= FILE_MAX)
         return 0;
@@ -119,16 +121,15 @@ static uint64_t sys_close(struct regs *r) {
     return (uint64_t)r;
 }
 
-// mmap flags arrive in r10 (arg 4), fd in r8 (arg 5)
+// mmap: anon args arrive in rdi/rsi/rdx/r10, fd in r8, offset in r9
 static uint64_t sys_mmap(struct regs *r) {
     uint64_t addr = r->rdi, len = r->rsi, prot = r->rdx, flags = r->r10;
+    int fd = (int)r->r8;
+    uint64_t off = r->r9;
+    struct file *file = 0;
     uint64_t pml4 = current->pml4;
 
     if (!len || len > 0x40000000) {          // cap at 1 GiB per call
-        r->rax = -1ULL;
-        return (uint64_t)r;
-    }
-    if (!(flags & MAP_ANONYMOUS)) {          // file-backed: not yet
         r->rax = -1ULL;
         return (uint64_t)r;
     }
@@ -139,6 +140,19 @@ static uint64_t sys_mmap(struct regs *r) {
     if (addr && !(flags & MAP_FIXED)) {
         r->rax = -1ULL;
         return (uint64_t)r;
+    }
+
+    if (!(flags & MAP_ANONYMOUS)) {
+        // file-backed: fd must name a regular file, offset page aligned
+        file = fd_get(fd);
+        if (!file || !file->vn || file->vn->type != VNODE_FILE) {
+            r->rax = -1ULL;
+            return (uint64_t)r;
+        }
+        if (off & 0xfff) {
+            r->rax = -1ULL;
+            return (uint64_t)r;
+        }
     }
 
     len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
@@ -165,17 +179,20 @@ static uint64_t sys_mmap(struct regs *r) {
             return (uint64_t)r;
         }
 
-    uint64_t vflags = VMM_PRESENT | VMM_USER;
-    if (prot & PROT_WRITE)
-        vflags |= VMM_WRITE;
-    if (!(prot & PROT_EXEC))
-        vflags |= VMM_NX;
-
-    for (uint64_t va = start; va < start + len; va += PAGE_SIZE) {
-        void *p = pmm_alloc_zeroed();
-        if (!p)
-            panic("mmap: out of pages");
-        vmm_map(pml4, va, (uint64_t)p, vflags);
+    // anonymous: map eagerly, zeroed. file-backed: record only, pages
+    // appear on #PF (task_mmap_fault)
+    if (!file) {
+        uint64_t vflags = VMM_PRESENT | VMM_USER;
+        if (prot & PROT_WRITE)
+            vflags |= VMM_WRITE;
+        if (!(prot & PROT_EXEC))
+            vflags |= VMM_NX;
+        for (uint64_t va = start; va < start + len; va += PAGE_SIZE) {
+            void *p = pmm_alloc_zeroed();
+            if (!p)
+                panic("mmap: out of pages");
+            vmm_map(pml4, va, (uint64_t)p, vflags);
+        }
     }
 
     struct mmap_region *m = kmalloc(sizeof(*m));
@@ -183,6 +200,12 @@ static uint64_t sys_mmap(struct regs *r) {
         panic("mmap: out of kernel heap");
     m->start = start;
     m->end = start + len;
+    m->file = file;
+    if (file)
+        file->refs++;   // region owns a reference until munmap/teardown
+    m->off = off;
+    m->prot = prot;
+    m->flags = flags;
     // keep the list sorted by start
     struct mmap_region **pp = &current->mmaps;
     while (*pp && (*pp)->start < start)
@@ -196,24 +219,45 @@ static uint64_t sys_mmap(struct regs *r) {
 
 static uint64_t sys_munmap(struct regs *r) {
     uint64_t addr = r->rdi, len = r->rsi;
+    if (addr & 0xfff) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
     len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
     for (struct mmap_region **pp = &current->mmaps; *pp; pp = &(*pp)->next) {
         struct mmap_region *m = *pp;
-        if (m->start == addr && m->end == addr + len) {
+        if (m->start != addr || m->end != addr + len)
+            continue;   // only whole-region munmap is supported
+
+        // shared file mapping: flush dirty pages back to the file
+        if (m->file && (m->flags & MAP_SHARED)) {
             for (uint64_t va = m->start; va < m->end; va += PAGE_SIZE) {
-                uint64_t phys = vmm_get_phys(current->pml4, va);
-                vmm_unmap(current->pml4, va);
-                if (phys)
-                    pmm_free((void *)phys);
+                uint64_t pte = vmm_get_pte(current->pml4, va);
+                if ((pte & VMM_PRESENT) && (pte & PTE_DIRTY)) {
+                    uint64_t foff = m->off + (va - m->start);
+                    m->file->vn->ops->write(m->file->vn,
+                                            phys2virt(pte & 0x000ffffffffff000ULL),
+                                            foff, PAGE_SIZE);
+                }
             }
-            *pp = m->next;
-            kfree(m);
-            r->rax = 0;
-            return (uint64_t)r;
         }
+
+        // unmap and release physical pages
+        for (uint64_t va = m->start; va < m->end; va += PAGE_SIZE) {
+            uint64_t phys = vmm_get_phys(current->pml4, va);
+            vmm_unmap(current->pml4, va);
+            if (phys)
+                pmm_free((void *)phys);
+        }
+        if (m->file)
+            vfs_close(m->file);
+        *pp = m->next;
+        kfree(m);
+        r->rax = 0;
+        return (uint64_t)r;
     }
-    r->rax = -1ULL;   // only whole-region munmap is supported
+    r->rax = -1ULL;
     return (uint64_t)r;
 }
 

@@ -10,11 +10,15 @@
 #define KSTACK_VA_BASE 0xffffffff90000000ULL  // per-pid slot, 64k each
 #define USER_STACK_TOP 0x7ffffffff000ULL
 #define USER_STACK_PAGES 16
-#define USER_MMAP_BASE 0x600000000000ULL      // anon mmap region grows up
+#define USER_MMAP_BASE 0x600000000000ULL      // mmap region grows up
 
-// anonymous mmap reservation (syscall 9/11)
+// mmap reservation (syscall 9/11); file = 0 for anonymous
 struct mmap_region {
     uint64_t start, end;
+    struct file *file;    // backing file, refcounted; 0 = anon
+    uint64_t off;         // file offset of region start
+    uint64_t prot;        // PROT_*
+    uint64_t flags;       // MAP_* (we care about MAP_SHARED)
     struct mmap_region *next;
 };
 
@@ -48,8 +52,10 @@ uint64_t task_schedule(uint64_t old_rsp);
 struct task *task_fork(struct regs *frame);
 uint64_t task_exit_current(int code);
 void task_unmap_user(struct task *t);
-void task_mmap_reset(struct task *t);      // drop mmap reservations
+void task_mmap_teardown(struct task *t);   // writeback shared, drop regions
 void task_mmap_clone(struct task *dst, const struct task *src);
+// lazy fill of a file-backed mapping on #PF; 1 = handled
+int task_mmap_fault(struct regs *r, uint64_t cr2);
 struct task *task_find_free(void);
 void task_wake_kbd(void);
 // exec current task with a new image from a vnode; returns new frame rsp, 0 on fail
