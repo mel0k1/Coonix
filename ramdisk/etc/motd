@@ -1,2 +1,2 @@
-Coonix 0.2.0 - vfs + tmpfs + cow fork
-binaries now come from the initramfs, enot approves
+Coonix 0.3.0 - ata + ext2 root + mmap/brk
+binaries now come from the real disk, enot approves

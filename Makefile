@@ -25,11 +25,14 @@ KSRC  := $(wildcard kernel/*.c)
 KASM  := $(wildcard kernel/*.asm)
 KOBJ  := $(KSRC:%.c=$(BUILD)/%.o) $(KASM:%.asm=$(BUILD)/%.o)
 
-USERS := shell hello forktest
+USERS := shell hello forktest mtest
 ULIBC := $(BUILD)/libc/string.o $(BUILD)/libc/stdio.o
 UELF  := $(USERS:%=$(BUILD)/user/%.elf)
 
-.PHONY: all iso run run-headless clean
+.PHONY: all iso disk run run-headless run-disk run-disk-headless clean
+
+# keep linked user binaries around (make deletes intermediates otherwise)
+.PRECIOUS: $(UELF) $(BUILD)/user/%.o
 
 all: $(KERNEL)
 
@@ -78,6 +81,15 @@ $(RDISK_ROOT)/etc/motd: ramdisk/etc/motd
 $(RAMDISK): $(USERS:%=$(RDISK_ROOT)/bin/%) $(RDISK_ROOT)/etc/motd
 	$(TAR) --format=ustar -C $(RDISK_ROOT) -cf $@ bin etc
 
+# --- disk: real ext2 image for the ata driver ---
+
+DISK := $(BUILD)/disk.img
+
+$(DISK): $(USERS:%=$(RDISK_ROOT)/bin/%) $(RDISK_ROOT)/etc/motd tools/mkdisk.py
+	python3 tools/mkdisk.py $(RDISK_ROOT) $@
+
+disk: $(DISK)
+
 # --- iso ---
 
 $(LIMINE_DIR)/limine: $(LIMINE_DIR)/limine.c
@@ -103,11 +115,12 @@ iso: $(KERNEL) $(RAMDISK) limine.conf $(LIMINE_DIR)/limine.c $(LIMINE_DIR)/limin
 	$(LIMINE_DIR)/limine bios-install $(ISO)
 	@echo "ISO ready: $(ISO)"
 
-run: iso
-	$(QEMU) -M q35 -m 2G -cdrom $(ISO) -display gtk
+# -M pc: piix3 ide with legacy ports, that is what the ata driver talks to
+run: iso disk
+	$(QEMU) -M pc -m 2G -cdrom $(ISO) -drive file=$(DISK),format=raw,if=ide,index=0 -display gtk
 
-run-headless: iso
-	$(QEMU) -M q35 -m 2G -cdrom $(ISO) -display none -serial stdio
+run-headless: iso disk
+	$(QEMU) -M pc -m 2G -cdrom $(ISO) -drive file=$(DISK),format=raw,if=ide,index=0 -display none -serial stdio
 
 clean:
 	rm -rf $(BUILD) $(ISO)

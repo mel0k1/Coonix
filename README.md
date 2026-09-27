@@ -33,23 +33,32 @@ make run      # запустить в qemu
 - [x] юзерспейс: мини-libc, shell, программы
 - [x] VFS + tmpfs, initramfs (ustar-модуль Limine)
 - [x] copy-on-write fork
+- [x] настоящий диск: ATA PIO LBA48 драйвер + ext2 (read-only) поверх VFS
+- [x] mmap (anonymous) / mprotect / munmap / brk — задел под glibc
+- [ ] запись на диск (ext2 rw)
+- [ ] AHCI/NVMe, tmpfs поверх VFS
 - [ ] портирование glibc
-- [ ] настоящий диск (ATA/AHCI) поверх VFS
 
 ## Как это устроено
 
 ```
-kernel/   ядро: загрузка, консоль, память, планировщик, vfs, syscalls
+kernel/   ядро: загрузка, консоль, память, планировщик, vfs, ata, ext2, syscalls
 libc/     мини-libc для юзерспейса (пока gcc -nostdlib)
-user/     программы: shell, hello, forktest
-ramdisk/  содержимое initramfs (etc/motd; bin/ наполняется при сборке)
+user/     программы: shell, hello, forktest, mtest
+ramdisk/  общий staging: попадает и в initramfs, и на диск (etc/motd; bin/ при сборке)
+tools/    mkdisk.py — сборка ext2-образа без root, checkdisk.py — проверка образа
 ```
 
 Ядро грузится Limine на `0xffffffff80000000` (higher half), физическая база
-`0x200000`. Пользовательские программы собираются в ELF и упаковываются в
-ustar-архив, который Limine передаёт ядру модулем (`module_path` в
-`limine.conf`): при загрузке ядро распаковывает его в tmpfs, и `execve`
-берёт бинарники уже из `/bin` через VFS.
+`0x200000`.
+
+**Настоящий диск.** `make run` поднимает QEMU на `-M pc` (PIIX3 IDE с legacy
+портами): ATA-драйвер в polling/LBA48 умеет `identify` и чтение секторов,
+поверх него работает read-only ext2 (суперблок, group descriptors, иноды,
+direct+indirect блоки, block cache), и он монтируется как корень. Образ диска
+(`build/disk.img`) собирает `tools/mkdisk.py` из того же staging-каталога, что
+и initramfs, — `execve` берёт `/bin/*` уже с настоящего диска. Если диска с
+ext2 нет, ядро откатывается на tmpfs + initramfs (ustar-модуль Limine).
 
 `fork` работает через copy-on-write: страницы помечаются read-only
 (софт-бит COW в PTE), refcounts ведутся в PMM, первый write ловит #PF,
