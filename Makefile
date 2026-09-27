@@ -3,12 +3,14 @@ CC      ?= gcc
 LD      ?= ld
 OBJCOPY ?= objcopy
 XORRISO ?= xorriso
+TAR     ?= tar
 QEMU    ?= qemu-system-x86_64
 
 LIMINE_DIR  ?= build/limine
 BUILD       := build
 KERNEL      := $(BUILD)/coonix.bin
 ISO         := coonix.iso
+RAMDISK     := $(BUILD)/initramfs.tar
 
 KCFLAGS := -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
 	   -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mno-80387 \
@@ -16,16 +18,16 @@ KCFLAGS := -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
 
 UCFLAGS := -nostdlib -nostartfiles -static -no-pie -fno-pic -fno-pie \
 	   -fno-stack-protector -fno-builtin -Wall -Wextra -O2 \
+	   -mno-mmx -mno-sse -mno-sse2 -mno-80387 \
 	   -I libc/include -MMD
 
 KSRC  := $(wildcard kernel/*.c)
 KASM  := $(wildcard kernel/*.asm)
 KOBJ  := $(KSRC:%.c=$(BUILD)/%.o) $(KASM:%.asm=$(BUILD)/%.o)
 
-USERS := shell hello
+USERS := shell hello forktest
 ULIBC := $(BUILD)/libc/string.o $(BUILD)/libc/stdio.o
 UELF  := $(USERS:%=$(BUILD)/user/%.elf)
-UBIN  := $(USERS:%=$(BUILD)/user/%_bin.o)
 
 .PHONY: all iso run run-headless clean
 
@@ -57,13 +59,24 @@ $(BUILD)/user/%.elf: $(BUILD)/user/%.o $(BUILD)/user/crt0.o $(ULIBC)
 	$(LD) -nostdlib -static -z max-page-size=0x1000 --build-id=none \
 	    -Ttext=0x400000 -e _start -o $@ $^
 
-# embed elf binaries into the kernel image
-$(BUILD)/user/%_bin.o: $(BUILD)/user/%.elf
-	cd $(BUILD)/user && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 $*.elf $*_bin.o
-
-$(KERNEL): $(KOBJ) $(UBIN) linker.ld
+$(KERNEL): $(KOBJ) linker.ld
 	$(LD) -nostdlib -static -T linker.ld -z max-page-size=0x1000 \
-	    -o $@ $(KOBJ) $(UBIN)
+	    -o $@ $(KOBJ)
+
+# --- initramfs: user binaries ride as a ustar module, kernel unpacks it ---
+
+RDISK_ROOT := $(BUILD)/initramfs_root
+
+$(RDISK_ROOT)/bin/%: $(BUILD)/user/%.elf
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+$(RDISK_ROOT)/etc/motd: ramdisk/etc/motd
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+$(RAMDISK): $(USERS:%=$(RDISK_ROOT)/bin/%) $(RDISK_ROOT)/etc/motd
+	$(TAR) --format=ustar -C $(RDISK_ROOT) -cf $@ bin etc
 
 # --- iso ---
 
@@ -74,9 +87,10 @@ $(LIMINE_DIR)/limine.c $(LIMINE_DIR)/limine-bios.sys:
 	git clone --depth=1 --branch=v9.x-binary \
 	    https://github.com/limine-bootloader/limine.git $(LIMINE_DIR)
 
-iso: $(KERNEL) limine.conf $(LIMINE_DIR)/limine.c $(LIMINE_DIR)/limine
+iso: $(KERNEL) $(RAMDISK) limine.conf $(LIMINE_DIR)/limine.c $(LIMINE_DIR)/limine
 	@mkdir -p $(BUILD)/iso_root/boot $(BUILD)/iso_root/EFI/BOOT
 	cp $(KERNEL) $(BUILD)/iso_root/boot/coonix.bin
+	cp $(RAMDISK) $(BUILD)/iso_root/boot/initramfs.tar
 	cp limine.conf $(BUILD)/iso_root/
 	cp $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin \
 	   $(LIMINE_DIR)/limine-uefi-cd.bin $(BUILD)/iso_root/boot/

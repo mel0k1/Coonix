@@ -13,6 +13,9 @@
 #include "pmm.h"
 #include "vmm.h"
 #include "heap.h"
+#include "vfs.h"
+#include "tmpfs.h"
+#include "initramfs.h"
 
 // --- limine boot protocol requests ---
 
@@ -41,6 +44,11 @@ __attribute__((used, section(".limine_requests")))
 volatile struct limine_stack_size_request stack_size_request = {
     .id = LIMINE_STACK_SIZE_REQUEST, .revision = 0,
     .stack_size = 0x40000
+};
+
+__attribute__((used, section(".limine_requests")))
+volatile struct limine_module_request module_request = {
+    .id = LIMINE_MODULE_REQUEST, .revision = 0
 };
 
 __attribute__((used, section(".limine_requests_end")))
@@ -117,8 +125,13 @@ void kmain(void) {
     kfree(b);
     console_puts("heap ok\n");
 
+    vfs_init();
+    tmpfs_mount();
+    initramfs_load();
+    console_puts("vfs: tmpfs mounted at /\n");
+
     task_init();
-    if (!task_spawn_user("shell", current))
+    if (!task_spawn_user("/bin/shell", current))
         panic("no shell");
     console_puts("ring 3 shell is up, kernel idles now\n");
 
