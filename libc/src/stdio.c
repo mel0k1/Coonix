@@ -47,7 +47,10 @@ void printf(const char *fmt, ...) {
         switch (*fmt) {
         case 's': {
             const char *s = __builtin_va_arg(ap, const char *);
-            puts(s ? s : "(null)");
+            if (!s) s = "(null)";
+            long len = 0;
+            while (s[len]) len++;
+            puts_n(s, len);
             break;
         }
         case 'c':

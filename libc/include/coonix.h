@@ -19,6 +19,15 @@ static inline long read(int fd, void *buf, unsigned long len) {
     return _sys(0, fd, (long)buf, (long)len);
 }
 
+static inline long open(const char *path, int flags, int mode) {
+    (void)flags; (void)mode;
+    return _sys(2, (long)path, flags, mode);
+}
+
+static inline long close(int fd) {
+    return _sys(3, fd, 0, 0);
+}
+
 static inline long getpid(void) {
     return _sys(39, 0, 0, 0);
 }
