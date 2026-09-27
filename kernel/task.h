@@ -39,6 +39,12 @@ struct task {
     uint64_t brk_base;    // past the last elf segment
     uint64_t brk_cur;     // current program break
     struct mmap_region *mmaps;  // sorted by start
+    uint64_t fs_base;     // user tls (arch_prctl)
+    uint64_t gs_base;
+    uint64_t clear_tid;   // set_tid_address
+    uint64_t kgs;         // kernel gs scratch: {kstack_top, user_rsp}
+    // elf image info for auxv
+    uint64_t phdr_va, phent, phnum, entry_va;
 };
 
 extern struct task task_table[TASK_MAX];
@@ -60,6 +66,8 @@ struct task *task_find_free(void);
 void task_wake_kbd(void);
 // exec current task with a new image from a vnode; returns new frame rsp, 0 on fail
 uint64_t task_exec_current(struct vnode *vn);
+// same, but name becomes argv[0] and auxv gets a fresh elf image info
+uint64_t task_exec_current_named(struct vnode *vn, const char *name);
 // lowest free fd >= 0, or -1
 int task_fd_alloc(struct file *f);
 void task_close_fds(struct task *t, int keep_console);

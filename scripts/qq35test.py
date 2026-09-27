@@ -52,8 +52,8 @@ class Qmp:
                 q = ch
                 shift = False
             elif ch == "_":
-                q = "underscore"
-                shift = False
+                q = "minus"
+                shift = True
             else:
                 continue
             if shift:
@@ -98,8 +98,12 @@ def main():
 
     print("=== BOOT (q35/ahci) ===")
     print(boot)
+    print("=== mtest ===")
+    print(run("mtest", 15))
     print("=== fstest ===")
     print(run("fstest", 15))
+    print("=== glibc_hello ===")
+    print(run("glibc_hello", 12))
     print("=== cat /test.txt ===")
     print(run("cat /test.txt"))
     print("=== ls ===")

@@ -46,3 +46,17 @@ static inline void enable_nxe(void) {
     __asm__ volatile("wrmsr" :: "A"(efer), "c"(0xC0000080));
 }
 
+// msr access (fs base for user tls lives in 0xC0000100)
+static inline void wrmsr(uint32_t msr, uint64_t val) {
+    __asm__ volatile("wrmsr" :: "c"(msr), "a"((uint32_t)val),
+                     "d"((uint32_t)(val >> 32)) : "memory");
+}
+static inline uint64_t rdmsr(uint32_t msr) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+#define MSR_FS_BASE 0xC0000100
+#define MSR_GS_BASE 0xC0000101
+

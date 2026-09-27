@@ -81,11 +81,22 @@ $(RDISK_ROOT)/etc/motd: ramdisk/etc/motd
 $(RAMDISK): $(USERS:%=$(RDISK_ROOT)/bin/%) $(RDISK_ROOT)/etc/motd
 	$(TAR) --format=ustar -C $(RDISK_ROOT) -cf $@ bin etc
 
+# --- glibc: static host-glibc binary, best effort (needs libc.a) ---
+
+GLIBC_PROGS := $(RDISK_ROOT)/bin/glibc_hello
+
+$(GLIBC_PROGS): user/glibc_hello.c
+	@if gcc -static -O2 -o $@ $< 2>/dev/null; then \
+		echo "glibc: built $@"; \
+	else \
+		rm -f $@; echo "glibc: no static libc, skipping"; \
+	fi
+
 # --- disk: real ext2 image for the ata driver ---
 
 DISK := $(BUILD)/disk.img
 
-$(DISK): $(USERS:%=$(RDISK_ROOT)/bin/%) $(RDISK_ROOT)/etc/motd tools/mkdisk.py
+$(DISK): $(USERS:%=$(RDISK_ROOT)/bin/%) $(RDISK_ROOT)/etc/motd $(GLIBC_PROGS) tools/mkdisk.py
 	python3 tools/mkdisk.py $(RDISK_ROOT) $@
 
 disk: $(DISK)

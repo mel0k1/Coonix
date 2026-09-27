@@ -171,11 +171,30 @@ def build(root):
         struct.pack_into("<I", raw, 28, nblocks * 2)
         for i, b in enumerate(blocks[:12]):
             struct.pack_into("<I", raw, 40 + 4 * i, b)
-        if len(blocks) > 12:
-            ind = img.alloc()
-            packed = b"".join(struct.pack("<I", b) for b in blocks[12:12 + 256])
-            img.write_block(ind, packed.ljust(BLOCK, b"\0"))
-            struct.pack_into("<I", raw, 40 + 4 * 12, ind)
+        rest = blocks[12:]
+
+        def pack_ptrs(ptrs):
+            ptrs = list(ptrs) + [0] * (256 - len(ptrs))
+            return b"".join(struct.pack("<I", p) for p in ptrs)
+
+        # singly indirect: 256 blocks
+        if rest:
+            ind1 = img.alloc()
+            img.write_block(ind1, pack_ptrs(rest[:256]))
+            struct.pack_into("<I", raw, 40 + 4 * 12, ind1)
+            rest = rest[256:]
+        # doubly indirect: 256 * 256 blocks (~256 MiB max)
+        if rest:
+            ind2 = img.alloc()
+            subs = []
+            while rest:
+                sub = img.alloc()
+                img.write_block(sub, pack_ptrs(rest[:256]))
+                subs.append(sub)
+                rest = rest[256:]
+            img.write_block(ind2, pack_ptrs(subs))
+            struct.pack_into("<I", raw, 40 + 4 * 13, ind2)
+        assert not rest, "triple indirect needed"
         img.write_inode(ino_of[rel], raw)
 
     img.write_super(used_blocks=img.next_block - 1,

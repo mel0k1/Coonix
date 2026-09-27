@@ -1,2 +1,2 @@
-Coonix 0.3.0 - ata + ext2 root + mmap/brk
-binaries now come from the real disk, enot approves
+Coonix 0.4.0 - ahci + ext2 rw + file mmap
+real glibc binaries now run, enot is proud

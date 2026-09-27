@@ -26,19 +26,40 @@ struct elf64_phdr {
 
 uint64_t elf_load_user(uint64_t pml4, const void *elf, size_t size,
                        uint64_t *image_end) {
+    (void)image_end;   // kept for the old call sites; use *_info for details
+    return elf_load_user_info(pml4, elf, size, 0);
+}
+
+uint64_t elf_load_user_info(uint64_t pml4, const void *elf, size_t size,
+                            struct elf_info *info) {
     const struct elf64_hdr *eh = elf;
     if (size < sizeof(*eh) || eh->ident[0] != 0x7f || eh->ident[1] != 'E')
         return 0;
+
+    if (info) {
+        info->entry = 0;
+        info->image_end = 0;
+        info->phdr_va = 0;
+        info->phent = 0;
+        info->phnum = 0;
+    }
 
     // switch so we can write into the new address space
     uint64_t old = vmm_kernel_pml4();
     vmm_switch(pml4);
 
     uint64_t top = 0;
+    uint64_t base_va = 0;   // va of the segment covering the phdrs
+    int have_base = 0;
     const struct elf64_phdr *ph = (const void *)((const uint8_t *)elf + eh->phoff);
     for (int i = 0; i < eh->phnum; i++) {
         if (ph[i].type != PT_LOAD)
             continue;
+        // remember the lowest segment: the phdrs live inside it
+        if (!have_base || ph[i].vaddr < base_va) {
+            base_va = ph[i].vaddr & ~0xfffULL;
+            have_base = 1;
+        }
         uint64_t flags = VMM_PRESENT | VMM_USER | VMM_NX;
         if (ph[i].flags & PF_W)
             flags |= VMM_WRITE;
@@ -63,7 +84,12 @@ uint64_t elf_load_user(uint64_t pml4, const void *elf, size_t size,
         if (end > top)
             top = end;
     }
-    if (image_end)
-        *image_end = top;
+    if (info) {
+        info->entry = eh->entry;
+        info->image_end = top;
+        info->phdr_va = have_base ? base_va + eh->phoff : 0;
+        info->phent = eh->phentsize;
+        info->phnum = eh->phnum;
+    }
     return eh->entry;
 }

@@ -116,8 +116,12 @@ uint64_t isr_handler(struct regs *r) {
             console_set_fg(0xff5555);
             console_puts("\nsegfault: pid ");
             print_dec(current->pid);
-            console_puts(" wrote 0x");
+            console_puts(r->err & 2 ? " wrote 0x" : " read/exec 0x");
             print_hex64(cr2);
+            console_puts(" rip 0x");
+            print_hex64(r->rip);
+            console_puts(" err ");
+            print_hex64(r->err);
             console_puts("\n");
             console_set_fg(CONSOLE_FG);
             return task_exit_current(139); // 128 + SIGSEGV

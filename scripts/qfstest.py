@@ -52,8 +52,8 @@ class Qmp:
                 q = ch
                 shift = False
             elif ch == "_":
-                q = "underscore"
-                shift = False
+                q = "minus"
+                shift = True
             else:
                 continue
             if shift:
@@ -104,6 +104,8 @@ def main():
     print(run("cat /shared.txt"))
     print("=== cat /test.txt ===")
     print(run("cat /test.txt"))
+    print("=== glibc_hello ===")
+    print(run("glibc_hello", 12))
     print("=== ls / ===")
     print(run("ls"))
 

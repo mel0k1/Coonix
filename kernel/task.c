@@ -14,6 +14,21 @@
 #define MAP_SHARED 0x01
 #define PTE_DIRTY  0x040
 
+// gs-relative scratch the syscall entry uses to find the kernel stack
+struct kgs_scratch {
+    uint64_t kstack_top;
+    uint64_t user_rsp;
+};
+
+static uint64_t kgs_alloc(uint64_t kstack_top) {
+    struct kgs_scratch *k = kmalloc(sizeof(*k));
+    if (!k)
+        panic("task: no kgs");
+    k->kstack_top = kstack_top;
+    k->user_rsp = 0;
+    return (uint64_t)k;
+}
+
 struct task task_table[TASK_MAX];
 struct task *current;
 
@@ -64,6 +79,7 @@ struct task *task_spawn_kernel(void (*entry)(void)) {
     t->state = T_READY;
     t->pml4 = vmm_kernel_pml4();
     map_kstack(t);
+    t->kgs = kgs_alloc(t->kstack_top);
 
     // forge a regs frame that "returns" into entry
     struct regs *r = (struct regs *)(t->kstack_top - sizeof(struct regs));
@@ -167,6 +183,85 @@ static void user_stack_setup(uint64_t pml4) {
     }
 }
 
+// builds the initial user stack contents: argv/envp strings, auxv, then
+// the arg vector itself. must run with the target pml4 active (kernel half
+// is shared, so heap + our stack keep working). returns final entry rsp.
+static uint64_t user_stack_build_args(uint64_t pml4, const char *prog,
+                                      const struct elf_info *ei) {
+    uint64_t old_cr3 = vmm_kernel_pml4();
+    if (old_cr3 != pml4)
+        vmm_switch(pml4);
+
+    // 16 pseudo-random bytes for glibc's stack canary (AT_RANDOM)
+    uint8_t rnd[16];
+    uint64_t seed = pit_ticks();
+    for (int i = 0; i < 16; i += 2) {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        *(uint16_t *)(rnd + i) = (uint16_t)(seed >> 33);
+    }
+
+    // strings grow down from the top of the stack
+    uint64_t sp = USER_STACK_TOP;
+
+    sp -= 16;
+    sp &= ~0xfULL;
+    for (int i = 0; i < 16; i++)
+        ((uint8_t *)sp)[i] = rnd[i];
+    uint64_t rand_ptr = sp;
+
+    // argv[0]
+    uint64_t plen = strlen(prog) + 1;
+    sp -= plen;
+    memcpy((void *)sp, prog, plen);
+    uint64_t argv0 = sp;
+
+    // envp: a minimal PATH
+    const char *env = "PATH=/bin";
+    uint64_t elen = strlen(env) + 1;
+    sp -= elen;
+    memcpy((void *)sp, env, elen);
+    uint64_t env0 = sp;
+
+    sp &= ~0xfULL;
+
+    // arg block: argc, argv[0], NULL, envp[0], NULL, 14 auxv pairs, AT_NULL
+    uint64_t block = 8 * 1         // argc
+                   + 8 * 2         // argv: ptr + NULL
+                   + 8 * 2         // envp: ptr + NULL
+                   + 8 * 2 * 14    // auxv pairs
+                   + 8 * 2;        // AT_NULL
+    sp -= block;
+    sp &= ~0xfULL;
+    uint64_t *a = (uint64_t *)sp;
+    int i = 0;
+    a[i++] = 1;           // argc
+    a[i++] = argv0;
+    a[i++] = 0;           // argv end
+    a[i++] = env0;
+    a[i++] = 0;           // envp end
+    #define AUXV(type, val) do { a[i++] = (uint64_t)(type); a[i++] = (uint64_t)(val); } while (0)
+    AUXV(3, ei ? ei->phdr_va : 0);    // AT_PHDR
+    AUXV(4, ei ? ei->phent : 0);      // AT_PHENT
+    AUXV(5, ei ? ei->phnum : 0);      // AT_PHNUM
+    AUXV(6, 4096);        // AT_PAGESZ
+    AUXV(9, ei ? ei->entry : 0);      // AT_ENTRY
+    AUXV(11, 0);          // AT_UID
+    AUXV(12, 0);          // AT_EUID
+    AUXV(13, 0);          // AT_GID
+    AUXV(14, 0);          // AT_EGID
+    AUXV(15, 0);          // AT_PLATFORM
+    AUXV(17, 100);        // AT_CLKTCK
+    AUXV(23, 0);          // AT_SECURE
+    AUXV(25, rand_ptr);   // AT_RANDOM: glibc aborts without it
+    AUXV(31, argv0);      // AT_EXECFN
+    #undef AUXV
+    a[i++] = 0;  a[i++] = 0;          // AT_NULL
+
+    if (old_cr3 != pml4)
+        vmm_switch(old_cr3);
+    return sp;
+}
+
 struct task *task_spawn_user(const char *path, struct task *parent) {
     void *image;
     long size = vfs_read_file(path, &image);
@@ -183,18 +278,26 @@ struct task *task_spawn_user(const char *path, struct task *parent) {
     uint64_t pml4 = vmm_create_pml4();
     t->pml4 = pml4;
     map_kstack(t);
+    t->kgs = kgs_alloc(t->kstack_top);
 
-    uint64_t entry = elf_load_user(t->pml4, image, size, &t->brk_base);
+    struct elf_info ei;
+    uint64_t entry = elf_load_user_info(t->pml4, image, size, &ei);
     kfree(image);
 
     if (!entry) {
         t->state = T_FREE;
         return 0;
     }
-    t->brk_base = (t->brk_base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    t->entry_va = ei.entry;
+    t->phdr_va = ei.phdr_va;
+    t->phent = ei.phent;
+    t->phnum = ei.phnum;
+    t->brk_base = (ei.image_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     t->brk_cur = t->brk_base;
     user_stack_setup(t->pml4);
     fds_init(t);
+
+    uint64_t entry_rsp = user_stack_build_args(t->pml4, path, &ei);
 
     // iret frame for ring 3 entry
     struct regs *r = (struct regs *)(t->kstack_top - sizeof(struct regs));
@@ -202,15 +305,16 @@ struct task *task_spawn_user(const char *path, struct task *parent) {
     r->rip = entry;
     r->cs = SEL_UCODE | 3;
     r->rflags = 0x202;
-    r->rsp = USER_STACK_TOP - 16;
+    r->rsp = entry_rsp;
     r->ss = SEL_UDATA | 3;
     t->rsp = (uint64_t)r;
     t->state = T_READY;
     return t;
 }
 
-// exec current task with a new image from a vnode (execve / disk exec)
-uint64_t task_exec_current(struct vnode *vn) {
+// exec current task with a new image from a vnode (execve / disk exec);
+// name is a kernel-side copy used as argv[0]
+uint64_t task_exec_current_named(struct vnode *vn, const char *name) {
     if (!vn || vn->type != VNODE_FILE)
         return 0;
     void *image = kmalloc(vn->size ? vn->size : 1);
@@ -224,8 +328,8 @@ uint64_t task_exec_current(struct vnode *vn) {
 
     uint64_t old_cr3 = vmm_kernel_pml4();
     uint64_t pml4 = vmm_create_pml4();
-    uint64_t image_end = 0;
-    uint64_t entry = elf_load_user(pml4, image, size, &image_end);
+    struct elf_info ei;
+    uint64_t entry = elf_load_user_info(pml4, image, size, &ei);
     kfree(image);
 
     if (!entry) {
@@ -240,10 +344,20 @@ uint64_t task_exec_current(struct vnode *vn) {
     task_mmap_teardown(current);
     vmm_destroy_user(current->pml4);
     current->pml4 = pml4;
-    current->brk_base = (image_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    current->brk_base = (ei.image_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     current->brk_cur = current->brk_base;
+    current->fs_base = 0;
+    current->gs_base = 0;
+    wrmsr(MSR_FS_BASE, 0);   // drop the old image's tls; gs stays kernel-owned
+    current->entry_va = ei.entry;
+    current->phdr_va = ei.phdr_va;
+    current->phent = ei.phent;
+    current->phnum = ei.phnum;
+    current->clear_tid = 0;
     user_stack_setup(pml4);
     task_close_fds(current, 1);
+
+    uint64_t entry_rsp = user_stack_build_args(pml4, name, &ei);
 
     // fresh iret frame on our kernel stack
     struct regs *fr = (struct regs *)current->rsp;
@@ -251,7 +365,7 @@ uint64_t task_exec_current(struct vnode *vn) {
     fr->rip = entry;
     fr->cs = SEL_UCODE | 3;
     fr->rflags = 0x202;
-    fr->rsp = USER_STACK_TOP - 16;
+    fr->rsp = entry_rsp;
     fr->ss = SEL_UDATA | 3;
     return (uint64_t)fr;
 }
@@ -300,6 +414,7 @@ struct task *task_fork(struct regs *frame) {
         vmm_map(vmm_kernel_pml4(), kva + i * PAGE_SIZE, (uint64_t)p,
                 VMM_PRESENT | VMM_WRITE);
     }
+    c->kgs = kgs_alloc(c->kstack_top);
 
     // cow-share user address space (pml4 entries 0..255): writable pages
     // become read-only + COW in both tasks, faults privatize them later
@@ -414,6 +529,9 @@ uint64_t task_schedule(uint64_t old_rsp) {
     current->state = T_RUNNING;
     tss_set_rsp0(current->kstack_top);
     vmm_switch(current->pml4);
+    // gs points at this task's syscall scratch; fs carries user tls
+    wrmsr(MSR_GS_BASE, current->kgs);
+    wrmsr(MSR_FS_BASE, current->fs_base);
     return current->rsp;
 }
 
@@ -425,6 +543,13 @@ void task_init(void) {
     current->state = T_RUNNING;
     current->pml4 = vmm_kernel_pml4();
     current->kstack_top = KSTACK_VA_BASE; // unused, we live on boot stack
+    current->kgs = kgs_alloc(KSTACK_VA_BASE);
+    wrmsr(MSR_GS_BASE, current->kgs);
     tss_set_rsp0(current->kstack_top);
     next_pid = 1;
+}
+
+// compat: exec without a program name
+uint64_t task_exec_current(struct vnode *vn) {
+    return task_exec_current_named(vn, "prog");
 }

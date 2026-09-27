@@ -9,6 +9,7 @@
 #include "heap.h"
 #include "kernel.h"
 #include "vfs.h"
+#include "pit.h"
 
 // every handler sets r->rax and returns current frame rsp;
 // blocking ones return a switched rsp instead
@@ -317,18 +318,180 @@ static uint64_t sys_brk(struct regs *r) {
 }
 
 static uint64_t sys_execve(struct regs *r) {
-    const char *name = (const char *)r->rdi;
+    const char *uname = (const char *)r->rdi;
+    // kernel-side copy of the program name (argv[0]); user pages are
+    // readable while the caller's cr3 is still active
+    char name[96];
+    int i = 0;
+    while (i < (int)sizeof(name) - 1) {
+        char c = uname[i];
+        name[i++] = c;
+        if (!c)
+            break;
+    }
+    name[sizeof(name) - 1] = 0;
+
     struct vnode *vn = vfs_resolve_prog(name);
     if (!vn) {
         r->rax = -1ULL;
         return (uint64_t)r;
     }
-    uint64_t fr = task_exec_current(vn);
+    uint64_t fr = task_exec_current_named(vn, name);
     if (!fr) {
         r->rax = -1ULL;
         return (uint64_t)r;
     }
     return fr;
+}
+
+// --- glibc-facing odds and ends ---
+
+struct iovec {
+    const void *base;
+    uint64_t len;
+};
+
+static uint64_t sys_writev(struct regs *r) {
+    int fd = (int)r->rdi;
+    const struct iovec *iv = (const struct iovec *)r->rsi;
+    uint64_t cnt = r->rdx;
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < cnt; i++) {
+        // reuse the write path by hand: fd may be the console
+        struct file *f = fd_get(fd);
+        if (!f) {
+            r->rax = -1ULL;
+            return (uint64_t)r;
+        }
+        const char *buf = iv[i].base;
+        uint64_t len = iv[i].len;
+        long n;
+        if (!f->vn) {
+            for (uint64_t j = 0; j < len; j++)
+                console_putc(buf[j]);
+            n = (long)len;
+        } else {
+            n = vfs_write(f, buf, len);
+            if (n < 0) {
+                r->rax = -1ULL;
+                return (uint64_t)r;
+            }
+        }
+        total += (uint64_t)n;
+    }
+    r->rax = total;
+    return (uint64_t)r;
+}
+
+struct utsname_k {
+    char sysname[65], nodename[65], release[65], version[65], machine[65],
+         domainname[65];
+};
+
+static uint64_t sys_uname(struct regs *r) {
+    struct utsname_k *u = (struct utsname_k *)r->rdi;
+    if (!u) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
+    memset(u, 0, sizeof(*u));
+    strcpy(u->sysname, "Linux");       // glibc cares little, but be polite
+    strcpy(u->nodename, "coonix");
+    strcpy(u->release, "6.1.0-coonix");
+    strcpy(u->version, "#1 SMP coonix");
+    strcpy(u->machine, "x86_64");
+    strcpy(u->domainname, "(none)");
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+// x86_64 glibc struct stat, 144 bytes
+struct stat_k {
+    uint64_t dev, ino, nlink;            // 24
+    uint32_t mode, uid, gid, pad0;       // 16 -> 40
+    uint64_t rdev, size, blksize, blocks;// 32 -> 72
+    uint64_t atim_sec, atim_nsec;        // 16 -> 88
+    uint64_t mtim_sec, mtim_nsec;        // 16 -> 104
+    uint64_t ctim_sec, ctim_nsec;        // 16 -> 120
+    uint64_t reserved[3];                // 24 -> 144
+};
+
+_Static_assert(sizeof(struct stat_k) == 144, "stat layout");
+
+static uint64_t sys_fstat(struct regs *r) {
+    struct file *f = fd_get((int)r->rdi);
+    struct stat_k *st = (struct stat_k *)r->rsi;
+    if (!f || !st) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
+    memset(st, 0, sizeof(*st));
+    if (!f->vn) {
+        st->mode = 0x2000 | 0620;      // S_IFCHR | tty-ish perms
+        st->blksize = 1024;
+    } else {
+        st->mode = 0x8000 | 0644;      // S_IFREG
+        st->size = f->vn->size;
+        st->blksize = 1024;
+        st->nlink = 1;
+    }
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+// ARCH_SET_FS 0x1002, ARCH_SET_GS 0x1001, ARCH_GET_FS 0x1003, ARCH_GET_GS 0x1004
+static uint64_t sys_arch_prctl(struct regs *r) {
+    uint64_t code = r->rdi, arg = r->rsi;
+    switch (code) {
+    case 0x1002:
+        current->fs_base = arg;
+        wrmsr(MSR_FS_BASE, arg);   // fs is free for user use
+        r->rax = 0;
+        break;
+    case 0x1001:
+        // gs is claimed by the kernel (syscall entry scratch); remember the
+        // requested value but never load it
+        current->gs_base = arg;
+        r->rax = 0;
+        break;
+    case 0x1003:
+        *(uint64_t *)arg = current->fs_base;
+        r->rax = 0;
+        break;
+    case 0x1004:
+        *(uint64_t *)arg = current->gs_base;
+        r->rax = 0;
+        break;
+    default:
+        r->rax = -1ULL;
+    }
+    return (uint64_t)r;
+}
+
+static uint64_t sys_set_tid_address(struct regs *r) {
+    current->clear_tid = r->rdi;
+    r->rax = (uint64_t)(long)current->pid;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_getrandom(struct regs *r) {
+    uint8_t *buf = (uint8_t *)r->rdi;
+    uint64_t len = r->rsi;
+    uint64_t seed = pit_ticks() ^ (r->rsp << 17);
+    for (uint64_t i = 0; i < len; i++) {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        buf[i] = (uint8_t)(seed >> 33);
+    }
+    r->rax = len;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_openat(struct regs *r) {
+    // dirfd ignored: only absolute paths resolve anyway
+    struct regs tmp = *r;
+    tmp.rdi = r->rsi;   // path
+    tmp.rsi = r->rdx;   // flags
+    return sys_open(&tmp);
 }
 
 static uint64_t sys_wait4(struct regs *r) {
@@ -353,21 +516,33 @@ uint64_t syscall_dispatch(struct regs *r) {
     switch (r->rax) {
     case SYS_read:    return sys_read(r);
     case SYS_write:   return sys_write(r);
+    case SYS_writev:  return sys_writev(r);
     case SYS_open:    return sys_open(r);
+    case SYS_openat:  return sys_openat(r);
     case SYS_close:   return sys_close(r);
+    case SYS_fstat:   return sys_fstat(r);
     case SYS_mmap:    return sys_mmap(r);
     case SYS_mprotect: return sys_mprotect(r);
     case SYS_munmap:  return sys_munmap(r);
     case SYS_brk:     return sys_brk(r);
     case SYS_getpid:  r->rax = current->pid; return (uint64_t)r;
+    case SYS_gettid:  r->rax = current->pid; return (uint64_t)r;
+    case SYS_getuid: case SYS_getgid: case SYS_geteuid:
+    case SYS_getegid: r->rax = 0; return (uint64_t)r;
+    case SYS_uname:   return sys_uname(r);
     case SYS_fork: {
         struct task *c = task_fork(r);
         r->rax = c ? (uint64_t)(long)c->pid : -1ULL;
         return (uint64_t)r;
     }
     case SYS_execve:  return sys_execve(r);
-    case SYS_exit:    return task_exit_current((int)r->rdi);
+    case SYS_exit:
+    case SYS_exit_group: return task_exit_current((int)r->rdi);
     case SYS_wait4:   return sys_wait4(r);
+    case SYS_arch_prctl: return sys_arch_prctl(r);
+    case SYS_set_tid_address: return sys_set_tid_address(r);
+    case SYS_set_robust_list: r->rax = 0; return (uint64_t)r;
+    case SYS_getrandom: return sys_getrandom(r);
     default:
         r->rax = -1ULL;
         return (uint64_t)r;

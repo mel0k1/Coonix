@@ -67,6 +67,35 @@ LIMINE_REQUESTS_END_MARKER
 
 static uint64_t hhdm;
 
+// sse/x87 for user space: glibc binaries use xmm freely
+static void enable_fpu_sse(void) {
+    uint64_t cr0;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~(1UL << 2);   // clear EM (emulate fpu -> #ud)
+    cr0 |= (1UL << 1);    // set MP
+    __asm__ volatile("mov %0, %%cr0" :: "r"(cr0) : "memory");
+    uint64_t cr4;
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1UL << 9);    // OSFXSR: save/restore xmm in fxsave area
+    cr4 |= (1UL << 17);   // OSXMMEXCPT: #XF instead of illegal opcode
+    __asm__ volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
+    __asm__ volatile("fninit");
+}
+
+extern void syscall_entry(void);
+
+// enable the native syscall instruction (linux binaries use it)
+static void syscall_init(void) {
+    uint64_t efer = rdmsr(0xC0000080);
+    wrmsr(0xC0000080, efer | 1);   // EFER.SCE
+    // STAR: kernel cs/ss at 32..47, user cs/ss at 48..63 (ss = cs + 8)
+    wrmsr(0xC0000081,
+          ((uint64_t)SEL_UCODE << 48) | ((uint64_t)SEL_KCODE << 32));
+    wrmsr(0xC0000082, (uint64_t)&syscall_entry);            // LSTAR
+    // FMASK: rflags &= FMASK on entry (linux value)
+    wrmsr(0xC0000084, 0x257FD5UL);
+}
+
 static void print_num(uint64_t v) {
     char buf[21];
     int i = 20;
@@ -112,8 +141,10 @@ void kmain(void) {
     console_puts("limine says hi, kernel is alive\n");
 
     enable_nxe(); // we use NX bit in page tables
+    enable_fpu_sse();
     gdt_init();
     idt_init();
+    syscall_init();
     pit_init(100);
     kbd_init();
     console_puts("gdt, idt, pit, kbd ready\n");
