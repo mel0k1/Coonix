@@ -16,6 +16,8 @@ void vmm_map(uint64_t pml4, uint64_t vaddr, uint64_t paddr, uint64_t flags);
 void vmm_unmap(uint64_t pml4, uint64_t vaddr);
 uint64_t vmm_get_phys(uint64_t pml4, uint64_t vaddr); // 0 if unmapped
 uint64_t vmm_get_pte(uint64_t pml4, uint64_t vaddr);
+// change protection flags of a mapped range
+void vmm_mprotect(uint64_t pml4, uint64_t vaddr, uint64_t pages, uint64_t flags);
 void vmm_switch(uint64_t pml4);
 
 // free all user-half pages + tables + the pml4 itself

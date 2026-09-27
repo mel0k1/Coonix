@@ -24,7 +24,8 @@ struct elf64_phdr {
 #define PF_X 1
 #define PF_W 2
 
-uint64_t elf_load_user(uint64_t pml4, const void *elf, size_t size) {
+uint64_t elf_load_user(uint64_t pml4, const void *elf, size_t size,
+                       uint64_t *image_end) {
     const struct elf64_hdr *eh = elf;
     if (size < sizeof(*eh) || eh->ident[0] != 0x7f || eh->ident[1] != 'E')
         return 0;
@@ -33,6 +34,7 @@ uint64_t elf_load_user(uint64_t pml4, const void *elf, size_t size) {
     uint64_t old = vmm_kernel_pml4();
     vmm_switch(pml4);
 
+    uint64_t top = 0;
     const struct elf64_phdr *ph = (const void *)((const uint8_t *)elf + eh->phoff);
     for (int i = 0; i < eh->phnum; i++) {
         if (ph[i].type != PT_LOAD)
@@ -58,6 +60,10 @@ uint64_t elf_load_user(uint64_t pml4, const void *elf, size_t size) {
         if (ph[i].filesz)
             memcpy((void *)ph[i].vaddr, (const uint8_t *)elf + ph[i].offset, ph[i].filesz);
         // TODO: drop write bit for read-only segments (W^X)
+        if (end > top)
+            top = end;
     }
+    if (image_end)
+        *image_end = top;
     return eh->entry;
 }

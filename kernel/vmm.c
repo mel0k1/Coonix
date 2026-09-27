@@ -92,6 +92,31 @@ uint64_t vmm_get_pte(uint64_t pml4_phys, uint64_t vaddr) {
     return pt[(vaddr >> 12) & 0x1ff];
 }
 
+// re-protect an existing range (mprotect); pages must be mapped
+void vmm_mprotect(uint64_t pml4, uint64_t vaddr, uint64_t pages, uint64_t flags) {
+    uint64_t *pml4t = phys2virt(pml4);
+    for (uint64_t p = 0; p < pages; p++) {
+        uint64_t va = vaddr + p * PAGE_SIZE;
+        uint64_t e1 = pml4t[(va >> 39) & 0x1ff];
+        if (!(e1 & VMM_PRESENT))
+            continue;
+        uint64_t *pdp = phys2virt(e1 & 0x000ffffffffff000ULL);
+        uint64_t e2 = pdp[(va >> 30) & 0x1ff];
+        if (!(e2 & VMM_PRESENT))
+            continue;
+        uint64_t *pd = phys2virt(e2 & 0x000ffffffffff000ULL);
+        uint64_t e3 = pd[(va >> 21) & 0x1ff];
+        if (!(e3 & VMM_PRESENT))
+            continue;
+        uint64_t *pt = phys2virt(e3 & 0x000ffffffffff000ULL);
+        uint64_t *pte = &pt[(va >> 12) & 0x1ff];
+        if (!(*pte & VMM_PRESENT))
+            continue;
+        *pte = (*pte & ~0x1fe & ~VMM_NX) | (flags & 0x1fe) | (flags & VMM_NX);
+        __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+    }
+}
+
 void vmm_switch(uint64_t pml4_phys) {
     __asm__ volatile("mov %0, %%cr3" :: "r"(pml4_phys) : "memory");
 }

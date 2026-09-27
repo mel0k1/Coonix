@@ -77,6 +77,32 @@ void task_unmap_user(struct task *t) {
     vmm_destroy_user(t->pml4);
 }
 
+// -- brk + mmap reservations ----------------------------------------------
+
+void task_mmap_reset(struct task *t) {
+    struct mmap_region *m = t->mmaps;
+    while (m) {
+        struct mmap_region *nx = m->next;
+        kfree(m);
+        m = nx;
+    }
+    t->mmaps = 0;
+}
+
+void task_mmap_clone(struct task *dst, const struct task *src) {
+    task_mmap_reset(dst);
+    struct mmap_region **tail = &dst->mmaps;
+    for (const struct mmap_region *m = src->mmaps; m; m = m->next) {
+        struct mmap_region *c = kmalloc(sizeof(*c));
+        if (!c)
+            return;
+        *c = *m;
+        c->next = 0;
+        *tail = c;
+        tail = &c->next;
+    }
+}
+
 static void user_stack_setup(uint64_t pml4) {
     // 16 pages below USER_STACK_TOP
     for (int i = 0; i < USER_STACK_PAGES; i++) {
@@ -105,13 +131,15 @@ struct task *task_spawn_user(const char *path, struct task *parent) {
     t->pml4 = pml4;
     map_kstack(t);
 
-    uint64_t entry = elf_load_user(t->pml4, image, size);
+    uint64_t entry = elf_load_user(t->pml4, image, size, &t->brk_base);
     kfree(image);
 
     if (!entry) {
         t->state = T_FREE;
         return 0;
     }
+    t->brk_base = (t->brk_base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    t->brk_cur = t->brk_base;
     user_stack_setup(t->pml4);
     fds_init(t);
 
@@ -143,7 +171,8 @@ uint64_t task_exec_current(struct vnode *vn) {
 
     uint64_t old_cr3 = vmm_kernel_pml4();
     uint64_t pml4 = vmm_create_pml4();
-    uint64_t entry = elf_load_user(pml4, image, size);
+    uint64_t image_end = 0;
+    uint64_t entry = elf_load_user(pml4, image, size, &image_end);
     kfree(image);
 
     if (!entry) {
@@ -156,6 +185,9 @@ uint64_t task_exec_current(struct vnode *vn) {
     // drop old image (we are on the new pml4 already), keep going on new one
     vmm_destroy_user(current->pml4);
     current->pml4 = pml4;
+    current->brk_base = (image_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    current->brk_cur = current->brk_base;
+    task_mmap_reset(current);
     user_stack_setup(pml4);
     task_close_fds(current, 1);
 
@@ -261,6 +293,11 @@ struct task *task_fork(struct regs *frame) {
             c->fds[i]->refs++;
         }
 
+    // brk + anon mmap reservations are part of the image
+    c->brk_base = current->brk_base;
+    c->brk_cur = current->brk_cur;
+    task_mmap_clone(c, current);
+
     // child frame: copy of parent's, rax=0
     struct regs *cr = (struct regs *)(c->kstack_top - sizeof(struct regs));
     memcpy(cr, frame, sizeof(*cr));
@@ -271,6 +308,7 @@ struct task *task_fork(struct regs *frame) {
 
 uint64_t task_exit_current(int code) {
     task_close_fds(current, 0);
+    task_mmap_reset(current);
     vmm_destroy_user(current->pml4);
     current->exit_code = code;
     current->state = T_ZOMBIE;

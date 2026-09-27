@@ -7,6 +7,9 @@
 #define SYS_write   1
 #define SYS_open    2
 #define SYS_close   3
+#define SYS_mmap    9
+#define SYS_mprotect 10
+#define SYS_munmap  11
 #define SYS_brk     12
 #define SYS_getpid  39
 #define SYS_fork    57
