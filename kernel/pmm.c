@@ -103,6 +103,22 @@ void pmm_init(void) {
     pages_used = (bitmap_phys + bitmap_pages * PAGE_SIZE - refs_phys) / PAGE_SIZE;
 }
 
+void pmm_reserve_range(uint64_t phys, uint64_t len) {
+    uint64_t start = phys & ~0xfffULL;
+    uint64_t end = (phys + len + PAGE_SIZE - 1) & ~0xfffULL;
+    for (uint64_t p = start; p < end; p += PAGE_SIZE) {
+        if (p < base)
+            continue;
+        uint64_t idx = (p - base) >> 12;
+        if (idx >= pages_total)
+            break;
+        if (!bit_test(idx)) {
+            bit_set(idx);
+            pages_used++;
+        }
+    }
+}
+
 void *pmm_alloc(void) {
     for (uint64_t p = 0; p < pages_total; p++) {
         if (!bit_test(p)) {

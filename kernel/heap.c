@@ -24,12 +24,14 @@ extern void vmm_map(uint64_t pml4, uint64_t vaddr, uint64_t paddr, uint64_t flag
 
 static void heap_grow(size_t bytes) {
     uint64_t npages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-    // find tail
+    // find tail; keep it page aligned so a chunk never spans an
+    // unmapped page (its data end must stay inside the last mapped page)
     uint64_t tail_vaddr = HEAP_BASE;
     if (head) {
         struct chunk *c = head;
         while (c->next) c = c->next;
-        tail_vaddr = ((uint64_t)c) + c->size;
+        tail_vaddr = ((uint64_t)c) + sizeof(struct chunk) + c->size;
+        tail_vaddr = (tail_vaddr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     }
     for (uint64_t i = 0; i < npages; i++) {
         void *p = pmm_alloc();

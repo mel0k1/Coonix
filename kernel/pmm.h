@@ -3,6 +3,8 @@
 #include <stdint.h>
 
 void pmm_init(void);
+// mark a physical range as used (kernel image, limine modules)
+void pmm_reserve_range(uint64_t phys, uint64_t len);
 void *pmm_alloc(void);           // 1 page, dirty
 void *pmm_alloc_zeroed(void);    // 1 page, zeroed via hhdm
 void pmm_free(void *page);       // drops one reference, frees at zero
