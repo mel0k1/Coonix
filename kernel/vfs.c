@@ -124,3 +124,65 @@ long vfs_read_file(const char *path, void **outbuf) {
     *outbuf = buf;
     return n;
 }
+
+// walk to the parent dir of an absolute path ("/a/b/c" -> vnode of /a/b)
+// and leave the last component in name[]
+static struct vnode *resolve_parent(const char *path, char *name, int nsize) {
+    if (!path || path[0] != '/')
+        return 0;
+
+    struct vnode *vn = vfs_root;
+    char comp[64];
+    int i = 0;
+
+    while (path[i]) {
+        while (path[i] == '/')
+            i++;
+        if (!path[i])
+            break;
+
+        int len = 0;
+        while (path[i] && path[i] != '/') {
+            if (len < (int)sizeof(comp) - 1)
+                comp[len++] = path[i];
+            i++;
+        }
+        comp[len] = 0;
+
+        // last component?
+        int last = 1;
+        for (int j = i; path[j]; j++)
+            if (path[j] != '/') {
+                last = 0;
+                break;
+            }
+        if (last) {
+            strncpy(name, comp, nsize - 1);
+            name[nsize - 1] = 0;
+            return vn;
+        }
+        if (vn->type != VNODE_DIR)
+            return 0;
+        vn = vn->ops->lookup(vn, comp);
+        if (!vn)
+            return 0;
+    }
+    return 0;
+}
+
+struct vnode *vfs_create(const char *path) {
+    char name[64];
+    struct vnode *dir = resolve_parent(path, name, sizeof(name));
+    if (!dir || dir->type != VNODE_DIR || !dir->ops->create)
+        return 0;
+    // refuse to clobber
+    if (dir->ops->lookup(dir, name))
+        return 0;
+    return dir->ops->create(dir, name);
+}
+
+int vfs_truncate(struct vnode *vn) {
+    if (!vn || vn->type != VNODE_FILE || !vn->ops->truncate)
+        return -1;
+    return vn->ops->truncate(vn);
+}

@@ -14,8 +14,12 @@
 // blocking ones return a switched rsp instead
 
 #define MAP_PRIVATE    0x02
+#define MAP_SHARED     0x01
 #define MAP_FIXED      0x10
 #define MAP_ANONYMOUS  0x20
+
+#define O_CREAT 0x40
+#define O_TRUNC 0x200
 
 #define PROT_READ  0x1
 #define PROT_WRITE 0x2
@@ -72,11 +76,21 @@ static uint64_t sys_read(struct regs *r) {
 
 static uint64_t sys_open(struct regs *r) {
     const char *path = (const char *)r->rdi;
+    int flags = (int)r->rsi;
     struct vnode *vn = vfs_resolve(path);
+    if (!vn && (flags & O_CREAT)) {
+        vn = vfs_create(path);
+        if (!vn) {
+            r->rax = -1ULL;
+            return (uint64_t)r;
+        }
+    }
     if (!vn) {
         r->rax = -1ULL;
         return (uint64_t)r;
     }
+    if ((flags & O_TRUNC) && vn->type == VNODE_FILE)
+        vfs_truncate(vn);
     struct file *f = vfs_open(vn);
     if (!f) {
         r->rax = -1ULL;

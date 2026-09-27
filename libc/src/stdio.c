@@ -44,13 +44,30 @@ void printf(const char *fmt, ...) {
             continue;
         }
         fmt++;
+        // minimal flags: '-' (left align) + decimal width for %s
+        int width = 0;
+        int left = 0;
+        if (*fmt == '-') {
+            left = 1;
+            fmt++;
+        }
+        while (*fmt >= '0' && *fmt <= '9') {
+            width = width * 10 + (*fmt - '0');
+            fmt++;
+        }
         switch (*fmt) {
         case 's': {
             const char *s = __builtin_va_arg(ap, const char *);
             if (!s) s = "(null)";
             long len = 0;
             while (s[len]) len++;
+            if (!left)
+                for (long pad = len; pad < width; pad++)
+                    puts_n(" ", 1);
             puts_n(s, len);
+            if (left)
+                for (long pad = len; pad < width; pad++)
+                    puts_n(" ", 1);
             break;
         }
         case 'c':

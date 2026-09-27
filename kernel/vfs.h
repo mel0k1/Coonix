@@ -13,6 +13,10 @@ struct vfs_ops {
     // read/write byte ranges, return bytes moved or -1
     long (*read)(struct vnode *vn, void *buf, uint64_t off, uint64_t len);
     long (*write)(struct vnode *vn, const void *buf, uint64_t off, uint64_t len);
+    // create an empty regular file named name in dir; 0 on error
+    struct vnode *(*create)(struct vnode *dir, const char *name);
+    // cut a regular file down to zero bytes; 0 ok, -1 error
+    int (*truncate)(struct vnode *vn);
 };
 
 struct vnode {
@@ -48,3 +52,9 @@ void vfs_close(struct file *f);
 
 // whole file into a kmalloc buffer, returns size or -1
 long vfs_read_file(const char *path, void **outbuf);
+
+// resolve parent dir of an absolute path, then create the last component;
+// returns the new vnode or 0
+struct vnode *vfs_create(const char *path);
+// truncate a file vnode to zero length
+int vfs_truncate(struct vnode *vn);

@@ -3,7 +3,8 @@
 
 Layout: 1024B blocks, rev 1, 128-byte inodes, single block group.
 8 MB image = 8192 blocks, 128 inodes. Files up to 12 direct + 256
-indirect blocks (~268 KB). The kernel side is a read-only ext2 driver.
+indirect blocks (~268 KB). The kernel side is a read/write ext2 driver,
+so the block/inode bitmaps and free counts must be real.
 """
 import os
 import struct
@@ -16,7 +17,10 @@ INODE_SIZE = 128
 FIRST_DATA_BLOCK = 1
 BGD_BLOCK = 2
 INODE_TABLE_BLOCK = 3
-DATA_START = INODE_TABLE_BLOCK + INODES * INODE_SIZE // BLOCK  # 19
+INODE_TABLE_BLOCKS = INODES * INODE_SIZE // BLOCK      # 16
+BLOCK_BITMAP_BLOCK = INODE_TABLE_BLOCK + INODE_TABLE_BLOCKS   # 19
+INODE_BITMAP_BLOCK = BLOCK_BITMAP_BLOCK + 1                    # 20
+DATA_START = INODE_BITMAP_BLOCK + 1                            # 21
 
 S_IFDIR = 0x4000
 S_IFREG = 0x8000
@@ -42,9 +46,13 @@ class Image:
         off = INODE_TABLE_BLOCK * BLOCK + (ino - 1) * INODE_SIZE
         self.buf[off:off + INODE_SIZE] = raw
 
-    def write_super(self):
+    def write_super(self, used_blocks, inode_list, used_dirs):
+        used_inodes = len(inode_list)
+        free_blocks = TOTAL_BLOCKS - used_blocks
+        free_inodes = INODES - used_inodes
         sb = struct.pack(
-            "<7I", INODES, TOTAL_BLOCKS, 0, 0, INODES - 11, FIRST_DATA_BLOCK, 0)
+            "<7I", INODES, TOTAL_BLOCKS, 0, free_blocks, free_inodes,
+            FIRST_DATA_BLOCK, 0)
         sb += struct.pack("<2I", 0, TOTAL_BLOCKS)          # frags, blocks/group
         sb += struct.pack("<2I", 0, INODES)                # frags/group, inodes/group
         sb += struct.pack("<2I", 0, 0)                     # mtime, wtime
@@ -56,11 +64,29 @@ class Image:
         sb += struct.pack("<I", 11)                        # first_ino
         sb += struct.pack("<H", INODE_SIZE)                # inode_size
         self.write_block(1, sb.ljust(BLOCK, b"\0"))
-        # group descriptor 0: unused bitmaps, inode table at block 3
-        bgd = struct.pack("<3I", 0, 0, INODE_TABLE_BLOCK)
-        bgd += struct.pack("<7H", TOTAL_BLOCKS, INODES, 0, TOTAL_BLOCKS, INODES - 11, 0, 0)
-        bgd += bytes(32 - 2 * 4 - 7 * 2)
+        # group descriptor 0: real bitmaps + free counts
+        bgd = struct.pack("<3I", BLOCK_BITMAP_BLOCK, INODE_BITMAP_BLOCK,
+                          INODE_TABLE_BLOCK)
+        bgd += struct.pack("<3H", free_blocks, free_inodes, used_dirs)
+        bgd += bytes(32 - 3 * 4 - 3 * 2)
         self.write_block(BGD_BLOCK, bgd.ljust(BLOCK, b"\0"))
+
+        # block bitmap: bit i covers block i + FIRST_DATA_BLOCK; block 0
+        # (boot block) is outside the bitmap domain
+        bbm = bytearray(BLOCK)
+        for b in range(FIRST_DATA_BLOCK, used_blocks + 1):
+            i = b - FIRST_DATA_BLOCK
+            assert 0 <= i < BLOCK * 8
+            bbm[i >> 3] |= 1 << (i & 7)
+        self.write_block(BLOCK_BITMAP_BLOCK, bytes(bbm))
+
+        # inode bitmap: bit i covers inode i + 1
+        ibm = bytearray(BLOCK)
+        for ino in inode_list:
+            i = ino - 1
+            assert 0 <= i < BLOCK * 8
+            ibm[i >> 3] |= 1 << (i & 7)
+        self.write_block(INODE_BITMAP_BLOCK, bytes(ibm))
 
 
 def dirent_block(entries):
@@ -114,7 +140,9 @@ def build(root):
         dir_data[dp] = dirent_block(ents)
 
     # directory inodes
+    dir_count = 0
     for dp, data in dir_data.items():
+        dir_count += 1
         nblocks = 1
         b = img.alloc()
         img.write_block(b, data)
@@ -150,7 +178,9 @@ def build(root):
             struct.pack_into("<I", raw, 40 + 4 * 12, ind)
         img.write_inode(ino_of[rel], raw)
 
-    img.write_super()
+    img.write_super(used_blocks=img.next_block - 1,
+                    inode_list=[2] + list(range(11, nxt)),
+                    used_dirs=dir_count)
     return bytes(img.buf)
 
 

@@ -1,4 +1,5 @@
 #include "ata.h"
+#include "blkdev.h"
 #include "console.h"
 #include "string.h"
 
@@ -127,12 +128,21 @@ uint64_t ata_init(void) {
     max_lba = (uint64_t)id[100] | ((uint64_t)id[101] << 16) |
               ((uint64_t)id[102] << 32) | ((uint64_t)id[103] << 48);
     flush_model(id);
-    return max_lba + 1;
+    max_lba = max_lba + 1;
+    // claim the root disk slot
+    if (!root_disk.ready) {
+        root_disk.name = "ata0 master (pio)";
+        root_disk.sectors = max_lba;
+        root_disk.read_sectors = ata_read_sectors;
+        root_disk.write_sectors = ata_write_sectors;
+        root_disk.ready = 1;
+    }
+    return max_lba;
 }
 
 // issue a read/write for up to 256 sectors, caller holds cli and spun up
 static int transfer(uint64_t lba, uint16_t count, void *buf, int write) {
-    if (lba + count > max_lba + 1)
+    if (lba + count > max_lba)   // max_lba holds the sector count now
         return -1;
 
     outb(ATA_DRIVE, 0x40 | ((lba >> 24) & 0x0f));

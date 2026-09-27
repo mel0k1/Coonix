@@ -20,6 +20,8 @@ static int nnodes;
 
 static struct vfs_ops tmpfs_ops;
 
+static struct tnode *tnode_new(const char *name, int type, struct tnode *parent);
+
 static struct tnode *vn2t(struct vnode *vn) {
     return (struct tnode *)vn->fs_data;
 }
@@ -97,6 +99,32 @@ static struct vnode *tmpfs_lookup(struct vnode *dir, const char *name) {
     return 0;
 }
 
+static struct vnode *tmpfs_create(struct vnode *dir, const char *name) {
+    struct tnode *t = vn2t(dir);
+    if (t->type != VNODE_DIR)
+        return 0;
+    if (strlen(name) >= NAME_MAX)
+        return 0;
+    for (struct tnode *x = t->child; x; x = x->sibling)
+        if (!strcmp(x->name, name))
+            return 0;   // exists
+    struct tnode *n = tnode_new(name, VNODE_FILE, t);
+    return n ? &n->vn : 0;
+}
+
+static int tmpfs_truncate(struct vnode *vn) {
+    struct tnode *t = vn2t(vn);
+    if (t->type != VNODE_FILE)
+        return -1;
+    if (t->data)
+        kfree(t->data);
+    t->data = 0;
+    t->size = 0;
+    t->cap = 0;
+    vn->size = 0;
+    return 0;
+}
+
 static struct tnode *tnode_new(const char *name, int type, struct tnode *parent) {
     struct tnode *t = kzalloc(sizeof(*t));
     if (!t)
@@ -119,6 +147,8 @@ void tmpfs_mount(void) {
     tmpfs_ops.lookup = tmpfs_lookup;
     tmpfs_ops.read = tmpfs_read;
     tmpfs_ops.write = tmpfs_write;
+    tmpfs_ops.create = tmpfs_create;
+    tmpfs_ops.truncate = tmpfs_truncate;
     troot = tnode_new("", VNODE_DIR, 0);
     if (!troot)
         panic("tmpfs: no root");
