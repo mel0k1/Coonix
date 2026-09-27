@@ -51,3 +51,11 @@ char *strncpy(char *dst, const char *src, size_t n) {
     while (n--) *p++ = 0;
     return dst;
 }
+
+int memcmp(const void *a, const void *b, size_t n) {
+    const uint8_t *x = a, *y = b;
+    while (n--)
+        if (*x++ != *y++)
+            return x[-1] - y[-1];
+    return 0;
+}

@@ -16,6 +16,8 @@
 #include "vfs.h"
 #include "tmpfs.h"
 #include "initramfs.h"
+#include "ata.h"
+#include "ext2.h"
 
 // --- limine boot protocol requests ---
 
@@ -49,6 +51,11 @@ volatile struct limine_stack_size_request stack_size_request = {
 __attribute__((used, section(".limine_requests")))
 volatile struct limine_module_request module_request = {
     .id = LIMINE_MODULE_REQUEST, .revision = 0
+};
+
+__attribute__((used, section(".limine_requests")))
+volatile struct limine_kernel_address_request ka_request = {
+    .id = LIMINE_KERNEL_ADDRESS_REQUEST, .revision = 0
 };
 
 __attribute__((used, section(".limine_requests_end")))
@@ -111,6 +118,20 @@ void kmain(void) {
     __asm__ volatile("sti");
 
     pmm_init();
+    // keep pmm hands off the kernel image and boot modules (initramfs tar
+    // lives in a reclaimable region we read later)
+    if (ka_request.response) {
+        extern char __kernel_end;
+        pmm_reserve_range(ka_request.response->physical_base,
+                          (uint64_t)&__kernel_end - ka_request.response->virtual_base);
+    }
+    if (module_request.response) {
+        for (uint64_t m = 0; m < module_request.response->module_count; m++) {
+            struct limine_file *lf = module_request.response->modules[m];
+            pmm_reserve_range((uint64_t)lf->address - hhdm,
+                              (lf->size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
+        }
+    }
     console_puts("memory: ");
     print_num(pmm_free_mem() >> 20);
     console_puts("/");
@@ -126,9 +147,24 @@ void kmain(void) {
     console_puts("heap ok\n");
 
     vfs_init();
-    tmpfs_mount();
-    initramfs_load();
-    console_puts("vfs: tmpfs mounted at /\n");
+    uint64_t sectors = ata_init();
+    if (sectors) {
+        console_puts("ata0 master: ");
+        console_puts(ata_model());
+        console_puts(", ");
+        print_num(sectors >> 11);
+        console_puts(" MB, lba48\n");
+    } else {
+        console_puts("ata: no disk on primary master\n");
+    }
+
+    if (sectors && ext2_mount_root() == 0) {
+        console_puts("vfs: ext2 root mounted from disk\n");
+    } else {
+        tmpfs_mount();
+        initramfs_load();
+        console_puts("vfs: tmpfs root + initramfs (disk boot failed)\n");
+    }
 
     task_init();
     if (!task_spawn_user("/bin/shell", current))
