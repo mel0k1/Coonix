@@ -70,7 +70,7 @@ static void map_kstack(struct task *t) {
         // map into the kernel half of BOTH current and new pml4? kernel half
         // is shared on pml4 level, so mapping into current pml4 is enough
         vmm_map(vmm_kernel_pml4(), va + i * PAGE_SIZE, (uint64_t)p,
-                VMM_PRESENT | VMM_WRITE);
+                VMM_PRESENT | VMM_WRITE | VMM_NX);   // w^x: kstacks don't run
     }
 }
 

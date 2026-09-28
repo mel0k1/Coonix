@@ -38,7 +38,7 @@ static void heap_grow(size_t bytes) {
         if (!p)
             panic("heap: out of memory");
         vmm_map(heap_pml4, tail_vaddr + i * PAGE_SIZE, (uint64_t)p,
-                VMM_PRESENT | VMM_WRITE);
+                VMM_PRESENT | VMM_WRITE | VMM_NX);   // w^x: heap never runs
     }
     struct chunk *c = (struct chunk *)tail_vaddr;
     c->size = npages * PAGE_SIZE - sizeof(struct chunk);
