@@ -247,8 +247,11 @@ static void user_stack_setup(uint64_t pml4) {
 // builds the initial user stack contents: argv/envp strings, auxv, then
 // the arg vector itself. must run with the target pml4 active (kernel half
 // is shared, so heap + our stack keep working). returns final entry rsp.
+// ea = caller-captured argv/envp blocks (NUL-separated), 0 = defaults
+#define EXEC_ARG_MAX 32
 static uint64_t user_stack_build_args(uint64_t pml4, const char *prog,
-                                      const struct elf_info *ei) {
+                                      const struct elf_info *ei,
+                                      const exec_args_t *ea) {
     uint64_t old_cr3 = vmm_kernel_pml4();
     if (old_cr3 != pml4)
         vmm_switch(pml4);
@@ -261,6 +264,24 @@ static uint64_t user_stack_build_args(uint64_t pml4, const char *prog,
         *(uint16_t *)(rnd + i) = (uint16_t)(seed >> 33);
     }
 
+    // flatten the arg vectors
+    const char *av[EXEC_ARG_MAX];
+    int argc = 0;
+    const char *ev[EXEC_ARG_MAX];
+    int envc = 0;
+    if (ea && ea->argv)
+        for (const char *p = ea->argv; *p && argc < EXEC_ARG_MAX;
+             p += strlen(p) + 1)
+            av[argc++] = p;
+    else
+        av[argc++] = prog;
+    if (ea && ea->envp)
+        for (const char *p = ea->envp; *p && envc < EXEC_ARG_MAX;
+             p += strlen(p) + 1)
+            ev[envc++] = p;
+    else
+        ev[envc++] = "PATH=/bin";
+
     // strings grow down from the top of the stack
     uint64_t sp = USER_STACK_TOP;
 
@@ -270,36 +291,39 @@ static uint64_t user_stack_build_args(uint64_t pml4, const char *prog,
         ((uint8_t *)sp)[i] = rnd[i];
     uint64_t rand_ptr = sp;
 
-    // argv[0]
-    uint64_t plen = strlen(prog) + 1;
-    sp -= plen;
-    memcpy((void *)sp, prog, plen);
-    uint64_t argv0 = sp;
-
-    // envp: a minimal PATH
-    const char *env = "PATH=/bin";
-    uint64_t elen = 10;   // "PATH=/bin\0"
-    sp -= elen;
-    memcpy((void *)sp, env, elen);
-    uint64_t env0 = sp;
+    uint64_t argv_ptr[EXEC_ARG_MAX], envp_ptr[EXEC_ARG_MAX];
+    for (int i = argc - 1; i >= 0; i--) {
+        uint64_t l = strlen(av[i]) + 1;
+        sp -= l;
+        memcpy((void *)sp, av[i], l);
+        argv_ptr[i] = sp;
+    }
+    for (int i = envc - 1; i >= 0; i--) {
+        uint64_t l = strlen(ev[i]) + 1;
+        sp -= l;
+        memcpy((void *)sp, ev[i], l);
+        envp_ptr[i] = sp;
+    }
 
     sp &= ~0xfULL;
 
-    // arg block: argc, argv[0], NULL, envp[0], NULL, 15 auxv pairs, AT_NULL
-    uint64_t block = 8 * 1         // argc
-                   + 8 * 3         // argv: ptr + NULL
-                   + 8 * 2         // envp: ptr + NULL
-                   + 8 * 2 * 15    // auxv pairs
-                   + 8 * 2;        // AT_NULL
+    // arg block: argc, argv+NULL, envp+NULL, auxv pairs, AT_NULL
+    uint64_t block = 8                       // argc
+                   + 8 * (argc + 1)          // argv vector
+                   + 8 * (envc + 1)          // envp vector
+                   + 8 * 2 * 15              // auxv pairs
+                   + 8 * 2;                  // AT_NULL
     sp -= block;
     sp &= ~0xfULL;
     uint64_t *a = (uint64_t *)sp;
     int i = 0;
-    a[i++] = 1;           // argc
-    a[i++] = argv0;
-    a[i++] = 0;           // argv end
-    a[i++] = env0;
-    a[i++] = 0;           // envp end
+    a[i++] = (uint64_t)argc;
+    for (int k = 0; k < argc; k++)
+        a[i++] = argv_ptr[k];
+    a[i++] = 0;
+    for (int k = 0; k < envc; k++)
+        a[i++] = envp_ptr[k];
+    a[i++] = 0;
     #define AUXV(type, val) do { a[i++] = (uint64_t)(type); a[i++] = (uint64_t)(val); } while (0)
     AUXV(3, ei ? ei->phdr_va : 0);    // AT_PHDR
     AUXV(4, ei ? ei->phent : 0);      // AT_PHENT
@@ -315,12 +339,13 @@ static uint64_t user_stack_build_args(uint64_t pml4, const char *prog,
     AUXV(17, 100);        // AT_CLKTCK
     AUXV(23, 0);          // AT_SECURE
     AUXV(25, rand_ptr);   // AT_RANDOM: glibc aborts without it
-    AUXV(31, argv0);      // AT_EXECFN
+    AUXV(31, argv_ptr[0]);// AT_EXECFN
     #undef AUXV
     a[i++] = 0;  a[i++] = 0;          // AT_NULL
 
     if (old_cr3 != pml4)
         vmm_switch(old_cr3);
+
     return sp;
 }
 
@@ -360,8 +385,9 @@ struct task *task_spawn_user(const char *path, struct task *parent) {
     t->brk_cur = t->brk_base;
     user_stack_setup(t->pml4);
     fds_init(t);
+    strcpy(t->cwd, "/");
 
-    uint64_t entry_rsp = user_stack_build_args(t->pml4, path, &ei);
+    uint64_t entry_rsp = user_stack_build_args(t->pml4, path, &ei, 0);
 
     // iret frame for ring 3 entry
     struct regs *r = (struct regs *)(t->kstack_top - sizeof(struct regs));
@@ -376,9 +402,10 @@ struct task *task_spawn_user(const char *path, struct task *parent) {
     return t;
 }
 
-// exec current task with a new image from a vnode (execve / disk exec);
-// name is a kernel-side copy used as argv[0]
-uint64_t task_exec_current_named(struct vnode *vn, const char *name) {
+// full execve: keep cwd, drop only CLOEXEC fds (redirections survive),
+// build the new stack from the caller's argv/envp
+uint64_t task_execve(struct vnode *vn, const char *name,
+                     const exec_args_t *ea) {
     if (!vn || vn->type != VNODE_FILE)
         return 0;
     void *image = kmalloc(vn->size ? vn->size : 1);
@@ -421,9 +448,18 @@ uint64_t task_exec_current_named(struct vnode *vn, const char *name) {
     current->child_tid = 0;
     current->sig_pending = 0;
     user_stack_setup(pml4);
-    task_close_fds(current, 1);
+    // exec: only CLOEXEC fds close (posix); console + redirect targets stay
+    for (int i = 0; i < FILE_MAX; i++) {
+        if (!current->fds[i])
+            continue;
+        if (current->fd_flags[i] & FD_CLOEXEC) {
+            vfs_close(current->fds[i]);
+            current->fds[i] = 0;
+            current->fd_flags[i] = 0;
+        }
+    }
 
-    uint64_t entry_rsp = user_stack_build_args(pml4, name, &ei);
+    uint64_t entry_rsp = user_stack_build_args(pml4, name, &ei, ea);
 
     // fresh iret frame on our kernel stack
     struct regs *fr = (struct regs *)current->rsp;
@@ -434,6 +470,11 @@ uint64_t task_exec_current_named(struct vnode *vn, const char *name) {
     fr->rsp = entry_rsp;
     fr->ss = SEL_UDATA | 3;
     return (uint64_t)fr;
+}
+
+// legacy wrappers: defaults for argv/envp, console-only fd policy
+uint64_t task_exec_current_named(struct vnode *vn, const char *name) {
+    return task_execve(vn, name, 0);
 }
 
 int task_fd_alloc(struct file *f) {
@@ -536,6 +577,8 @@ struct task *task_fork(struct regs *frame) {
             c->fds[i] = current->fds[i];
             c->fds[i]->refs++;
         }
+    memcpy(c->fd_flags, current->fd_flags, sizeof(c->fd_flags));
+    strcpy(c->cwd, current->cwd);
 
     // brk + anon mmap reservations are part of the image
     c->brk_base = current->brk_base;
@@ -591,6 +634,8 @@ struct task *task_clone_thread(struct regs *frame, uint64_t flags,
             c->fds[i] = current->fds[i];
             c->fds[i]->refs++;
         }
+    memcpy(c->fd_flags, current->fd_flags, sizeof(c->fd_flags));
+    strcpy(c->cwd, current->cwd);
     c->brk_base = current->brk_base;
     c->brk_cur = current->brk_cur;
     task_mmap_clone(c, current);
@@ -713,6 +758,16 @@ uint64_t task_exit_current_sig(int sig) {
 void task_wake_kbd(void) {
     for (int i = 0; i < TASK_MAX; i++)
         if (task_table[i].state == T_BLOCKED && task_table[i].wait_reason == WAIT_KBD)
+            task_table[i].state = T_READY;
+}
+
+// unblock readers/writers parked on a pipe; the replayed syscall sees the
+// new buffer state (or EOF/EPIPE)
+void task_wake_pipe(struct pipe *p) {
+    for (int i = 0; i < TASK_MAX; i++)
+        if (task_table[i].state == T_BLOCKED &&
+            task_table[i].wait_reason == WAIT_PIPE &&
+            task_table[i].wait_pipe == p)
             task_table[i].state = T_READY;
 }
 

@@ -12,7 +12,7 @@ import sys
 
 BLOCK = 1024
 TOTAL_BLOCKS = 8192
-INODES = 128
+INODES = 256
 INODE_SIZE = 128
 FIRST_DATA_BLOCK = 1
 BGD_BLOCK = 2
@@ -24,6 +24,11 @@ DATA_START = INODE_BITMAP_BLOCK + 1                            # 21
 
 S_IFDIR = 0x4000
 S_IFREG = 0x8000
+S_IFLNK = 0xA000
+
+FT_REG = 1
+FT_DIR = 2
+FT_LNK = 7
 
 
 class Image:
@@ -112,31 +117,36 @@ def dirent_block(entries):
 def build(root):
     img = Image()
 
-    # walk staging tree
-    entries = []  # (relpath, fullpath, is_dir)
+    # walk staging tree (hidden files like .stamp are staging bookkeeping)
+    entries = []  # (relpath, fullpath, kind) kind: dir | file | link
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
         for d in sorted(dirnames):
             rel = os.path.relpath(os.path.join(dirpath, d), root)
-            entries.append((rel, os.path.join(dirpath, d), True))
+            entries.append((rel, os.path.join(dirpath, d), "dir"))
         for f in sorted(filenames):
-            rel = os.path.relpath(os.path.join(dirpath, f), root)
-            entries.append((rel, os.path.join(dirpath, f), False))
+            full = os.path.join(dirpath, f)
+            if os.path.basename(f).startswith("."):
+                continue
+            rel = os.path.relpath(full, root)
+            kind = "link" if os.path.islink(full) else "file"
+            entries.append((rel, full, kind))
 
     ino_of = {".": 2}
     nxt = 11
-    for rel, full, is_dir in entries:
+    for rel, full, kind in entries:
         ino_of[rel] = nxt
         nxt += 1
         assert nxt <= INODES, "too many files"
 
     # directory data blocks
     dir_data = {}
-    for dp in ["."] + [rel for rel, _, is_d in entries if is_d]:
-        ents = [(2, 2, "."), (2, 2, "..")]
-        for rel, full, is_dir in entries:
+    for dp in ["."] + [rel for rel, _, kind in entries if kind == "dir"]:
+        ents = [(2, FT_DIR, "."), (2, FT_DIR, "..")]
+        for rel, full, kind in entries:
             if (os.path.dirname(rel) or ".") == dp:
-                ents.append((ino_of[rel], 2 if is_dir else 1, os.path.basename(rel)))
+                ft = FT_DIR if kind == "dir" else FT_LNK if kind == "link" else FT_REG
+                ents.append((ino_of[rel], ft, os.path.basename(rel)))
         dir_data[dp] = dirent_block(ents)
 
     # directory inodes
@@ -154,9 +164,20 @@ def build(root):
         struct.pack_into("<I", raw, 40, b)
         img.write_inode(ino_of[dp], raw)
 
-    # file inodes + data
-    for rel, full, is_dir in entries:
-        if is_dir:
+    # file + symlink inodes
+    for rel, full, kind in entries:
+        if kind == "dir":
+            continue
+        if kind == "link":
+            # fast symlink: target lives inside i_block (< 60 bytes)
+            target = os.readlink(full).encode()
+            assert len(target) < 60, f"slow symlink not supported: {rel}"
+            raw = bytearray(INODE_SIZE)
+            struct.pack_into("<H", raw, 0, S_IFLNK | 0o777)
+            struct.pack_into("<I", raw, 4, len(target))
+            struct.pack_into("<H", raw, 26, 1)
+            raw[40:40 + len(target)] = target
+            img.write_inode(ino_of[rel], raw)
             continue
         with open(full, "rb") as fh:
             data = fh.read()

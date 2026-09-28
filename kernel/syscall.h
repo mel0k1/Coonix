@@ -52,4 +52,34 @@
 #define SYS_set_robust_list 273
 #define SYS_getrandom 318
 
+// userspace porting set (busybox & friends)
+#define SYS_mremap  25
+#define SYS_access  21
+#define SYS_pipe    22
+#define SYS_symlink 88
+#define SYS_link    86
+#define SYS_dup     32
+#define SYS_dup2    33
+#define SYS_fcntl   72
+#define SYS_ftruncate 77
+#define SYS_getcwd  79
+#define SYS_chdir   80
+#define SYS_rename  82
+#define SYS_mkdir   83
+#define SYS_rmdir   84
+#define SYS_unlink  87
+#define SYS_readlink 89
+#define SYS_chmod   90
+#define SYS_fchmod  91
+#define SYS_gettimeofday 96
+#define SYS_getpgid 121
+#define SYS_setpgid 109
+#define SYS_sigaltstack 132
+#define SYS_getdents64 217
+#define SYS_faccessat 269
+#define SYS_fchmodat 268
+#define SYS_utimensat 280
+#define SYS_dup3    292
+#define SYS_pipe2   293
+
 uint64_t syscall_dispatch(struct regs *r);

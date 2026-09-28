@@ -236,6 +236,22 @@ uint64_t isr_handler(struct regs *r) {
         print_hex64(r->rip);
         console_puts(" cr2 0x");
         print_hex64(cr2);
+        console_puts("\n  frame rsp 0x");
+        print_hex64((uint64_t)r);
+        console_puts(" urip 0x");
+        print_hex64(r->rip);
+        console_puts(" cs 0x");
+        print_hex64(r->cs);
+        console_puts(" ss 0x");
+        print_hex64(r->ss);
+        console_puts("\n  u_rsp 0x");
+        print_hex64(r->rsp);
+        console_puts(" rfl 0x");
+        print_hex64(r->rflags);
+        console_puts(" rax 0x");
+        print_hex64(r->rax);
+        console_puts(" err 0x");
+        print_hex64(r->err);
         console_puts("\n");
         panic("cpu exception");
     }

@@ -1,2 +1,2 @@
-Coonix 0.5.0 - signals, futex, pthreads, tty
-real glibc threads and signals work, enot is proud
+Coonix 0.6.0 - busybox userspace, dlopen, fs syscalls
+real glibc threads, signals and busybox sh work, enot is proud

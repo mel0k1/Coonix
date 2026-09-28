@@ -1,5 +1,4 @@
 #include "syscall.h"
-#include "task.h"
 #include "kbd.h"
 #include "console.h"
 #include "string.h"
@@ -13,6 +12,8 @@
 #include "signal.h"
 #include "futex.h"
 #include "serial.h"
+#include "pipe.h"
+#include "task.h"
 
 // every handler sets r->rax and returns current frame rsp;
 // blocking ones return a switched rsp instead
@@ -22,14 +23,160 @@
 #define MAP_FIXED      0x10
 #define MAP_ANONYMOUS  0x20
 
-#define O_CREAT 0x40
-#define O_TRUNC 0x200
-
 #define PROT_READ  0x1
 #define PROT_WRITE 0x2
 #define PROT_EXEC  0x4
 
 #define PTE_DIRTY  0x040
+
+// user path capture: copy the string, make absolute against cwd.
+// returns 0 ok, -1 bad pointer/empty
+static int user_path(uint64_t uptr, char *out, int cap) {
+    const char *up = (const char *)uptr;
+    if (!up)
+        return -1;
+    char tmp[256];
+    int i = 0;
+    while (i < (int)sizeof(tmp) - 1) {
+        char c = up[i];
+        tmp[i++] = c;
+        if (!c)
+            break;
+    }
+    tmp[sizeof(tmp) - 1] = 0;
+    if (!tmp[0])
+        return -1;
+    if (tmp[0] == '/') {
+        strncpy(out, tmp, cap - 1);
+        out[cap - 1] = 0;
+        return 0;
+    }
+    // relative: cwd + "/" + tmp
+    int n = 0;
+    const char *cwd = current->cwd;
+    while (cwd[n] && n < cap - 1) {
+        out[n] = cwd[n];
+        n++;
+    }
+    if (n && out[n - 1] != '/' && n < cap - 1)
+        out[n++] = '/';
+    for (int k = 0; tmp[k] && n < cap - 1; k++)
+        out[n++] = tmp[k];
+    out[n] = 0;
+    return 0;
+}
+
+// in-place canonicalization of an absolute path: drop "." and "x/.."
+static void path_canon(char *p) {
+    if (!p || p[0] != '/')
+        return;
+    char tmp[256];
+    strncpy(tmp, p, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = 0;
+    const char *comps[64];
+    uint16_t clen[64];
+    int n = 0;
+    const char *s = tmp;
+    while (*s) {
+        while (*s == '/')
+            s++;
+        if (!*s)
+            break;
+        const char *start = s;
+        while (*s && *s != '/')
+            s++;
+        uint64_t len = (uint64_t)(s - start);
+        if (len == 1 && start[0] == '.')
+            continue;
+        if (len == 2 && start[0] == '.' && start[1] == '.') {
+            if (n)
+                n--;
+            continue;
+        }
+        if (n < 64) {
+            comps[n] = start;
+            clen[n] = (uint16_t)len;
+            n++;
+        }
+    }
+    int w = 0;
+    for (int i = 0; i < n; i++) {
+        p[w++] = '/';
+        for (int k = 0; k < clen[i]; k++)
+            p[w++] = comps[i][k];
+    }
+    if (!w)
+        p[w++] = '/';
+    p[w] = 0;
+}
+
+// capture a NUL-terminated array of user strings into one kernel block
+// ("str\0str\0...\0"); returns 0 ok, -1 bad/oversized
+#define EXEC_STRV_MAX 32
+static int capture_strv(uint64_t up, char **out, int *cnt) {
+    *out = 0;
+    *cnt = 0;
+    if (!up)
+        return 0;
+    const uint64_t *uv = (const uint64_t *)up;
+    const char *strs[EXEC_STRV_MAX];
+    int n = 0;
+    while (n < EXEC_STRV_MAX) {
+        uint64_t p = uv[n];
+        if (!p)
+            break;
+        const char *s = (const char *)p;
+        uint64_t len = 0;
+        while (len < 1024 && s[len])
+            len++;
+        if (len >= 1024)
+            return -1;
+        strs[n] = s;
+        n++;
+    }
+    if (!n)
+        return 0;
+    uint64_t total = 0;
+    for (int i = 0; i < n; i++)
+        total += strlen(strs[i]) + 1;
+    // +1: double NUL at the end — consumers scan strings until an empty
+    // one, so the block must end "str\0str\0\0"
+    char *blk = kmalloc(total + 1);
+    if (!blk)
+        return -1;
+    uint64_t off = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t l = strlen(strs[i]) + 1;
+        memcpy(blk + off, strs[i], l);
+        off += l;
+    }
+    blk[total] = 0;
+    *out = blk;
+    *cnt = n;
+    return 0;
+}
+
+// unified read/write across console / pipe / file; bytes moved or -1
+static long file_write(struct file *f, const void *buf, uint64_t len) {
+    if (f->is_console) {
+        const char *b = buf;
+        for (uint64_t i = 0; i < len; i++)
+            console_putc(b[i]);
+        return (long)len;
+    }
+    if (f->pipe)
+        return (long)pipe_write_nb(f->pipe, buf, len);
+    return vfs_write(f, buf, len);
+}
+
+static long file_read(struct file *f, void *buf, uint64_t len);
+__attribute__((unused)) static long file_read(struct file *f, void *buf, uint64_t len) {
+    if (f->is_console)
+        return tty_read(buf, len ? (int)len : 1);
+    if (f->pipe)
+        return (long)pipe_read_nb(f->pipe, buf, len);
+    return vfs_read(f, buf, len);
+}
 
 // errno values the kernel returns as negative results (linux abi)
 #define EPERM   1
@@ -56,6 +203,31 @@
 #define ETIMEDOUT 110
 #define EMFILE  24
 #define EIO     5
+#define EPIPE   32
+#define ECHILD  10
+#define ERANGE  34
+#define ENOTEMPTY 39
+
+#define O_CREAT 0x40
+#define O_TRUNC 0x200
+#define O_CLOEXEC 0x80000
+
+#define SIGPIPE 13
+
+#define F_GETFD 1
+#define F_SETFD 2
+#define F_GETFL 3
+#define F_SETFL 4
+#define F_DUPFD 0
+#define F_DUPFD_CLOEXEC 1030
+
+#define DT_REG  8
+#define DT_DIR  4
+#define DT_LNK  10
+
+#define MREMAP_MAYMOVE 1
+
+#define AT_FDCWD (-100)
 
 #define SEEK_SET 0
 #define SEEK_CUR 1
@@ -98,13 +270,14 @@ static uint64_t sys_write(struct regs *r) {
         r->rax = -EBADF;
         return (uint64_t)r;
     }
-    if (!f->vn) { // console
-        for (uint64_t i = 0; i < len; i++)
-            console_putc(buf[i]);
-        r->rax = len;
+    if (f->pipe && !f->pipe->readers) {
+        signal_send_task(current, SIGPIPE);   // default kills
+        r->rax = -EPIPE;
         return (uint64_t)r;
     }
-    long n = vfs_write(f, buf, len);
+    long n = file_write(f, buf, len);
+    if (n >= 0 && f->pipe)
+        task_wake_pipe(f->pipe);
     r->rax = n < 0 ? (uint64_t)-EIO : (uint64_t)n;
     return (uint64_t)r;
 }
@@ -116,7 +289,27 @@ static uint64_t sys_read(struct regs *r) {
         r->rax = -EBADF;
         return (uint64_t)r;
     }
-    if (!f->vn) { // console: line discipline read
+    if (f->pipe) {
+        // pipe: return what fits; block only when empty and writers live
+        uint64_t n = pipe_read_nb(f->pipe, (uint8_t *)buf,
+                                  r->rdx ? r->rdx : 1);
+        if (n) {
+            task_wake_pipe(f->pipe);   // freed space may wake a writer
+            r->rax = n;
+            return (uint64_t)r;
+        }
+        if (!f->pipe->writers) {
+            r->rax = 0;   // EOF
+            return (uint64_t)r;
+        }
+        cli();
+        replay_fixup(r);
+        current->wait_reason = WAIT_PIPE;
+        current->wait_pipe = f->pipe;
+        current->state = T_BLOCKED;
+        return task_schedule((uint64_t)r);
+    }
+    if (f->is_console) { // console: line discipline read
         long n = tty_read(buf, r->rdx ? (int)r->rdx : 1);
         if (n < 0) {
             // sleep until a key arrives; replay the syscall on wake.
@@ -139,7 +332,11 @@ static uint64_t sys_read(struct regs *r) {
 }
 
 static uint64_t sys_open(struct regs *r) {
-    const char *path = (const char *)r->rdi;
+    char path[256];
+    if (user_path(r->rdi, path, sizeof(path)) < 0) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
     int flags = (int)r->rsi;
     struct vnode *vn = vfs_resolve(path);
     if (!vn && (flags & O_CREAT)) {
@@ -166,6 +363,8 @@ static uint64_t sys_open(struct regs *r) {
         r->rax = -EMFILE;
         return (uint64_t)r;
     }
+    if (flags & O_CLOEXEC)
+        current->fd_flags[fd] |= FD_CLOEXEC;
     r->rax = fd;
     return (uint64_t)r;
 }
@@ -232,7 +431,7 @@ static uint64_t sys_ioctl(struct regs *r) {
         r->rax = -EBADF;
         return (uint64_t)r;
     }
-    if (f->vn) {                    // regular files: no tty ioctls
+    if (!f->is_console) {           // pipes and regular files: no tty ioctls
         r->rax = -ENOTTY;
         return (uint64_t)r;
     }
@@ -256,6 +455,15 @@ static uint64_t sys_ioctl(struct regs *r) {
         r->rax = 0;
         return (uint64_t)r;
     }
+    case 0x540F: {                  // TIOCGPGRP: the foreground group
+        int *p = arg;
+        *p = current->pgid;
+        r->rax = 0;
+        return (uint64_t)r;
+    }
+    case 0x5410:                    // TIOCSPGRP: accepted, single fg group
+        r->rax = 0;
+        return (uint64_t)r;
     default:
         r->rax = -ENOTTY;
         return (uint64_t)r;
@@ -427,37 +635,6 @@ static uint64_t sys_mmap(struct regs *r) {
     return (uint64_t)r;
 }
 
-static uint64_t sys_munmap(struct regs *r) {
-    uint64_t addr = r->rdi, len = r->rsi;
-    if (addr & 0xfff) {
-        r->rax = -1ULL;
-        return (uint64_t)r;
-    }
-    len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    if (!len)
-        len = PAGE_SIZE;
-
-    // carve region boundaries, then drop every region inside [addr, addr+len)
-    if (mmap_ensure_bounds(addr, addr + len) < 0) {
-        r->rax = -1ULL;
-        return (uint64_t)r;
-    }
-    for (struct mmap_region **pp = &current->mmaps; *pp;) {
-        struct mmap_region *m = *pp;
-        if (m->start >= addr + len || m->end <= addr) {
-            pp = &m->next;
-            continue;
-        }
-        mmap_release_range(m, m->start, m->end);
-        *pp = m->next;
-        if (m->file)
-            vfs_close(m->file);
-        kfree(m);
-    }
-    r->rax = 0;
-    return (uint64_t)r;
-}
-
 static uint64_t sys_mprotect(struct regs *r) {
     uint64_t addr = r->rdi, len = r->rsi, prot = r->rdx;
     if ((addr & 0xfff) || !len) {
@@ -524,26 +701,52 @@ static uint64_t sys_brk(struct regs *r) {
 
 static uint64_t sys_execve(struct regs *r) {
     const char *uname = (const char *)r->rdi;
-    // kernel-side copy of the program name (argv[0]); user pages are
-    // readable while the caller's cr3 is still active
-    char name[96];
+    // kernel-side copy of the program name; user pages are readable while
+    // the caller's cr3 is still active (same for argv/envp below)
+    char raw[128];
     int i = 0;
-    while (i < (int)sizeof(name) - 1) {
+    while (i < (int)sizeof(raw) - 1) {
         char c = uname[i];
-        name[i++] = c;
+        raw[i++] = c;
         if (!c)
             break;
     }
-    name[sizeof(name) - 1] = 0;
+    raw[sizeof(raw) - 1] = 0;
 
-    struct vnode *vn = vfs_resolve_prog(name);
-    if (!vn) {
-        r->rax = -1ULL;
+    int has_slash = 0;
+    for (const char *p = raw; *p; p++)
+        if (*p == '/') { has_slash = 1; break; }
+
+    char path[256];
+    struct vnode *vn;
+    if (has_slash) {
+        if (user_path(r->rdi, path, sizeof(path)) < 0) {
+            r->rax = -EFAULT;
+            return (uint64_t)r;
+        }
+        vn = vfs_resolve(path);
+    } else {
+        // bare name: PATH search (kernel policy: /bin/<name>)
+        vn = vfs_resolve_prog(raw);
+        strcpy(path, raw);
+    }
+    if (!vn || vn->type != VNODE_FILE) {
+        r->rax = -ENOENT;
         return (uint64_t)r;
     }
-    uint64_t fr = task_exec_current_named(vn, name);
+
+    // capture argv/envp before the image swap; blocks freed below
+    exec_args_t ea = { 0, 0, 0, 0 };
+    capture_strv(r->rsi, &ea.argv, &ea.argc);
+    capture_strv(r->rdx, &ea.envp, &ea.envc);
+
+    uint64_t fr = task_execve(vn, path, &ea);
+    if (ea.argv)
+        kfree(ea.argv);
+    if (ea.envp)
+        kfree(ea.envp);
     if (!fr) {
-        r->rax = -1ULL;
+        r->rax = -ENOENT;
         return (uint64_t)r;
     }
     return fr;
@@ -562,27 +765,23 @@ static uint64_t sys_writev(struct regs *r) {
     uint64_t cnt = r->rdx;
     uint64_t total = 0;
     for (uint64_t i = 0; i < cnt; i++) {
-        // reuse the write path by hand: fd may be the console
+        // reuse the write path by hand: fd may be the console or a pipe
         struct file *f = fd_get(fd);
         if (!f) {
-            r->rax = -1ULL;
+            r->rax = -EBADF;
             return (uint64_t)r;
         }
-        const char *buf = iv[i].base;
-        uint64_t len = iv[i].len;
-        long n;
-        if (!f->vn) {
-            for (uint64_t j = 0; j < len; j++)
-                console_putc(buf[j]);
-            n = (long)len;
-        } else {
-            n = vfs_write(f, buf, len);
-            if (n < 0) {
-                r->rax = -1ULL;
-                return (uint64_t)r;
-            }
+        long n = file_write(f, iv[i].base, iv[i].len);
+        if (n < 0) {
+            r->rax = -EIO;
+            return (uint64_t)r;
         }
         total += (uint64_t)n;
+    }
+    if (total) {
+        struct file *f = fd_get(fd);
+        if (f && f->pipe)
+            task_wake_pipe(f->pipe);
     }
     r->rax = total;
     return (uint64_t)r;
@@ -623,25 +822,43 @@ struct stat_k {
 
 _Static_assert(sizeof(struct stat_k) == 144, "stat layout");
 
+static void stat_fill(struct stat_k *st, struct vnode *vn) {
+    memset(st, 0, sizeof(*st));
+    if (vn->mode)
+        st->mode = vn->mode;
+    else if (vn->type == VNODE_DIR)
+        st->mode = 0x4000 | 0755;      // S_IFDIR
+    else
+        st->mode = 0x8000 | 0644;      // S_IFREG
+    st->size = vn->size;
+    st->blksize = 1024;
+    st->nlink = 1;
+    st->dev = vn->dev;
+    st->ino = vn->ino;
+}
+
 static uint64_t sys_fstat(struct regs *r) {
     struct file *f = fd_get((int)r->rdi);
     struct stat_k *st = (struct stat_k *)r->rsi;
     if (!f || !st) {
-        r->rax = -1ULL;
+        r->rax = -EFAULT;
         return (uint64_t)r;
     }
-    memset(st, 0, sizeof(*st));
-    if (!f->vn) {
+    if (f->is_console) {
+        memset(st, 0, sizeof(*st));
         st->mode = 0x2000 | 0620;      // S_IFCHR | tty-ish perms
         st->blksize = 1024;
-    } else {
-        st->mode = 0x8000 | 0644;      // S_IFREG
-        st->size = f->vn->size;
-        st->blksize = 1024;
-        st->nlink = 1;
-        st->dev = f->vn->dev;
-        st->ino = f->vn->ino;
+        r->rax = 0;
+        return (uint64_t)r;
     }
+    if (f->pipe) {
+        memset(st, 0, sizeof(*st));
+        st->mode = 0x1000 | 0600;      // S_IFIFO
+        st->blksize = 4096;
+        r->rax = 0;
+        return (uint64_t)r;
+    }
+    stat_fill(st, f->vn);
     r->rax = 0;
     return (uint64_t)r;
 }
@@ -687,28 +904,27 @@ static uint64_t sys_newfstatat(struct regs *r) {
     const char *path = (const char *)r->rsi;
     int empty = !path || !path[0] || (r->r10 & 0x1000);   // AT_EMPTY_PATH
     if (!st || (!empty && !path)) {
-        r->rax = -1ULL;
+        r->rax = -EFAULT;
         return (uint64_t)r;
     }
     struct vnode *vn = 0;
     if (empty) {
         struct file *f = fd_get((int)r->rdi);
-        if (f)
+        if (f && f->vn)
             vn = f->vn;
     } else {
-        vn = vfs_resolve(path);
+        char p[256];
+        if (user_path(r->rsi, p, sizeof(p)) < 0) {
+            r->rax = -EFAULT;
+            return (uint64_t)r;
+        }
+        vn = vfs_resolve(p);
     }
-    if (!vn || vn->type != VNODE_FILE) {
-        r->rax = -1ULL;
+    if (!vn) {
+        r->rax = -ENOENT;
         return (uint64_t)r;
     }
-    memset(st, 0, sizeof(*st));
-    st->mode = 0x8000 | 0644;      // S_IFREG
-    st->size = vn->size;
-    st->blksize = 1024;
-    st->nlink = 1;
-    st->dev = vn->dev;
-    st->ino = vn->ino;
+    stat_fill(st, vn);
     r->rax = 0;
     return (uint64_t)r;
 }
@@ -751,9 +967,14 @@ static uint64_t sys_openat(struct regs *r) {
 }
 
 static uint64_t sys_wait4(struct regs *r) {
+    // cli across the whole scan+block: the child's exit_common also runs
+    // with IF=0, so (single cpu) a child cannot exit between our "no zombie
+    // found" scan and the blocked-state store — that interleave used to
+    // park the parent in WAIT_CHILD forever (busybox children exit fast)
     int *status = (int *)r->rsi;
     long want = (long)r->rdi;          // pid filter: -1 = any child, 0 =
                                        // any child in my group (same here)
+    cli();
     for (int i = 0; i < TASK_MAX; i++) {
         struct task *t = &task_table[i];
         if (t->state == T_ZOMBIE && t->parent == current &&
@@ -763,11 +984,23 @@ static uint64_t sys_wait4(struct regs *r) {
                                        : (t->exit_code & 0xff) << 8;
             r->rax = t->pid;
             t->state = T_FREE;
-            return (uint64_t)r;
+            return (uint64_t)r;        // iretq restores IF
         }
     }
-    // no zombie child yet: sleep until one exits (cli: see sys_read)
-    cli();
+    // posix: no (live or zombie) children at all -> ECHILD, not a block
+    // forever. busybox sh counts on this after reaping a pipeline
+    int have_child = 0;
+    for (int i = 0; i < TASK_MAX; i++)
+        if (task_table[i].state != T_FREE &&
+            task_table[i].parent == current) {
+            have_child = 1;
+            break;
+        }
+    if (!have_child) {
+        r->rax = (uint64_t)-ECHILD;
+        return (uint64_t)r;
+    }
+    // no zombie child yet: sleep until one exits (replay re-runs wait4)
     replay_fixup(r);
     current->wait_reason = WAIT_CHILD;
     current->state = T_BLOCKED;
@@ -989,6 +1222,670 @@ static uint64_t sys_madvise(struct regs *r) {
     return (uint64_t)r;
 }
 
+// --- userspace porting set: cwd, getdents, pipes, fds, namei --------------
+
+// getdents64: f->off doubles as the readdir cursor; linux_dirent64 layout
+struct linux_dirent64_k {
+    uint64_t d_ino;
+    int64_t d_off;
+    uint16_t d_reclen;
+    uint8_t d_type;
+    // char d_name[]; NUL-terminated, padded to 8
+};
+
+static uint64_t sys_getdents64(struct regs *r) {
+    int fd = (int)r->rdi;
+    uint8_t *ubuf = (uint8_t *)r->rsi;
+    uint64_t count = r->rdx;
+    struct file *f = fd_get(fd);
+    if (!f || !f->vn || f->vn->type != VNODE_DIR) {
+        r->rax = f && f->vn ? (uint64_t)-ENOTDIR : (uint64_t)-EBADF;
+        return (uint64_t)r;
+    }
+    uint64_t written = 0;
+    char name[256];
+    for (;;) {
+        uint64_t saved = f->off;
+        uint64_t ctx = saved;
+        uint64_t ino;
+        int type;
+        if (!vfs_readdir(f->vn, &ctx, &ino, &type, name, (int)sizeof(name)))
+            break;
+        uint64_t nl = strlen(name) + 1;
+        uint64_t reclen = (19 + nl + 7) & ~(uint64_t)7;
+        if (written + reclen > count) {
+            f->off = saved;   // entry stays pending for the next call
+            break;
+        }
+        uint8_t *e = ubuf + written;
+        *(uint64_t *)(e + 0) = ino;
+        *(int64_t *)(e + 8) = (int64_t)ctx;
+        *(uint16_t *)(e + 16) = (uint16_t)reclen;
+        e[18] = type == VNODE_DIR ? DT_DIR
+              : type == VNODE_LNK ? DT_LNK : DT_REG;
+        memcpy(e + 19, name, nl);
+        memset(e + 19 + nl, 0, reclen - 19 - nl);
+        written += reclen;
+        f->off = ctx;
+    }
+    r->rax = written;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_getcwd(struct regs *r) {
+    char *buf = (char *)r->rdi;
+    uint64_t size = r->rsi;
+    uint64_t len = strlen(current->cwd) + 1;
+    if (!buf || size < len) {
+        r->rax = size && buf ? (uint64_t)-ERANGE : (uint64_t)-EFAULT;
+        return (uint64_t)r;
+    }
+    memcpy(buf, current->cwd, len);
+    r->rax = len;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_chdir(struct regs *r) {
+    char path[256];
+    if (user_path(r->rdi, path, sizeof(path)) < 0) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    struct vnode *vn = vfs_resolve(path);
+    if (!vn || vn->type != VNODE_DIR) {
+        r->rax = -ENOENT;
+        return (uint64_t)r;
+    }
+    path_canon(path);
+    strcpy(current->cwd, path);
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_pipe2(struct regs *r) {
+    int *ufds = (int *)r->rdi;
+    uint64_t flags = r->rsi;
+    if (!ufds) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    struct pipe *p = pipe_create();
+    if (!p) {
+        r->rax = -ENOMEM;
+        return (uint64_t)r;
+    }
+    struct file *fr = kmalloc(sizeof(*fr));
+    struct file *fw = kmalloc(sizeof(*fw));
+    if (!fr || !fw) {
+        if (fr) kfree(fr);
+        if (fw) kfree(fw);
+        kfree(p);
+        r->rax = -ENOMEM;
+        return (uint64_t)r;
+    }
+    fr->vn = 0; fr->pipe = p; fr->pipe_writer = 0; fr->off = 0;
+    fr->refs = 1; fr->is_console = 0;
+    fw->vn = 0; fw->pipe = p; fw->pipe_writer = 1; fw->off = 0;
+    fw->refs = 1; fw->is_console = 0;
+    int rfd = task_fd_alloc(fr);
+    if (rfd < 0) {
+        kfree(fr);
+        kfree(fw);
+        kfree(p);
+        r->rax = -EMFILE;
+        return (uint64_t)r;
+    }
+    int wfd = task_fd_alloc(fw);
+    if (wfd < 0) {
+        current->fds[rfd] = 0;
+        vfs_close(fr);   // readers->0; the pipe dies with the write end
+        kfree(fw);
+        kfree(p);
+        r->rax = -EMFILE;
+        return (uint64_t)r;
+    }
+    if (flags & O_CLOEXEC) {
+        current->fd_flags[rfd] |= FD_CLOEXEC;
+        current->fd_flags[wfd] |= FD_CLOEXEC;
+    }
+    ufds[0] = rfd;
+    ufds[1] = wfd;
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_pipe(struct regs *r) {
+    struct regs tmp = *r;
+    tmp.rsi = 0;   // no flags
+    sys_pipe2(&tmp);
+    r->rax = tmp.rax;   // shim: return OUR frame, only the result moves
+    return (uint64_t)r;
+}
+
+static uint64_t sys_dup(struct regs *r) {
+    struct file *f = fd_get((int)r->rdi);
+    if (!f) {
+        r->rax = -EBADF;
+        return (uint64_t)r;
+    }
+    f->refs++;
+    int fd = task_fd_alloc(f);
+    if (fd < 0) {
+        f->refs--;
+        r->rax = -EMFILE;
+        return (uint64_t)r;
+    }
+    current->fd_flags[fd] = 0;
+    r->rax = (uint64_t)fd;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_dup2(struct regs *r) {
+    int oldfd = (int)r->rdi;
+    int newfd = (int)r->rsi;
+    struct file *f = fd_get(oldfd);
+    if (!f || newfd < 0 || newfd >= FILE_MAX) {
+        r->rax = -EBADF;
+        return (uint64_t)r;
+    }
+    if (oldfd == newfd) {
+        r->rax = (uint64_t)newfd;
+        return (uint64_t)r;
+    }
+    struct file *prev = current->fds[newfd];
+    current->fds[newfd] = f;
+    current->fd_flags[newfd] = 0;
+    f->refs++;
+    if (prev)
+        vfs_close(prev);
+    r->rax = (uint64_t)newfd;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_dup3(struct regs *r) {
+    uint64_t fr = sys_dup2(r);
+    if ((int)r->rsi != (int)r->rdi && fr == (uint64_t)r &&
+        r->rax == (uint64_t)(int)r->rsi && (r->rdx & O_CLOEXEC))
+        current->fd_flags[(int)r->rsi] |= FD_CLOEXEC;
+    return fr;
+}
+
+static uint64_t sys_fcntl(struct regs *r) {
+    int fd = (int)r->rdi;
+    int cmd = (int)r->rsi;
+    uint64_t arg = r->rdx;
+    struct file *f = fd_get(fd);
+    if (!f) {
+        r->rax = -EBADF;
+        return (uint64_t)r;
+    }
+    switch (cmd) {
+    case F_GETFD:
+        r->rax = current->fd_flags[fd];
+        return (uint64_t)r;
+    case F_SETFD:
+        current->fd_flags[fd] = (arg & FD_CLOEXEC) ? FD_CLOEXEC : 0;
+        r->rax = 0;
+        return (uint64_t)r;
+    case F_GETFL:
+        r->rax = 2;   // O_RDWR: we do not track open modes
+        return (uint64_t)r;
+    case F_SETFL:
+        r->rax = 0;   // O_NONBLOCK et al: accepted, not implemented
+        return (uint64_t)r;
+    case F_DUPFD:
+    case F_DUPFD_CLOEXEC: {
+        if ((int)arg < 0 || (int)arg >= FILE_MAX) {
+            r->rax = -EINVAL;
+            return (uint64_t)r;
+        }
+        for (int i = (int)arg; i < FILE_MAX; i++) {
+            if (current->fds[i])
+                continue;
+            f->refs++;
+            current->fds[i] = f;
+            current->fd_flags[i] =
+                cmd == F_DUPFD_CLOEXEC ? FD_CLOEXEC : 0;
+            r->rax = (uint64_t)i;
+            return (uint64_t)r;
+        }
+        r->rax = -EMFILE;
+        return (uint64_t)r;
+    }
+    default:
+        r->rax = -EINVAL;
+        return (uint64_t)r;
+    }
+}
+
+static uint64_t sys_mkdir(struct regs *r) {
+    char path[256];
+    if (user_path(r->rdi, path, sizeof(path)) < 0) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    if (!vfs_mkdir(path)) {
+        r->rax = -EEXIST;
+        return (uint64_t)r;
+    }
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_rmdir(struct regs *r) {
+    char path[256];
+    if (user_path(r->rdi, path, sizeof(path)) < 0) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    struct vnode *vn = vfs_resolve(path);
+    if (!vn || vn->type != VNODE_DIR) {
+        r->rax = -ENOENT;
+        return (uint64_t)r;
+    }
+    if (!vfs_rmdir(path)) {
+        r->rax = -ENOTEMPTY;
+        return (uint64_t)r;
+    }
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_unlink(struct regs *r) {
+    char path[256];
+    if (user_path(r->rdi, path, sizeof(path)) < 0) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    if (!vfs_unlink(path)) {
+        r->rax = -ENOENT;
+        return (uint64_t)r;
+    }
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_rename(struct regs *r) {
+    char oldp[256], newp[256];
+    if (user_path(r->rdi, oldp, sizeof(oldp)) < 0 ||
+        user_path(r->rsi, newp, sizeof(newp)) < 0) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    if (vfs_rename(oldp, newp) < 0) {
+        r->rax = -ENOENT;
+        return (uint64_t)r;
+    }
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_symlink(struct regs *r) {
+    char path[256];
+    const char *ut = (const char *)r->rsi;
+    char target[128];
+    int i = 0;
+    if (ut)
+        while (i < (int)sizeof(target) - 1) {
+            char c = ut[i];
+            target[i++] = c;
+            if (!c)
+                break;
+        }
+    target[sizeof(target) - 1] = 0;
+    if (!target[0] || user_path(r->rdi, path, sizeof(path)) < 0) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    if (!vfs_symlink(path, target)) {
+        r->rax = -EEXIST;
+        return (uint64_t)r;
+    }
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_readlink(struct regs *r) {
+    char path[256];
+    if (user_path(r->rdi, path, sizeof(path)) < 0) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    struct vnode *vn = vfs_resolve_nofollow(path);
+    if (!vn || vn->type != VNODE_LNK) {
+        r->rax = -EINVAL;
+        return (uint64_t)r;
+    }
+    char *buf = (char *)r->rsi;
+    uint64_t size = r->rdx;
+    char target[128];
+    long n = vfs_readlink_vn(vn, target, sizeof(target));
+    if (n < 0) {
+        r->rax = -EINVAL;
+        return (uint64_t)r;
+    }
+    if ((uint64_t)n > size)
+        n = (long)size;
+    memcpy(buf, target, (uint64_t)n);
+    r->rax = (uint64_t)n;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_ftruncate(struct regs *r) {
+    struct file *f = fd_get((int)r->rdi);
+    uint64_t len = r->rsi;
+    if (!f || !f->vn) {
+        r->rax = -EBADF;
+        return (uint64_t)r;
+    }
+    if (vfs_truncate_to(f->vn, len) < 0) {
+        r->rax = -EINVAL;
+        return (uint64_t)r;
+    }
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_fchmod(struct regs *r) {
+    struct file *f = fd_get((int)r->rdi);
+    if (!f || !f->vn) {
+        r->rax = -EBADF;
+        return (uint64_t)r;
+    }
+    if (vfs_chmod(f->vn, (uint32_t)r->rsi) < 0) {
+        r->rax = -EPERM;
+        return (uint64_t)r;
+    }
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_fchmodat(struct regs *r) {
+    char path[256];
+    if (user_path(r->rsi, path, sizeof(path)) < 0) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    struct vnode *vn = vfs_resolve(path);
+    if (!vn) {
+        r->rax = -ENOENT;
+        return (uint64_t)r;
+    }
+    if (vfs_chmod(vn, (uint32_t)r->rdx) < 0) {
+        r->rax = -EPERM;
+        return (uint64_t)r;
+    }
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_link(struct regs *r) {
+    char oldp[256], newp[256];
+    if (user_path(r->rdi, oldp, sizeof(oldp)) < 0 ||
+        user_path(r->rsi, newp, sizeof(newp)) < 0) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    if (vfs_link(oldp, newp) < 0) {
+        r->rax = -ENOENT;
+        return (uint64_t)r;
+    }
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_chmod(struct regs *r) {
+    char path[256];
+    if (user_path(r->rdi, path, sizeof(path)) < 0) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    struct vnode *vn = vfs_resolve(path);
+    if (!vn) {
+        r->rax = -ENOENT;
+        return (uint64_t)r;
+    }
+    if (vfs_chmod(vn, (uint32_t)r->rsi) < 0) {
+        r->rax = -EPERM;
+        return (uint64_t)r;
+    }
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+// glibc struct sysinfo (x86_64: 112 bytes, tail-padded)
+struct sysinfo_k {
+    int64_t uptime;
+    uint64_t loads[3];
+    uint64_t totalram, freeram, sharedram, bufferram;
+    uint64_t totalswap, freeswap;
+    uint16_t procs, pad;
+    uint64_t totalhigh, freehigh;
+    uint32_t mem_unit;
+};
+
+_Static_assert(sizeof(struct sysinfo_k) == 112, "sysinfo layout");
+
+static uint64_t sys_sysinfo(struct regs *r) {
+    struct sysinfo_k *si = (struct sysinfo_k *)r->rdi;
+    if (!si) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    memset(si, 0, sizeof(*si));
+    si->uptime = (int64_t)(pit_ticks() / 100);
+    si->totalram = pmm_total_mem();
+    si->freeram = pmm_free_mem();
+    si->mem_unit = 1;
+    int procs = 0;
+    for (int i = 0; i < TASK_MAX; i++)
+        if (task_table[i].state != T_FREE && task_table[i].pid)
+            procs++;
+    si->procs = (uint16_t)procs;
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_faccessat(struct regs *r) {
+    char path[256];
+    if (user_path(r->rsi, path, sizeof(path)) < 0) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    // mode: F_OK existence check; R/W/X all granted (we run as root)
+    struct vnode *vn = vfs_resolve(path);
+    if (!vn) {
+        r->rax = -ENOENT;
+        return (uint64_t)r;
+    }
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_access(struct regs *r) {
+    struct regs tmp = *r;
+    tmp.rsi = r->rdi;   // path
+    tmp.rdx = r->rsi;   // mode
+    sys_faccessat(&tmp);
+    r->rax = tmp.rax;   // shim: return OUR frame, only the result moves
+    return (uint64_t)r;
+}
+
+static uint64_t sys_faccessat(struct regs *r);
+static uint64_t sys_access(struct regs *r);
+static int munmap_range(uint64_t addr, uint64_t len);
+
+static uint64_t sys_mremap(struct regs *r) {
+    uint64_t addr = r->rdi;
+    uint64_t old_len = (r->rsi + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint64_t new_len = (r->rdx + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if ((addr & 0xfff) || !old_len || !new_len) {
+        r->rax = -EINVAL;
+        return (uint64_t)r;
+    }
+    // exact anonymous region only (what musl's realloc mremaps)
+    struct mmap_region *m = 0;
+    for (struct mmap_region *x = current->mmaps; x; x = x->next)
+        if (x->start == addr && x->end == addr + old_len && !x->file) {
+            m = x;
+            break;
+        }
+    if (!m) {
+        r->rax = -EINVAL;
+        return (uint64_t)r;
+    }
+    if (new_len <= old_len) {
+        if (new_len < old_len)
+            munmap_range(addr + new_len, old_len - new_len);
+        r->rax = addr;
+        return (uint64_t)r;
+    }
+    // grow: fresh gap, eager map, copy, drop the old range
+    uint64_t hint = USER_MMAP_BASE;
+    struct mmap_region *g = current->mmaps;
+    for (; g; g = g->next) {
+        if (g->start - hint >= new_len)
+            break;
+        hint = g->end;
+    }
+    uint64_t start = hint;
+    for (struct mmap_region *x = current->mmaps; x; x = x->next)
+        if (start < x->end && x->start < start + new_len) {
+            r->rax = -ENOMEM;
+            return (uint64_t)r;
+        }
+    uint64_t vflags = VMM_PRESENT | VMM_USER;
+    if (m->prot & PROT_WRITE)
+        vflags |= VMM_WRITE;
+    if (!(m->prot & PROT_EXEC))
+        vflags |= VMM_NX;
+    for (uint64_t va = start; va < start + new_len; va += PAGE_SIZE) {
+        void *pg = pmm_alloc_zeroed();
+        if (!pg)
+            panic("mremap: out of pages");
+        vmm_map(current->pml4, va, (uint64_t)pg, vflags);
+    }
+    uint64_t copy = old_len < new_len ? old_len : new_len;
+    memcpy((void *)start, (const void *)addr, copy);
+    struct mmap_region *nm = kmalloc(sizeof(*nm));
+    if (!nm)
+        panic("mremap: out of kernel heap");
+    *nm = *m;
+    nm->start = start;
+    nm->end = start + new_len;
+    nm->next = 0;
+    struct mmap_region **pp = &current->mmaps;
+    while (*pp && (*pp)->start < start)
+        pp = &(*pp)->next;
+    nm->next = *pp;
+    *pp = nm;
+    munmap_range(addr, old_len);
+    r->rax = start;
+    return (uint64_t)r;
+}
+
+// shared tail of munmap: carve bounds, drop every region inside
+static int munmap_range(uint64_t addr, uint64_t len) {
+    if (mmap_ensure_bounds(addr, addr + len) < 0)
+        return -1;
+    for (struct mmap_region **pp = &current->mmaps; *pp;) {
+        struct mmap_region *m = *pp;
+        if (m->start >= addr + len || m->end <= addr) {
+            pp = &m->next;
+            continue;
+        }
+        mmap_release_range(m, m->start, m->end);
+        *pp = m->next;
+        if (m->file)
+            vfs_close(m->file);
+        kfree(m);
+    }
+    return 0;
+}
+
+static uint64_t sys_munmap(struct regs *r) {
+    uint64_t addr = r->rdi, len = r->rsi;
+    if (addr & 0xfff) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
+    len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (!len)
+        len = PAGE_SIZE;
+    if (munmap_range(addr, len) < 0) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_gettimeofday(struct regs *r) {
+    uint64_t *tv = (uint64_t *)r->rdi;
+    if (!tv) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    uint64_t t = pit_ticks();
+    tv[0] = t / 100;                 // seconds
+    tv[1] = (t % 100) * 10000;       // usec
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_setpgid(struct regs *r) {
+    long pid = (long)r->rdi;
+    long pgid = (long)r->rsi;
+    struct task *t = current;
+    if (pid != 0 && pid != current->pid) {
+        t = 0;
+        for (int i = 0; i < TASK_MAX; i++)
+            if (task_table[i].state != T_FREE &&
+                task_table[i].pid == pid &&
+                task_table[i].parent == current) {
+                t = &task_table[i];
+                break;
+            }
+        if (!t) {
+            r->rax = -ESRCH;
+            return (uint64_t)r;
+        }
+    }
+    if (pgid == 0)
+        pgid = t->tgid;
+    t->pgid = (int)pgid;
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_getpgid(struct regs *r) {
+    long pid = (long)r->rdi;
+    if (pid == 0) {
+        r->rax = (uint64_t)current->pgid;
+        return (uint64_t)r;
+    }
+    for (int i = 0; i < TASK_MAX; i++)
+        if (task_table[i].state != T_FREE && task_table[i].pid == pid) {
+            r->rax = (uint64_t)task_table[i].pgid;
+            return (uint64_t)r;
+        }
+    r->rax = -ESRCH;
+    return (uint64_t)r;
+}
+
+// stubs: accepted, no state
+static uint64_t sys_sigaltstack(struct regs *r) {
+    (void)r;
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_utimensat(struct regs *r) {
+    (void)r;
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
 uint64_t syscall_dispatch(struct regs *r) {
     // entry guard: a syscall arriving while the scheduler thinks the idle
     // task is current means a context escaped from the scheduler — catch
@@ -1054,9 +1951,39 @@ uint64_t syscall_dispatch(struct regs *r) {
     case SYS_mmap:    fr = sys_mmap(r); break;
     case SYS_mprotect: fr = sys_mprotect(r); break;
     case SYS_munmap:  fr = sys_munmap(r); break;
+    case SYS_mremap:  fr = sys_mremap(r); break;
     case SYS_madvise: fr = sys_madvise(r); break;
     case SYS_brk:     fr = sys_brk(r); break;
     case SYS_futex:   fr = sys_futex(r); break;
+    case SYS_getdents64: fr = sys_getdents64(r); break;
+    case SYS_getcwd:  fr = sys_getcwd(r); break;
+    case SYS_chdir:   fr = sys_chdir(r); break;
+    case SYS_pipe:    fr = sys_pipe(r); break;
+    case SYS_pipe2:   fr = sys_pipe2(r); break;
+    case SYS_dup:     fr = sys_dup(r); break;
+    case SYS_dup2:    fr = sys_dup2(r); break;
+    case SYS_dup3:    fr = sys_dup3(r); break;
+    case SYS_fcntl:   fr = sys_fcntl(r); break;
+    case SYS_mkdir:   fr = sys_mkdir(r); break;
+    case SYS_rmdir:   fr = sys_rmdir(r); break;
+    case SYS_unlink:  fr = sys_unlink(r); break;
+    case SYS_rename:  fr = sys_rename(r); break;
+    case SYS_symlink: fr = sys_symlink(r); break;
+    case SYS_readlink: fr = sys_readlink(r); break;
+    case SYS_ftruncate: fr = sys_ftruncate(r); break;
+    case SYS_chmod:   fr = sys_chmod(r); break;
+    case SYS_fchmod:  fr = sys_fchmod(r); break;
+    case SYS_fchmodat: fr = sys_fchmodat(r); break;
+    case SYS_link:    fr = sys_link(r); break;
+    case 170 /* SYS_sync */: r->rax = 0; fr = (uint64_t)r; break;
+    case SYS_sysinfo: fr = sys_sysinfo(r); break;
+    case SYS_faccessat: fr = sys_faccessat(r); break;
+    case 21 /* SYS_access */: fr = sys_access(r); break;
+    case SYS_gettimeofday: fr = sys_gettimeofday(r); break;
+    case SYS_setpgid: fr = sys_setpgid(r); break;
+    case SYS_getpgid: fr = sys_getpgid(r); break;
+    case SYS_sigaltstack: fr = sys_sigaltstack(r); break;
+    case SYS_utimensat: fr = sys_utimensat(r); break;
     case SYS_getpid:  r->rax = (uint64_t)(long)current->tgid; fr = (uint64_t)r; break;
     case SYS_gettid:  r->rax = (uint64_t)(long)current->pid; fr = (uint64_t)r; break;
     case SYS_getppid: fr = sys_getppid(r); break;

@@ -88,11 +88,42 @@ int main(void) {
             printf("bye\n");
             return 0;
         } else {
-            // try to run it from /bin via fork+exec
+            // try to run it from /bin via fork+exec; quote-aware tokenizer
+            // (strips ' and " spans) so argv reaches the child intact —
+            // busybox dispatches on argv[0], sh -c needs one fat argument
+            char *argv[16];
+            int argc = 0;
+            char *p = buf;      // read cursor
+            char *w = buf;      // write cursor (quotes stripped in place)
+            while (*p) {
+                while (*p == ' ')
+                    p++;
+                if (!*p)
+                    break;
+                if (argc < 15)
+                    argv[argc++] = w;
+                while (*p && *p != ' ') {
+                    if (*p == '\'' || *p == '"') {
+                        char q = *p++;
+                        while (*p && *p != q)
+                            *w++ = *p++;
+                        if (*p == q)
+                            p++;
+                    } else {
+                        *w++ = *p++;
+                    }
+                }
+                if (*p)
+                    p++;        // the space
+                *w++ = 0;
+            }
+            if (!argc)
+                continue;
+            argv[argc] = 0;
             long pid = fork();
             if (pid == 0) {
-                if (execve(buf, 0, 0) < 0) {
-                    printf("unknown: %s (try help)\n", buf);
+                if (execve(argv[0], argv, 0) < 0) {
+                    printf("unknown: %s (try help)\n", argv[0]);
                     exit(1);
                 }
             } else {

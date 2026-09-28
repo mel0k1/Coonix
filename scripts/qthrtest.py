@@ -39,11 +39,24 @@ class Qmp:
         except (BrokenPipeError, OSError):
             return None
 
-    def type_str(self, text, delay=0.012):
+    def type_str(self, text, delay=0.03):
         specials = {" ": "spc", "\n": "ret", "-": "minus", "=": "equal",
                     "[": "bracket_left", "]": "bracket_right",
-                    "/": "slash", ".": "dot", ",": "comma", ";": "semicolon"}
+                    "/": "slash", ".": "dot", ",": "comma", ";": "semicolon",
+                    "`": "grave_accent", "'": "apostrophe",
+                    "\\\\": "backslash"}
+        shifted = {"|": "backslash", ">": "dot", "<": "comma",
+                   "\"": "apostrophe", "~": "grave_accent",
+                   "$": "4", "#": "3", "&": "7", "*": "8",
+                   "(": "9", ")": "0", "+": "equal", "_": "minus",
+                   ":": "semicolon", "!": "1", "?": "slash",
+                   "%": "5", "@": "2", "^": "6", "{": "bracket_left",
+                   "}": "bracket_right"}
         for ch in text:
+            if ch in shifted:
+                self.key("shift", shifted[ch])
+                time.sleep(delay)
+                continue
             if ch in specials:
                 q = specials[ch]
                 shift = False
@@ -65,8 +78,8 @@ class Qmp:
             time.sleep(delay)
 
 
-def main():
-    machine = sys.argv[1] if len(sys.argv) > 1 else "pc"
+def main_setup(machine):
+    """boot qemu headless, connect qmp, wait for the shell prompt"""
     open("/tmp/coonix-serial.log", "wb").close()
     ser = open("/tmp/coonix-serial.log", "rb")
 
@@ -95,45 +108,53 @@ def main():
         except (ConnectionRefusedError, FileNotFoundError, OSError):
             if qemu.poll() is not None:
                 print("qemu died early", file=sys.stderr)
-                return 1
+                raise SystemExit(1)
             time.sleep(0.5)
     if q is None:
         print("qmp socket never came up", file=sys.stderr)
-        return 1
+        raise SystemExit(1)
     q.cmd("qmp_capabilities")
     deadline = time.time() + 30
     seen = b""
     while time.time() < deadline:
-        data = ser.read()
-        seen += data
+        seen += ser.read()
         if b"coonix> " in seen:
             break
         time.sleep(0.4)
+    return qemu, q, ser
 
-    def run(cmd, wait_s=3.0, expect=None, timeout=40):
-        nonlocal seen
-        q.type_str(cmd + "\n")
-        acc = b""
-        start = time.time()
-        while time.time() - start < timeout:
-            acc += ser.read()
-            if expect and expect.encode() in acc:
-                break
-            time.sleep(0.3)
-        out = acc.decode(errors="replace")
-        ok = not expect or expect in out
-        print(f"[{'OK' if ok else 'FAIL'}] {cmd}")
-        if not ok:
-            print(out)
-        elif len(out) < 800:
-            print(out.rstrip())
-        return ok
+
+def run_shell(q, ser, cmd, expect=None, timeout=40):
+    """type a command at the shell, wait for expected output"""
+    # the prompt prints slightly before read() re-arms; give it a beat
+    time.sleep(0.6)
+    q.type_str(cmd + "\n")
+    acc = b""
+    start = time.time()
+    while time.time() - start < timeout:
+        acc += ser.read()
+        if expect and expect.encode() in acc:
+            break
+        time.sleep(0.3)
+    out = acc.decode(errors="replace")
+    ok = not expect or expect in out
+    print(f"[{'OK' if ok else 'FAIL'}] {cmd}")
+    if not ok:
+        print(out)
+    elif len(out) < 800:
+        print(out.rstrip())
+    return ok
+
+
+def main():
+    machine = sys.argv[1] if len(sys.argv) > 1 else "pc"
+    qemu, q, ser = main_setup(machine)
 
     results = []
-    results.append(run("pthreadtest", wait_s=3, expect="pthreadtest: OK",
-                       timeout=120))
-    results.append(run("sigtest", wait_s=3, expect="sigtest: OK",
-                       timeout=120))
+    results.append(run_shell(q, ser, "pthreadtest", expect="pthreadtest: OK",
+                             timeout=120))
+    results.append(run_shell(q, ser, "sigtest", expect="sigtest: OK",
+                             timeout=120))
     # iotest: typed interaction (canonical line, then raw key)
     q.type_str("iotest\n")
     time.sleep(3)
@@ -149,8 +170,8 @@ def main():
     results.append(ok)
     # ctrl-C must not kill the shell: interrupt the raw read mid-way
     # (iotest exited; shell is at prompt)
-    results.append(run("hello", wait_s=2, expect="hello from ring 3"))
-    results.append(run("forktest", wait_s=2, expect="cow works"))
+    results.append(run_shell(q, ser, "hello", expect="hello from ring 3"))
+    results.append(run_shell(q, ser, "forktest", expect="cow works"))
 
     qemu.terminate()
     qemu.wait()

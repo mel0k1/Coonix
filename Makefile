@@ -25,7 +25,7 @@ KSRC  := $(wildcard kernel/*.c)
 KASM  := $(wildcard kernel/*.asm)
 KOBJ  := $(KSRC:%.c=$(BUILD)/%.o) $(KASM:%.asm=$(BUILD)/%.o)
 
-USERS := shell hello forktest mtest fstest dtest
+USERS := shell hello forktest mtest fstest dtest fsx
 ULIBC := $(BUILD)/libc/string.o $(BUILD)/libc/stdio.o
 UELF  := $(USERS:%=$(BUILD)/user/%.elf)
 
@@ -85,17 +85,11 @@ $(RAMDISK): $(USERS:%=$(RDISK_ROOT)/bin/%) $(RDISK_ROOT)/etc/motd
 
 LIBSTAMP := $(RDISK_ROOT)/lib64/.stamp
 
-GLIBC_PROGS := $(RDISK_ROOT)/bin/glibc_hello $(RDISK_ROOT)/bin/hello_dyn \
+GLIBC_PROGS := $(RDISK_ROOT)/bin/hello_dyn \
 	$(RDISK_ROOT)/bin/pthreadtest $(RDISK_ROOT)/bin/sigtest \
-	$(RDISK_ROOT)/bin/iotest \
+	$(RDISK_ROOT)/bin/iotest $(RDISK_ROOT)/bin/dltest \
+	$(RDISK_ROOT)/lib/libfoo.so \
 	$(LIBSTAMP)
-
-$(RDISK_ROOT)/bin/glibc_hello: user/glibc_hello.c
-	@if gcc -static -O2 -o $@ $< 2>/dev/null; then \
-	        echo "glibc: built $@"; \
-	else \
-	        rm -f $@; echo "glibc: no static libc, skipping"; \
-	fi
 
 # dynamically linked hello: needs the real ld.so + libc on the disk
 $(RDISK_ROOT)/bin/hello_dyn: user/glibc_hello.c
@@ -127,21 +121,80 @@ $(RDISK_ROOT)/bin/iotest: user/iotest.c
 	        rm -f $@; echo "glibc: iotest skipped"; \
 	fi
 
+# dlopen: runtime-loaded shared object via the real loader
+$(RDISK_ROOT)/bin/dltest: user/dltest.c
+	@if gcc -O2 -Wall -o $@ $< 2>/dev/null; then \
+		echo "glibc: built $@"; \
+	else \
+		rm -f $@; echo "glibc: dltest skipped"; \
+	fi
+
+# freestanding .so (no DT_NEEDED) so the disk needs no extra libs
+$(RDISK_ROOT)/lib/libfoo.so: user/libfoo.c
+	@mkdir -p $(dir $@)
+	@if gcc -shared -fPIC -nostdlib -O2 -o $@ $< 2>/dev/null; then \
+		echo "glibc: built $@"; \
+	else \
+		rm -f $@; echo "glibc: libfoo skipped"; \
+	fi
+
 $(RDISK_ROOT)/lib64/.stamp:
 	@mkdir -p $(RDISK_ROOT)/lib64 $(RDISK_ROOT)/lib/x86_64-linux-gnu
-	@for d in lib64 lib/x86_64-linux-gnu; do \
-	        for f in ld-linux-x86-64.so.2 libc.so.6; do \
-	                cp /usr/lib/x86_64-linux-gnu/$$f $(RDISK_ROOT)/$$d/ 2>/dev/null || true; \
-	        done; \
+	@# interp path is hardcoded to /lib64; the rest lives only in the
+	@# multiarch dir (ld.so default search path) to save disk space
+	cp /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 $(RDISK_ROOT)/lib64/ 2>/dev/null || true
+	@for f in libc.so.6 libm.so.6 libresolv.so.2; do \
+		cp /usr/lib/x86_64-linux-gnu/$$f $(RDISK_ROOT)/lib/x86_64-linux-gnu/ 2>/dev/null || true; \
 	done
 	@touch $@
 
+# --- busybox: host-gcc dynamic glibc build riding the existing ld.so path
+
+BUSYBOX_VER := 1_36_1
+BUSYBOX_DIR := build/busybox-$(BUSYBOX_VER)
+BUSYBOX_TAR := build/busybox-$(BUSYBOX_VER).tar.gz
+BB_APPLETS := sh ash ls cat echo pwd cp mv rm mkdir rmdir touch env sleep \
+              head tail wc grep seq true false uname clear printf test \
+              sync free date basename dirname which id whoami ln stat \
+              cmp cut tr od xargs find nice
+
+$(BUSYBOX_TAR):
+	@mkdir -p build
+	curl -sL --max-time 300 -o $@ \
+	    https://github.com/mirror/busybox/archive/refs/tags/$(BUSYBOX_VER).tar.gz
+
+$(BUSYBOX_DIR)/Makefile: $(BUSYBOX_TAR)
+	tar xzf $< -C build
+
+$(BUSYBOX_DIR)/busybox: $(BUSYBOX_DIR)/Makefile
+	@if [ ! -f $(BUSYBOX_DIR)/.config ]; then \
+		$(MAKE) -C $(BUSYBOX_DIR) defconfig; \
+		sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' $(BUSYBOX_DIR)/.config; \
+	fi
+	$(MAKE) -C $(BUSYBOX_DIR) -j$$(nproc)
+	strip $(BUSYBOX_DIR)/busybox
+
+$(RDISK_ROOT)/bin/busybox: $(BUSYBOX_DIR)/busybox
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+# applet links: the kernel vfs resolves fast symlinks, busybox dispatches
+# on basename(argv[0])
+$(RDISK_ROOT)/bin/.bblinks: $(RDISK_ROOT)/bin/busybox
+	@for a in $(BB_APPLETS); do ln -sf busybox $(RDISK_ROOT)/bin/$$a; done
+	@touch $@
+
+# scratch dir for the tests (ext2 dirs persist across runs)
+$(RDISK_ROOT)/tmp/.keep:
+	@mkdir -p $(RDISK_ROOT)/tmp
+	@touch $@
 
 # --- disk: real ext2 image for the ata driver ---
 
 DISK := $(BUILD)/disk.img
 
-$(DISK): $(USERS:%=$(RDISK_ROOT)/bin/%) $(RDISK_ROOT)/etc/motd $(GLIBC_PROGS) tools/mkdisk.py
+$(DISK): $(USERS:%=$(RDISK_ROOT)/bin/%) $(RDISK_ROOT)/etc/motd $(GLIBC_PROGS) \
+        $(RDISK_ROOT)/bin/.bblinks $(RDISK_ROOT)/tmp/.keep tools/mkdisk.py
 	python3 tools/mkdisk.py $(RDISK_ROOT) $@
 
 disk: $(DISK)

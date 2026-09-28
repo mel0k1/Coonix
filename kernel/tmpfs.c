@@ -113,6 +113,71 @@ static struct vnode *tmpfs_create(struct vnode *dir, const char *name) {
     return n ? &n->vn : 0;
 }
 
+static int tmpfs_readdir(struct vnode *dir, uint64_t *ctx, uint64_t *ino,
+                         int *type, char *name, int name_cap) {
+    struct tnode *t = vn2t(dir);
+    uint64_t skip = *ctx;
+    for (struct tnode *c = t->child; c; c = c->sibling) {
+        if (skip) { skip--; continue; }
+        strncpy(name, c->name, name_cap - 1);
+        name[name_cap - 1] = 0;
+        *ino = c->vn.ino;
+        *type = c->type;
+        (*ctx)++;
+        return 1;
+    }
+    return 0;
+}
+
+static int tmpfs_unlink(struct vnode *dir, const char *name) {
+    struct tnode *t = vn2t(dir);
+    struct tnode **pp = &t->child;
+    while (*pp) {
+        if (!strcmp((*pp)->name, name)) {
+            if ((*pp)->type == VNODE_DIR)
+                return -1;
+            struct tnode *dead = *pp;
+            *pp = dead->sibling;
+            if (dead->data)
+                kfree(dead->data);
+            kfree(dead);
+            nnodes--;
+            return 0;
+        }
+        pp = &(*pp)->sibling;
+    }
+    return -1;
+}
+
+static struct vnode *tmpfs_mkdir(struct vnode *dir, const char *name) {
+    struct tnode *t = vn2t(dir);
+    if (t->type != VNODE_DIR || strlen(name) >= NAME_MAX)
+        return 0;
+    for (struct tnode *x = t->child; x; x = x->sibling)
+        if (!strcmp(x->name, name))
+            return 0;
+    struct tnode *n = tnode_new(name, VNODE_DIR, t);
+    return n ? &n->vn : 0;
+}
+
+static int tmpfs_rmdir(struct vnode *dir, const char *name) {
+    struct tnode *t = vn2t(dir);
+    struct tnode **pp = &t->child;
+    while (*pp) {
+        if (!strcmp((*pp)->name, name)) {
+            struct tnode *dead = *pp;
+            if (dead->type != VNODE_DIR || dead->child)
+                return -1;
+            *pp = dead->sibling;
+            kfree(dead);
+            nnodes--;
+            return 0;
+        }
+        pp = &(*pp)->sibling;
+    }
+    return -1;
+}
+
 static int tmpfs_truncate(struct vnode *vn) {
     struct tnode *t = vn2t(vn);
     if (t->type != VNODE_FILE)
@@ -138,6 +203,7 @@ static struct tnode *tnode_new(const char *name, int type, struct tnode *parent)
     t->vn.fs_data = t;
     t->vn.ino = ++tino;
     t->vn.dev = 0x0009;   // distinct from ext2, stable per-fs id
+    t->vn.mode = type == VNODE_DIR ? 0x4000 | 0755 : 0x8000 | 0644;
     if (parent) {
         t->sibling = parent->child;
         parent->child = t;
@@ -152,6 +218,10 @@ void tmpfs_mount(void) {
     tmpfs_ops.write = tmpfs_write;
     tmpfs_ops.create = tmpfs_create;
     tmpfs_ops.truncate = tmpfs_truncate;
+    tmpfs_ops.readdir = tmpfs_readdir;
+    tmpfs_ops.unlink = tmpfs_unlink;
+    tmpfs_ops.mkdir = tmpfs_mkdir;
+    tmpfs_ops.rmdir = tmpfs_rmdir;
     troot = tnode_new("", VNODE_DIR, 0);
     if (!troot)
         panic("tmpfs: no root");

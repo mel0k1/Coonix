@@ -2,9 +2,11 @@
 #pragma once
 #include <stdint.h>
 
-enum { VNODE_FILE, VNODE_DIR };
+enum { VNODE_FILE, VNODE_DIR, VNODE_LNK, VNODE_PIPE };
 
 struct vnode;
+
+struct pipe;
 
 // fs driver callbacks, all take/return vnodes
 struct vfs_ops {
@@ -17,11 +19,35 @@ struct vfs_ops {
     struct vnode *(*create)(struct vnode *dir, const char *name);
     // cut a regular file down to zero bytes; 0 ok, -1 error
     int (*truncate)(struct vnode *vn);
+    // --- optional (zero = unsupported) ---
+    // directory iterator: one entry per call. *ctx is a driver-private
+    // cursor (0 = restart); returns 1 with entry filled, 0 = no more
+    int (*readdir)(struct vnode *dir, uint64_t *ctx, uint64_t *ino,
+                   int *type, char *name, int name_cap);
+    // remove name from dir (file or symlink); 0 ok
+    int (*unlink)(struct vnode *dir, const char *name);
+    // create a directory; 0 ok
+    struct vnode *(*mkdir)(struct vnode *dir, const char *name);
+    // remove an empty directory; 0 ok
+    int (*rmdir)(struct vnode *dir, const char *name);
+    // symlink target into buf; bytes copied or -1
+    long (*readlink)(struct vnode *vn, char *buf, uint64_t size);
+    // create a symlink named name -> target; 0 ok
+    struct vnode *(*symlink)(struct vnode *dir, const char *name,
+                             const char *target);
+    // resize a file (free blocks past the new end); 0 ok
+    int (*truncate_to)(struct vnode *vn, uint64_t size);
+    // change permission bits (type bits preserved); 0 ok
+    int (*chmod)(struct vnode *vn, uint32_t mode);
+    // add a second directory entry pointing at an existing vnode (hard
+    // link); bumps the link count; 0 ok
+    int (*link)(struct vnode *dir, struct vnode *vn, const char *name);
 };
 
 struct vnode {
-    int type;              // VNODE_FILE / VNODE_DIR
-    uint64_t size;         // files: bytes; dirs: 0
+    int type;              // VNODE_*
+    uint64_t size;         // files/symlinks: bytes
+    uint32_t mode;         // st_mode low bits incl. S_IFxxx
     struct vfs_ops *ops;
     void *fs_data;         // fs-private inode
     uint64_t ino;          // fs inode number (st_ino)
@@ -30,7 +56,9 @@ struct vnode {
 
 // open file description, shared across fork
 struct file {
-    struct vnode *vn;      // 0 = console
+    struct vnode *vn;      // 0 = console or pipe
+    struct pipe *pipe;     // 0 unless a pipe endpoint
+    int pipe_writer;       // pipe endpoints: 1 = write end
     uint64_t off;
     int refs;
     int is_console;
@@ -38,11 +66,16 @@ struct file {
 
 #define FILE_MAX 16
 
+// fd flags (fcntl F_SETFD / exec)
+#define FD_CLOEXEC 1
+
 void vfs_init(void);
 void vfs_mount_root(struct vnode *vn);
 
-// absolute paths only (no cwd yet)
+// absolute paths; symlink components are followed (last one too)
 struct vnode *vfs_resolve(const char *path);
+// like vfs_resolve but the final component is NOT dereferenced if a link
+struct vnode *vfs_resolve_nofollow(const char *path);
 // resolve executable: full path as-is, bare name -> /bin/<name>
 struct vnode *vfs_resolve_prog(const char *name);
 
@@ -60,3 +93,20 @@ long vfs_read_file(const char *path, void **outbuf);
 struct vnode *vfs_create(const char *path);
 // truncate a file vnode to zero length
 int vfs_truncate(struct vnode *vn);
+
+// directory iteration glue for getdents64: one entry per call, *ctx is
+// an opaque cursor owned by the caller (0 = start)
+int vfs_readdir(struct vnode *dir, uint64_t *ctx, uint64_t *ino, int *type,
+                char *name, int name_cap);
+
+// namei building blocks used by the syscall layer; paths are absolute,
+// the caller prepends cwd for relative names
+struct vnode *vfs_unlink(const char *path);
+struct vnode *vfs_mkdir(const char *path);
+struct vnode *vfs_rmdir(const char *path);
+struct vnode *vfs_symlink(const char *path, const char *target);
+long vfs_readlink_vn(struct vnode *vn, char *buf, uint64_t size);
+int vfs_rename(const char *oldp, const char *newp);
+int vfs_truncate_to(struct vnode *vn, uint64_t size);
+int vfs_chmod(struct vnode *vn, uint32_t mode);
+int vfs_link(const char *oldp, const char *newp);

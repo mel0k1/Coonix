@@ -37,8 +37,7 @@ static inline long fork(void) {
 }
 
 static inline long execve(const char *name, char *const argv[], char *const envp[]) {
-    (void)argv; (void)envp;
-    return _sys(59, (long)name, 0, 0);
+    return _sys(59, (long)name, (long)argv, (long)envp);
 }
 
 static inline void exit(int code) {
@@ -181,3 +180,92 @@ struct coonix_termios {
 static inline long ioctl(int fd, unsigned long req, void *arg) {
     return _sys(16, fd, (long)req, (long)arg);
 }
+
+// --- fs ops: cwd, directories, namei (kernel numbers, linux order) ---
+
+#define DT_BLK  6
+#define DT_CHR  2
+#define DT_FIFO 1
+#define DT_LNK  10
+#define DT_DIR  4
+#define DT_REG  8
+
+struct coonix_dirent64 {
+    unsigned long long d_ino;
+    long long d_off;
+    unsigned short d_reclen;
+    unsigned char d_type;
+    char d_name[];
+};
+
+static inline long getdents64(int fd, void *buf, unsigned long len) {
+    return _sys(217, fd, (long)buf, (long)len);
+}
+
+static inline long chdir(const char *path) {
+    return _sys(80, (long)path, 0, 0);
+}
+
+static inline long getcwd(char *buf, unsigned long size) {
+    return _sys(79, (long)buf, (long)size, 0);
+}
+
+static inline long pipe(int *fds) {
+    return _sys(22, (long)fds, 0, 0);
+}
+
+static inline long dup(int fd) {
+    return _sys(32, fd, 0, 0);
+}
+
+static inline long dup2(int oldfd, int newfd) {
+    return _sys(33, oldfd, newfd, 0);
+}
+
+static inline long fcntl(int fd, int cmd, long arg) {
+    return _sys(72, fd, cmd, arg);
+}
+
+static inline long mkdir(const char *path, unsigned mode) {
+    (void)mode;
+    return _sys(83, (long)path, 0, 0);
+}
+
+static inline long rmdir(const char *path) {
+    return _sys(84, (long)path, 0, 0);
+}
+
+static inline long unlink(const char *path) {
+    return _sys(87, (long)path, 0, 0);
+}
+
+static inline long symlink(const char *target, const char *linkpath) {
+    return _sys(88, (long)linkpath, (long)target, 0);
+}
+
+static inline long rename(const char *oldp, const char *newp) {
+    return _sys(82, (long)oldp, (long)newp, 0);
+}
+
+static inline long ftruncate(int fd, unsigned long len) {
+    return _sys(77, fd, (long)len, 0);
+}
+
+static inline long access(const char *path, int mode) {
+    return _sys(21, (long)path, mode, 0);
+}
+
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+
+static inline long lseek(int fd, long off, int whence) {
+    return _sys(8, fd, off, whence);
+}
+
+#define F_GETFD 1
+#define F_SETFD 2
+#define F_GETFL 3
+#define F_SETFL 4
+#define F_DUPFD 0
+#define FD_CLOEXEC 1

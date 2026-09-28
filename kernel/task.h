@@ -36,7 +36,8 @@ struct mmap_region {
 };
 
 enum { T_FREE, T_READY, T_RUNNING, T_BLOCKED, T_ZOMBIE };
-enum { WAIT_NONE = 0, WAIT_KBD = 1, WAIT_CHILD = 2, WAIT_SLEEP = 3 };
+enum { WAIT_NONE = 0, WAIT_KBD = 1, WAIT_CHILD = 2, WAIT_SLEEP = 3,
+       WAIT_PIPE = 4 };
 
 struct task {
     int pid;              // thread id (tid)
@@ -46,12 +47,15 @@ struct task {
     int exit_code;        // wait4 sees: signal death -> the signal, else code<<8
     int sig_death;        // exit_code was a killing signal
     int wait_reason;      // WAIT_*
+    void *wait_pipe;      // WAIT_PIPE: which pipe we sit on
     struct task *parent;
     uint64_t rsp;         // kernel rsp (top: struct regs)
     uint64_t kstack_top;  // virtual
     uint64_t pml4;        // phys; shared between threads of a group
     uint64_t wake_tick;   // nanosleep deadline (tick units)
     struct file *fds[FILE_MAX];
+    uint8_t fd_flags[FILE_MAX];     // FD_CLOEXEC per fd
+    char cwd[192];        // current directory (absolute, kernel-side)
     uint64_t brk_base;    // past the last elf segment
     uint64_t brk_cur;     // current program break
     struct mmap_region *mmaps;  // sorted by start
@@ -99,6 +103,7 @@ void task_mmap_clone(struct task *dst, const struct task *src);
 int task_mmap_fault(struct regs *r, uint64_t cr2);
 struct task *task_find_free(void);
 void task_wake_kbd(void);
+void task_wake_pipe(struct pipe *p);   // unblock WAIT_PIPE tasks on p
 void task_tick_wake(void);      // unblock nanosleep deadlines
 void task_reap(void);           // idle loop: free parked kstacks
 int task_frame_owned(struct regs *fr);   // forensics
@@ -107,6 +112,15 @@ int task_count_group(int tgid, struct task *except);
 uint64_t task_exec_current(struct vnode *vn);
 // same, but name becomes argv[0] and auxv gets a fresh elf image info
 uint64_t task_exec_current_named(struct vnode *vn, const char *name);
+// full execve: caller-captured argv/envp (kernel-side copies, each a
+// single kmalloc block of NUL-separated strings). both may be 0
+typedef struct exec_args {
+    int argc, envc;
+    char *argv;         // block: str\0str\0...\0
+    char *envp;
+} exec_args_t;
+uint64_t task_execve(struct vnode *vn, const char *name,
+                     const exec_args_t *ea);
 // lowest free fd >= 0, or -1
 int task_fd_alloc(struct file *f);
 void task_close_fds(struct task *t, int keep_console);

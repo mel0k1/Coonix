@@ -51,7 +51,23 @@ make run      # запустить в qemu
       clone(CLONE_VM|THREAD|SETTLS|CHILD_CLEARTID) для pthread_create,
       нативный вход сисколлов через LSTAR/EFER.SCE (glibc вызывает syscall,
       а не int 0x80), наносон/kill/tgkill/set_tid_address
-- [ ] портирование glibc дальше: полноценный libc userspace, dlopen и т.п.
+- [x] **dlopen работает**: glibc-программа грузит .so с диска в рантайме
+      (dlopen/dlsym/dlclose через настоящий ld.so, релокации + .data/.bss
+      в загруженном .so)
+- [x] **fs-слой под userspace**: getdents64, chdir/getcwd (cwd в task),
+      pipe/pipe2 (блокирующиеся кольцевые буферы + EPIPE/SIGPIPE),
+      dup/dup2/dup3, fcntl (FD_CLOEXEC переживает exec правильно),
+      rename (с заменой цели), mkdir/rmdir/unlink/link/chmod/ftruncate,
+      sysinfo, faccessat, mremap (для realloc), gettimeofday, setpgid,
+      TIOCGPGRP/TIOCSPGRP; argv/envp передаются через execve, симлинки
+      ext2 (fast symlink) + разрешение в VFS, сигнатурный фикс wait4:
+      ECHILD вместо вечного сна + атомарный скан зомби под cli
+- [x] **busybox как userspace-набор**: собранный host-gcc против glibc
+      (динамический, живёт на уже настроенном ld.so-пути), applet-симлинки
+      на диске, sh с пайплайнами и редиректами, ls/cp/mv/rm/grep/cat и
+      ещё ~30 апплетов; тесты: qbbtest.py, qfsxtest.py, qdltest.py
+- [ ] чистка W^X до конца: NX на kernel data-сегментах
+- [ ] портирование glibc дальше: полноценный libc userspace
 
 ## Как это устроено
 

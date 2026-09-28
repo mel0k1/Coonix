@@ -13,16 +13,64 @@
 #define E2_IFMT    0xf000
 #define E2_IFDIR   0x4000
 #define E2_IFREG   0x8000
+#define E2_IFLNK   0xa000
+
+// dirent ftype field
+#define E2_FT_REG  1
+#define E2_FT_DIR  2
+#define E2_FT_LNK  7
+
+
+// the block cache is shared and non-reentrant: a tick mid-op would let
+// another task evict slots a live pointer still points into. every public
+// op runs with interrupts off (ata transfers are already atomic)
+#define E2_ENTER uint64_t __e2fl; __asm__ volatile("pushfq; popq %0; cli" : "=r"(__e2fl))
+#define E2_LEAVE __asm__ volatile("pushq %0; popfq" :: "r"(__e2fl) : "memory")
 
 #define BLK_SIZE   1024
 #define BLK_IND    256        // u32 entries per indirect block
 
+static struct vnode *e2_lookup_impl(struct vnode *dir, const char *name);
+static long e2_read_impl(struct vnode *vn, void *buf, uint64_t off, uint64_t len);
+static long e2_write_impl(struct vnode *vn, const void *buf, uint64_t off, uint64_t len);
+static struct vnode *e2_create_impl(struct vnode *dir, const char *name);
+static int e2_truncate_impl(struct vnode *vn);
+static int e2_readdir_impl(struct vnode *dir, uint64_t *ctx, uint64_t *ino,
+                      int *type, char *name, int name_cap);
+static int e2_unlink_impl(struct vnode *dir, const char *name);
+static struct vnode *e2_mkdir_impl(struct vnode *dir, const char *name);
+static int e2_rmdir_impl(struct vnode *dir, const char *name);
+static long e2_readlink_impl(struct vnode *vn, char *buf, uint64_t size);
+static struct vnode *e2_symlink_impl(struct vnode *dir, const char *name,
+                                const char *target);
+static int e2_truncate_to_impl(struct vnode *vn, uint64_t size);
+static int e2_chmod_impl(struct vnode *vn, uint32_t mode);
+static int e2_link_impl(struct vnode *dir, struct vnode *vn, const char *name);
+
+// cli-guarded public ops (wrappers live at the bottom)
 static struct vnode *e2_lookup(struct vnode *dir, const char *name);
 static long e2_read(struct vnode *vn, void *buf, uint64_t off, uint64_t len);
 static long e2_write(struct vnode *vn, const void *buf, uint64_t off, uint64_t len);
 static struct vnode *e2_create(struct vnode *dir, const char *name);
 static int e2_truncate(struct vnode *vn);
-struct vfs_ops e2_ops = { e2_lookup, e2_read, e2_write, e2_create, e2_truncate };
+static int e2_readdir(struct vnode *dir, uint64_t *ctx, uint64_t *ino,
+               int *type, char *name, int name_cap);
+static int e2_unlink(struct vnode *dir, const char *name);
+static struct vnode *e2_mkdir(struct vnode *dir, const char *name);
+static int e2_rmdir(struct vnode *dir, const char *name);
+static long e2_readlink(struct vnode *vn, char *buf, uint64_t size);
+static struct vnode *e2_symlink(struct vnode *dir, const char *name,
+                         const char *target);
+static int e2_truncate_to(struct vnode *vn, uint64_t size);
+static int e2_chmod(struct vnode *vn, uint32_t mode);
+static int e2_link(struct vnode *dir, struct vnode *vn, const char *name);
+
+struct vfs_ops e2_ops = {
+    e2_lookup, e2_read, e2_write, e2_create, e2_truncate,
+    e2_readdir, e2_unlink, e2_mkdir, e2_rmdir, e2_readlink, e2_symlink,
+    e2_truncate_to, e2_chmod, e2_link
+};
+
 
 struct e2_super {
     uint32_t inodes_count, blocks_count, r_blocks, free_blocks, free_inodes,
@@ -158,8 +206,11 @@ static uint8_t *blk_rw(uint32_t n) {
 
 // flush every dirty block to the device
 void ext2_sync(void) {
-    if (!root_disk.ready)
+    E2_ENTER;
+    if (!root_disk.ready) {
+        E2_LEAVE;
         return;
+    }
     for (int i = 0; i < CACHE_N; i++)
         if (cache[i].valid && cache[i].dirty) {
             if (root_disk.write_sectors((uint64_t)cache[i].block * 2, 2,
@@ -222,8 +273,12 @@ static struct e2_node *node_get(uint32_t ino) {
     n->ino = ino;
 
     int type = n->inode.mode & E2_IFMT;
-    n->vn.type = type == E2_IFDIR ? VNODE_DIR : VNODE_FILE;
-    n->vn.size = n->inode.size_lo;
+    n->vn.type = type == E2_IFDIR ? VNODE_DIR
+               : type == E2_IFLNK ? VNODE_LNK : VNODE_FILE;
+    n->vn.size = type == E2_IFLNK
+        ? (n->inode.size_lo > 60 ? 60 : n->inode.size_lo)   // fast symlink
+        : n->inode.size_lo;
+    n->vn.mode = n->inode.mode;
     n->vn.ops = &e2_ops;
     n->vn.fs_data = n;
     n->vn.ino = ino;
@@ -306,6 +361,33 @@ static uint32_t inode_alloc(void) {
         }
     }
     return 0;
+}
+
+// undo an inode_alloc (create/mkdir/symlink rollback)
+static void inode_rollback(uint32_t ino) {
+    const struct e2_bgd *bg0 = (const struct e2_bgd *)blk_get(fs.bgd_block);
+    if (!bg0)
+        return;
+    uint8_t *bm = blk_rw(bg0->inode_bitmap);
+    if (!bm)
+        return;
+    uint32_t i = ino - 1;
+    if (bm[i >> 3] & (1 << (i & 7))) {
+        bm[i >> 3] &= (uint8_t)~(1 << (i & 7));
+        struct e2_bgd *bg = (struct e2_bgd *)blk_rw(fs.bgd_block);
+        if (bg && bg->free_inodes < 0xffff)
+            bg->free_inodes++;
+    }
+}
+
+// free an inode: bitmap + cached node slot. the slot is wiped wholesale;
+// a vnode still held by an open fd keeps its ops pointer as a dangling
+// copy (we never re-check fs_data) — unlink-while-open is out of contract
+static void inode_free(uint32_t ino) {
+    inode_rollback(ino);
+    for (int k = 0; k < NODE_CACHE; k++)
+        if (nodes[k].ino == ino)
+            memset(&nodes[k], 0, sizeof(nodes[k]));
 }
 
 // -- block mapping: index -> device block, with allocation ------------------
@@ -397,6 +479,37 @@ static int blk_link(struct e2_inode *in, uint64_t bi, uint32_t db) {
     return -1;
 }
 
+// clear the block pointer at data index bi (does not free the block)
+static void blk_clear(struct e2_inode *in, uint64_t bi) {
+    if (bi < 12) {
+        in->block[bi] = 0;
+        return;
+    }
+    bi -= 12;
+    if (bi < BLK_IND) {
+        if (!in->block[12])
+            return;
+        uint32_t *t = (uint32_t *)blk_rw(in->block[12]);
+        if (t)
+            t[bi] = 0;
+        return;
+    }
+    bi -= BLK_IND;
+    if (bi < (uint64_t)BLK_IND * BLK_IND) {
+        if (!in->block[13])
+            return;
+        uint32_t *l1 = (uint32_t *)blk_rw(in->block[13]);
+        if (!l1)
+            return;
+        uint32_t s1 = (uint32_t)(bi / BLK_IND);
+        if (!l1[s1])
+            return;
+        uint32_t *l2 = (uint32_t *)blk_rw(l1[s1]);
+        if (l2)
+            l2[bi % BLK_IND] = 0;
+    }
+}
+
 // free every data + indirect block of an inode, zero the block map
 static void blk_free_chain(struct e2_inode *in) {
     for (int i = 0; i < 12; i++)
@@ -429,9 +542,11 @@ static void blk_free_chain(struct e2_inode *in) {
     in->blocks512 = 0;
 }
 
+
+
 // -- vfs ops ---------------------------------------------------------------
 
-static long e2_read(struct vnode *vn, void *buf, uint64_t off, uint64_t len) {
+static long e2_read_impl(struct vnode *vn, void *buf, uint64_t off, uint64_t len) {
     struct e2_node *n = vn->fs_data;
 
     if (n->vn.type == VNODE_DIR) {
@@ -501,7 +616,7 @@ static long e2_read(struct vnode *vn, void *buf, uint64_t off, uint64_t len) {
     return (long)done;
 }
 
-static long e2_write(struct vnode *vn, const void *buf, uint64_t off, uint64_t len) {
+static long e2_write_impl(struct vnode *vn, const void *buf, uint64_t off, uint64_t len) {
     struct e2_node *n = vn->fs_data;
     if (vn->type != VNODE_FILE)
         return -1;
@@ -617,7 +732,7 @@ static int dirent_insert(struct e2_node *d, uint32_t ino, uint8_t ftype,
     return 0;
 }
 
-static struct vnode *e2_create(struct vnode *dir, const char *name) {
+static struct vnode *e2_create_impl(struct vnode *dir, const char *name) {
     struct e2_node *d = dir->fs_data;
     if (dir->type != VNODE_DIR)
         return 0;
@@ -631,15 +746,11 @@ static struct vnode *e2_create(struct vnode *dir, const char *name) {
     tmp.inode.mode = E2_IFREG | 0755;
     tmp.inode.links = 1;
     tmp.vn.type = VNODE_FILE;
+    tmp.vn.mode = tmp.inode.mode;
     tmp.vn.ops = &e2_ops;
     tmp.vn.fs_data = &tmp;
-    if (dirent_insert(d, ino, 1, name) < 0) {
-        // roll the inode allocation back
-        uint8_t *bm = blk_rw(((const struct e2_bgd *)blk_get(fs.bgd_block))->inode_bitmap);
-        if (bm) {
-            uint32_t i = ino - 1;
-            bm[i >> 3] &= (uint8_t)~(1 << (i & 7));
-        }
+    if (dirent_insert(d, ino, E2_FT_REG, name) < 0) {
+        inode_rollback(ino);
         return 0;
     }
 
@@ -648,10 +759,11 @@ static struct vnode *e2_create(struct vnode *dir, const char *name) {
     struct e2_node *n = node_get(ino);
     if (!n)
         return 0;
+    ext2_sync();
     return &n->vn;
 }
 
-static int e2_truncate(struct vnode *vn) {
+static int e2_truncate_impl(struct vnode *vn) {
     struct e2_node *n = vn->fs_data;
     if (vn->type != VNODE_FILE)
         return -1;
@@ -663,7 +775,7 @@ static int e2_truncate(struct vnode *vn) {
     return 0;
 }
 
-static struct vnode *e2_lookup(struct vnode *dir, const char *name) {
+static struct vnode *e2_lookup_impl(struct vnode *dir, const char *name) {
     struct e2_node *d = dir->fs_data;
     uint64_t dlen = strlen(name);
 
@@ -687,6 +799,412 @@ static struct vnode *e2_lookup(struct vnode *dir, const char *name) {
         }
     }
     return 0;
+}
+
+// -- namei ops: readdir / unlink / mkdir / rmdir / symlink / link ----------
+
+// one dirent per call; *ctx = (block << 32) | byte offset
+static int e2_readdir_impl(struct vnode *dir, uint64_t *ctx, uint64_t *ino,
+                      int *type, char *name, int name_cap) {
+    struct e2_node *d = dir->fs_data;
+    uint32_t b = (uint32_t)(*ctx >> 32);
+    uint32_t pos = (uint32_t)(*ctx & 0xffffffff);
+
+    for (; b * BLK_SIZE < dir->size; b++, pos = 0) {
+        uint32_t db = blk_of(&d->inode, b);
+        if (!db) {
+            *ctx = (uint64_t)(b + 1) << 32;
+            continue;
+        }
+        const uint8_t *raw = blk_get(db);
+        if (!raw)
+            return 0;
+        while (pos + sizeof(struct e2_dirent) <= BLK_SIZE) {
+            const struct e2_dirent *e =
+                (const struct e2_dirent *)(raw + pos);
+            if (e->rec_len < sizeof(struct e2_dirent) ||
+                pos + e->rec_len > BLK_SIZE) {
+                pos = BLK_SIZE;
+                break;
+            }
+            if (e->ino) {
+                uint32_t nl = e->name_len;
+                if (nl >= (uint32_t)name_cap)
+                    nl = name_cap - 1;
+                memcpy(name, raw + pos + sizeof(*e), nl);
+                name[nl] = 0;
+                *ino = e->ino;
+                *type = e->ftype == E2_FT_DIR ? VNODE_DIR
+                      : e->ftype == E2_FT_LNK ? VNODE_LNK : VNODE_FILE;
+                pos += e->rec_len;
+                *ctx = ((uint64_t)b << 32) | pos;
+                return 1;
+            }
+            pos += e->rec_len;
+        }
+        *ctx = (uint64_t)(b + 1) << 32;
+    }
+    return 0;
+}
+
+// merge the removed entry's slot into the previous one (or wipe in place
+// for the first entry of a block; insert() reuses wiped slots)
+static int dirent_remove(struct e2_node *d, const char *name) {
+    uint32_t nl = (uint32_t)strlen(name);
+    for (uint32_t b = 0; b * BLK_SIZE < d->vn.size; b++) {
+        uint32_t db = blk_of(&d->inode, b);
+        if (!db)
+            return -1;
+        uint8_t *raw = blk_rw(db);
+        if (!raw)
+            return -1;
+        uint64_t pos = 0;
+        uint64_t prev = 0;
+        int have_prev = 0;
+        while (pos + sizeof(struct e2_dirent) <= BLK_SIZE) {
+            struct e2_dirent *e = (struct e2_dirent *)(raw + pos);
+            if (e->rec_len < sizeof(struct e2_dirent) ||
+                pos + e->rec_len > BLK_SIZE)
+                break;
+            if (e->ino && e->name_len == nl &&
+                !memcmp(raw + pos + sizeof(*e), name, nl)) {
+                if (have_prev) {
+                    struct e2_dirent *p =
+                        (struct e2_dirent *)(raw + prev);
+                    p->rec_len = (uint16_t)(p->rec_len + e->rec_len);
+                } else {
+                    e->ino = 0;   // wiped slot
+                }
+                return 0;
+            }
+            if (e->ino) {
+                prev = pos;
+                have_prev = 1;
+            }
+            pos += e->rec_len;
+        }
+    }
+    return -1;
+}
+
+static int e2_unlink_impl(struct vnode *dir, const char *name) {
+    struct e2_node *d = dir->fs_data;
+    if (dir->type != VNODE_DIR)
+        return -1;
+    struct vnode *v = e2_lookup(dir, name);
+    if (!v || v->type == VNODE_DIR)
+        return -1;   // dirs go through rmdir
+    if (dirent_remove(d, name) < 0)
+        return -1;
+    struct e2_node *n = (struct e2_node *)v->fs_data;
+    if (n->inode.links > 1) {
+        n->inode.links--;
+        inode_sync(n);
+    } else {
+        blk_free_chain(&n->inode);
+        inode_free(n->ino);
+    }
+    ext2_sync();
+    return 0;
+}
+
+static struct vnode *e2_mkdir_impl(struct vnode *dir, const char *name) {
+    struct e2_node *d = dir->fs_data;
+    if (dir->type != VNODE_DIR)
+        return 0;
+    uint32_t ino = inode_alloc();
+    if (!ino)
+        return 0;
+    uint32_t db = block_alloc();
+    if (!db) {
+        inode_rollback(ino);
+        return 0;
+    }
+    uint8_t *raw = blk_rw(db);
+    if (!raw) {
+        block_free(db);
+        inode_rollback(ino);
+        return 0;
+    }
+    memset(raw, 0, BLK_SIZE);
+    struct e2_dirent *e = (struct e2_dirent *)raw;
+    e->ino = ino;
+    e->rec_len = 12;
+    e->name_len = 1;
+    e->ftype = E2_FT_DIR;
+    raw[8] = '.';
+    struct e2_dirent *p = (struct e2_dirent *)(raw + 12);
+    p->ino = d->ino;
+    p->rec_len = BLK_SIZE - 12;
+    p->name_len = 2;
+    p->ftype = E2_FT_DIR;
+    raw[12 + 8] = '.';
+    raw[12 + 9] = '.';
+
+    if (dirent_insert(d, ino, E2_FT_DIR, name) < 0) {
+        block_free(db);
+        inode_rollback(ino);
+        return 0;
+    }
+
+    struct e2_node tmp = { 0 };
+    tmp.ino = ino;
+    tmp.inode.mode = E2_IFDIR | 0755;
+    tmp.inode.links = 2;          // parent entry + "."
+    tmp.inode.size_lo = BLK_SIZE;
+    tmp.inode.blocks512 = 2;
+    tmp.inode.block[0] = db;
+    tmp.vn.type = VNODE_DIR;
+    tmp.vn.mode = tmp.inode.mode;
+    tmp.vn.ops = &e2_ops;
+    inode_sync(&tmp);
+
+    struct e2_node *n = node_get(ino);
+    if (!n)
+        return 0;
+    d->inode.links++;             // parent gains a ".." reference
+    inode_sync(d);
+    struct e2_bgd *bg = (struct e2_bgd *)blk_rw(fs.bgd_block);
+    if (bg && bg->used_dirs < 0xffff)
+        bg->used_dirs++;
+    ext2_sync();
+    return &n->vn;
+}
+
+static int e2_rmdir_impl(struct vnode *dir, const char *name) {
+    struct e2_node *d = dir->fs_data;
+    if (dir->type != VNODE_DIR)
+        return -1;
+    struct vnode *v = e2_lookup(dir, name);
+    if (!v || v->type != VNODE_DIR)
+        return -1;
+    struct e2_node *n = (struct e2_node *)v->fs_data;
+    // empty means only "." and ".." are linked
+    for (uint32_t b = 0; b * BLK_SIZE < v->size; b++) {
+        uint32_t db = blk_of(&n->inode, b);
+        if (!db)
+            return -1;
+        const uint8_t *raw = blk_get(db);
+        if (!raw)
+            return -1;
+        uint64_t pos = 0;
+        int count = 0;
+        while (pos + sizeof(struct e2_dirent) <= BLK_SIZE) {
+            const struct e2_dirent *e =
+                (const struct e2_dirent *)(raw + pos);
+            if (e->rec_len < sizeof(struct e2_dirent) ||
+                pos + e->rec_len > BLK_SIZE)
+                break;
+            if (e->ino)
+                count++;
+            pos += e->rec_len;
+        }
+        if (count > 2)
+            return -1;   // ENOTEMPTY
+    }
+    if (dirent_remove(d, name) < 0)
+        return -1;
+    blk_free_chain(&n->inode);
+    inode_free(n->ino);
+    if (d->inode.links)
+        d->inode.links--;
+    inode_sync(d);
+    struct e2_bgd *bg = (struct e2_bgd *)blk_rw(fs.bgd_block);
+    if (bg && bg->used_dirs)
+        bg->used_dirs--;
+    ext2_sync();
+    return 0;
+}
+
+// fast symlinks only: the target lives in i_block (60 bytes max)
+static struct vnode *e2_symlink_impl(struct vnode *dir, const char *name,
+                                const char *target) {
+    struct e2_node *d = dir->fs_data;
+    if (dir->type != VNODE_DIR)
+        return 0;
+    uint32_t tl = (uint32_t)strlen(target);
+    if (tl > 59)
+        return 0;
+    uint32_t ino = inode_alloc();
+    if (!ino)
+        return 0;
+    struct e2_node tmp = { 0 };
+    tmp.ino = ino;
+    tmp.inode.mode = E2_IFLNK | 0777;
+    tmp.inode.links = 1;
+    tmp.inode.size_lo = tl;
+    memcpy(tmp.inode.block, target, tl);
+    tmp.vn.type = VNODE_LNK;
+    tmp.vn.size = tl;
+    tmp.vn.mode = tmp.inode.mode;
+    tmp.vn.ops = &e2_ops;
+    tmp.vn.fs_data = &tmp;
+    if (dirent_insert(d, ino, E2_FT_LNK, name) < 0) {
+        inode_rollback(ino);
+        return 0;
+    }
+    inode_sync(&tmp);
+    struct e2_node *n = node_get(ino);
+    if (!n)
+        return 0;
+    ext2_sync();
+    return &n->vn;
+}
+
+static long e2_readlink_impl(struct vnode *vn, char *buf, uint64_t size) {
+    struct e2_node *n = vn->fs_data;
+    if (vn->type != VNODE_LNK)
+        return -1;
+    uint64_t len = n->inode.size_lo;
+    if (len > 60)
+        len = 60;
+    if (len > size)
+        len = size;
+    memcpy(buf, (const char *)n->inode.block, len);
+    return (long)len;
+}
+
+static int e2_truncate_to_impl(struct vnode *vn, uint64_t size) {
+    struct e2_node *n = vn->fs_data;
+    if (vn->type != VNODE_FILE)
+        return -1;
+    if (size == 0)
+        return e2_truncate(vn);
+    if (size >= vn->size) {
+        n->inode.size_lo = (uint32_t)size;   // sparse grow
+        vn->size = size;
+        inode_sync(n);
+        ext2_sync();
+        return 0;
+    }
+    uint64_t keep = (size + BLK_SIZE - 1) / BLK_SIZE;
+    uint64_t old = (vn->size + BLK_SIZE - 1) / BLK_SIZE;
+    for (uint64_t bi = keep; bi < old; bi++) {
+        uint32_t db = blk_of(&n->inode, bi);
+        if (db)
+            block_free(db);
+        blk_clear(&n->inode, bi);
+    }
+    n->inode.size_lo = (uint32_t)size;
+    vn->size = size;
+    inode_sync(n);
+    ext2_sync();
+    return 0;
+}
+
+static int e2_chmod_impl(struct vnode *vn, uint32_t mode) {
+    struct e2_node *n = vn->fs_data;
+    n->inode.mode = (uint16_t)((n->inode.mode & E2_IFMT) | (mode & 07777));
+    vn->mode = n->inode.mode;
+    inode_sync(n);
+    ext2_sync();
+    return 0;
+}
+
+static int e2_link_impl(struct vnode *dir, struct vnode *vn, const char *name) {
+    struct e2_node *d = dir->fs_data;
+    struct e2_node *n = vn->fs_data;
+    if (dir->type != VNODE_DIR || vn->type == VNODE_DIR)
+        return -1;
+    if (dirent_insert(d, n->ino,
+                      vn->type == VNODE_LNK ? E2_FT_LNK : E2_FT_REG,
+                      name) < 0)
+        return -1;
+    n->inode.links++;
+    inode_sync(n);
+    ext2_sync();
+    return 0;
+}
+
+
+
+
+// cli-guarded public ops; the _impl bodies above are free-running
+static struct vnode *e2_lookup(struct vnode *dir, const char *name) {
+    E2_ENTER;
+    struct vnode *r = e2_lookup_impl(dir, name);
+    E2_LEAVE;
+    return r;
+}
+static long e2_read(struct vnode *vn, void *buf, uint64_t off, uint64_t len) {
+    E2_ENTER;
+    long r = e2_read_impl(vn, buf, off, len);
+    E2_LEAVE;
+    return r;
+}
+static long e2_write(struct vnode *vn, const void *buf, uint64_t off, uint64_t len) {
+    E2_ENTER;
+    long r = e2_write_impl(vn, buf, off, len);
+    E2_LEAVE;
+    return r;
+}
+static struct vnode *e2_create(struct vnode *dir, const char *name) {
+    E2_ENTER;
+    struct vnode *r = e2_create_impl(dir, name);
+    E2_LEAVE;
+    return r;
+}
+static int e2_truncate(struct vnode *vn) {
+    E2_ENTER;
+    int r = e2_truncate_impl(vn);
+    E2_LEAVE;
+    return r;
+}
+static int e2_readdir(struct vnode *dir, uint64_t *ctx, uint64_t *ino,
+                      int *type, char *name, int name_cap) {
+    E2_ENTER;
+    int r = e2_readdir_impl(dir, ctx, ino, type, name, name_cap);
+    E2_LEAVE;
+    return r;
+}
+static int e2_unlink(struct vnode *dir, const char *name) {
+    E2_ENTER;
+    int r = e2_unlink_impl(dir, name);
+    E2_LEAVE;
+    return r;
+}
+static struct vnode *e2_mkdir(struct vnode *dir, const char *name) {
+    E2_ENTER;
+    struct vnode *r = e2_mkdir_impl(dir, name);
+    E2_LEAVE;
+    return r;
+}
+static int e2_rmdir(struct vnode *dir, const char *name) {
+    E2_ENTER;
+    int r = e2_rmdir_impl(dir, name);
+    E2_LEAVE;
+    return r;
+}
+static long e2_readlink(struct vnode *vn, char *buf, uint64_t size) {
+    E2_ENTER;
+    long r = e2_readlink_impl(vn, buf, size);
+    E2_LEAVE;
+    return r;
+}
+static struct vnode *e2_symlink(struct vnode *dir, const char *name,
+                                const char *target) {
+    E2_ENTER;
+    struct vnode *r = e2_symlink_impl(dir, name, target);
+    E2_LEAVE;
+    return r;
+}
+static int e2_truncate_to(struct vnode *vn, uint64_t size) {
+    E2_ENTER;
+    int r = e2_truncate_to_impl(vn, size);
+    E2_LEAVE;
+    return r;
+}
+static int e2_chmod(struct vnode *vn, uint32_t mode) {
+    E2_ENTER;
+    int r = e2_chmod_impl(vn, mode);
+    E2_LEAVE;
+    return r;
+}
+static int e2_link(struct vnode *dir, struct vnode *vn, const char *name) {
+    E2_ENTER;
+    int r = e2_link_impl(dir, vn, name);
+    E2_LEAVE;
+    return r;
 }
 
 // -- mount -----------------------------------------------------------------
