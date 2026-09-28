@@ -10,23 +10,30 @@
 #include "gdt.h"
 #include "heap.h"
 #include "vfs.h"
+#include "signal.h"
 
 #define MAP_SHARED 0x01
 #define PTE_DIRTY  0x040
 
-// gs-relative scratch the syscall entry uses to find the kernel stack
-struct kgs_scratch {
-    uint64_t kstack_top;
-    uint64_t user_rsp;
-};
+// clone flags (linux)
+#define CLONE_VM            0x100
+#define CLONE_FS            0x200
+#define CLONE_FILES         0x400
+#define CLONE_SIGHAND       0x800
+#define CLONE_VFORK         0x4000
+#define CLONE_THREAD        0x10000
+#define CLONE_SYSVSEM       0x40000
+#define CLONE_SETTLS        0x80000
+#define CLONE_PARENT_SETTID 0x100000
+#define CLONE_CHILD_CLEARTID 0x200000
+#define CLONE_CHILD_SETTID  0x01000000
 
-static uint64_t kgs_alloc(uint64_t kstack_top) {
-    struct kgs_scratch *k = kmalloc(sizeof(*k));
-    if (!k)
-        panic("task: no kgs");
-    k->kstack_top = kstack_top;
-    k->user_rsp = 0;
-    return (uint64_t)k;
+// gs scratch lives inside the task slot: zero allocations, cannot dangle.
+// syscall_entry reads gs:0 (kstack_top) and gs:8 (user rsp stash)
+static void kgs_init(struct task *t) {
+    t->kgs_area[0] = t->kstack_top;
+    t->kgs_area[1] = 0;
+    t->kgs = (uint64_t)&t->kgs_area[0];
 }
 
 struct task task_table[TASK_MAX];
@@ -56,11 +63,64 @@ static void map_kstack(struct task *t) {
         void *p = pmm_alloc();
         if (!p)
             panic("task: no mem for kstack");
+        // a previous owner may not be reaped yet: replace any stale frame
+        uint64_t old = vmm_get_phys(vmm_kernel_pml4(), va + i * PAGE_SIZE);
+        if (old)
+            pmm_free((void *)old);
         // map into the kernel half of BOTH current and new pml4? kernel half
         // is shared on pml4 level, so mapping into current pml4 is enough
         vmm_map(vmm_kernel_pml4(), va + i * PAGE_SIZE, (uint64_t)p,
                 VMM_PRESENT | VMM_WRITE);
     }
+}
+
+// release kstack + gs scratch of a task whose slot is going away
+static void free_kstack(struct task *t) {
+    if (!t->kstack_top)
+        return;
+    uint64_t va = t->kstack_top - KSTACK_SIZE;
+    for (int i = 0; i < KSTACK_PAGES; i++) {
+        uint64_t phys = vmm_get_phys(vmm_kernel_pml4(), va + i * PAGE_SIZE);
+        vmm_unmap(vmm_kernel_pml4(), va + i * PAGE_SIZE);
+        if (phys)
+            pmm_free((void *)phys);
+    }
+    t->kstack_top = 0;
+    t->kgs = 0;   // scratch is in the slot: nothing to free
+}
+
+// a task cannot unmap the kernel stack it is running on. exiting threads
+// park their stack here and the idle loop frees it later
+#define REAP_MAX 16
+static uint64_t reap_q[REAP_MAX][2];   // {kstack_top, kgs}
+static int reap_rh, reap_rt;
+
+static void reap_push(uint64_t ktop, uint64_t kgs) {
+    if (!ktop)
+        return;                       // nothing to reap
+    int next = (reap_rt + 1) % REAP_MAX;
+    if (next == reap_rh)
+        return;                       // queue full: drop (leak, not crash)
+    reap_q[reap_rt][0] = ktop;
+    reap_q[reap_rt][1] = kgs;
+    reap_rt = next;
+}
+
+void task_reap(void) {
+    cli();
+    while (reap_rh != reap_rt) {
+        uint64_t top = reap_q[reap_rh][0];
+        reap_rh = (reap_rh + 1) % REAP_MAX;
+        uint64_t va = top - KSTACK_SIZE;
+        for (int i = 0; i < KSTACK_PAGES; i++) {
+            uint64_t phys = vmm_get_phys(vmm_kernel_pml4(),
+                                         va + i * PAGE_SIZE);
+            vmm_unmap(vmm_kernel_pml4(), va + i * PAGE_SIZE);
+            if (phys)
+                pmm_free((void *)phys);
+        }
+    }
+    sti();
 }
 
 static void fds_init(struct task *t) {
@@ -79,7 +139,7 @@ struct task *task_spawn_kernel(void (*entry)(void)) {
     t->state = T_READY;
     t->pml4 = vmm_kernel_pml4();
     map_kstack(t);
-    t->kgs = kgs_alloc(t->kstack_top);
+    kgs_init(t);
 
     // forge a regs frame that "returns" into entry
     struct regs *r = (struct regs *)(t->kstack_top - sizeof(struct regs));
@@ -275,12 +335,14 @@ struct task *task_spawn_user(const char *path, struct task *parent) {
         return 0;
     memset(t, 0, sizeof(*t));
     t->pid = next_pid++;
+    t->tgid = t->pid;         // fresh process: own group
+    t->pgid = t->pid;
     t->parent = parent;
 
     uint64_t pml4 = vmm_create_pml4();
     t->pml4 = pml4;
     map_kstack(t);
-    t->kgs = kgs_alloc(t->kstack_top);
+    kgs_init(t);
 
     struct elf_info ei;
     uint64_t entry = elf_load_user_info(t->pml4, image, size, &ei);
@@ -356,6 +418,8 @@ uint64_t task_exec_current_named(struct vnode *vn, const char *name) {
     current->phent = ei.phent;
     current->phnum = ei.phnum;
     current->clear_tid = 0;
+    current->child_tid = 0;
+    current->sig_pending = 0;
     user_stack_setup(pml4);
     task_close_fds(current, 1);
 
@@ -392,13 +456,20 @@ void task_close_fds(struct task *t, int keep_console) {
     }
 }
 
-// fork: clone address space via copy-on-write
+// fork: clone address space via copy-on-write. interrupts stay off for the
+// whole walk: a tick mid-fork would let another task grab our slot or
+// double-run the syscall
 struct task *task_fork(struct regs *frame) {
+    cli();
     struct task *c = task_find_free();
-    if (!c)
+    if (!c) {
+        sti();
         return 0;
+    }
     memset(c, 0, sizeof(*c));
     c->pid = next_pid++;
+    c->tgid = c->pid;
+    c->pgid = current->pgid;      // same console group
     c->parent = current;
     c->state = T_READY;
 
@@ -411,12 +482,14 @@ struct task *task_fork(struct regs *frame) {
     uint64_t kva = KSTACK_VA_BASE + (uint64_t)c->pid * 0x10000;
     for (int i = 0; i < KSTACK_PAGES; i++) {
         void *p = pmm_alloc();
-        if (!p)
+        if (!p) {
+            sti();
             return 0;
+        }
         vmm_map(vmm_kernel_pml4(), kva + i * PAGE_SIZE, (uint64_t)p,
                 VMM_PRESENT | VMM_WRITE);
     }
-    c->kgs = kgs_alloc(c->kstack_top);
+    kgs_init(c);
 
     // cow-share user address space (pml4 entries 0..255): writable pages
     // become read-only + COW in both tasks, faults privatize them later
@@ -469,26 +542,172 @@ struct task *task_fork(struct regs *frame) {
     c->brk_cur = current->brk_cur;
     task_mmap_clone(c, current);
 
+    // signal state: handlers copied, pending dropped, mask kept (posix)
+    memcpy(c->sigact, current->sigact, sizeof(c->sigact));
+    c->sig_mask = current->sig_mask;
+    c->tgid = c->pid;
+    // tls: the child keeps the parent's thread pointer (glibc binaries
+    // dereference %fs:... constantly; a zero fs_base sends them into the
+    // elf header page and worse)
+    c->fs_base = current->fs_base;
+    c->gs_base = current->gs_base;
+
     // child frame: copy of parent's, rax=0
     struct regs *cr = (struct regs *)(c->kstack_top - sizeof(struct regs));
     memcpy(cr, frame, sizeof(*cr));
     cr->rax = 0;
     c->rsp = (uint64_t)cr;
+    sti();
+    return c;
+}
+// CLONE_THREAD: same address space (shared pml4), new tid, own kernel stack.
+// glibc pthread_create needs SETTLS + PARENT_SETTID + CHILD_CLEARTID.
+// interrupts off: the caller switches to the child before enabling them
+struct task *task_clone_thread(struct regs *frame, uint64_t flags,
+                               uint64_t newsp, uint64_t parent_tid,
+                               uint64_t child_tid, uint64_t tls) {
+    if (!(flags & CLONE_THREAD) || !(flags & CLONE_VM))
+        return 0;   // caller falls back to fork semantics
+    cli();
+    struct task *c = task_find_free();
+    if (!c) {
+        sti();
+        return 0;
+    }
+    memset(c, 0, sizeof(*c));
+    c->pid = next_pid++;
+    c->tgid = current->tgid;
+    c->pgid = current->pgid;
+    c->parent = current->parent ? current->parent : current;
+    c->state = T_READY;
+    c->pml4 = current->pml4;      // shared address space
+    map_kstack(c);
+    kgs_init(c);
+
+    // own copies of the fd table refs and mmap list (same pattern as fork;
+    // pages themselves are shared via the pml4)
+    for (int i = 0; i < FILE_MAX; i++)
+        if (current->fds[i]) {
+            c->fds[i] = current->fds[i];
+            c->fds[i]->refs++;
+        }
+    c->brk_base = current->brk_base;
+    c->brk_cur = current->brk_cur;
+    task_mmap_clone(c, current);
+
+    c->fs_base = (flags & CLONE_SETTLS) ? tls : current->fs_base;
+    c->clear_tid = current->clear_tid;
+    if (flags & CLONE_CHILD_CLEARTID)
+        c->child_tid = child_tid;
+    memcpy(c->sigact, current->sigact, sizeof(c->sigact));
+    c->sig_mask = current->sig_mask;
+
+    if (flags & CLONE_PARENT_SETTID)
+        *(int *)parent_tid = c->pid;
+    if (flags & CLONE_CHILD_SETTID)
+        *(int *)child_tid = c->pid;
+
+    // child frame = parent's with rax=0 and the new user stack
+    struct regs *cr = (struct regs *)(c->kstack_top - sizeof(struct regs));
+    memcpy(cr, frame, sizeof(*cr));
+    cr->rax = 0;
+    if (newsp)
+        cr->rsp = newsp;
+    c->rsp = (uint64_t)cr;
     return c;
 }
 
-uint64_t task_exit_current(int code) {
+int task_count_group(int tgid, struct task *except) {
+    int n = 0;
+    for (int i = 0; i < TASK_MAX; i++)
+        if (&task_table[i] != except && task_table[i].state != T_FREE &&
+            task_table[i].tgid == tgid)
+            n++;
+    return n;
+}
+
+// thread death: everything the thread owns privately goes away, the shared
+// address space and the other threads stay. self=1 when t == current:
+// the kernel stack cannot be unmapped while we run on it, so it goes to
+// the reap queue for the idle task
+static void task_thread_release(struct task *t, int self) {
+    // joiners watch *child_tid: zero it and wake the futex
+    uint64_t ct = t->child_tid ? t->child_tid : t->clear_tid;
+    if (ct) {
+        *(uint32_t *)ct = 0;
+        extern void futex_wake_addr(uint64_t uaddr, int n);
+        futex_wake_addr(ct, -1);
+    }
+    task_close_fds(t, 0);
+    task_mmap_teardown(t);        // own list copy: file refs back
+    if (self) {
+        reap_push(t->kstack_top, t->kgs);
+        t->kstack_top = 0;
+        t->kgs = 0;
+    } else {
+        free_kstack(t);
+    }
+    t->state = T_FREE;
+}
+
+static uint64_t exit_common(int code, int sig_death, int force_group) {
+    // interrupts off for the whole teardown: a tick mid-exit could pick a
+    // sibling whose kstack/pml4 is already half-freed, or leave the exiting
+    // task schedulable on a destroyed image. every path below ends in
+    // task_schedule(0) and the next task's iretq restores IF
+    cli();
+    int i_am_leader = current->pid == current->tgid;
+    int others = task_count_group(current->tgid, current);
+    if (!force_group && !i_am_leader && others > 0) {
+        // pthread_exit from a worker: only this thread goes away
+        task_thread_release(current, 1);
+        return task_schedule(0);
+    }
+    // group death: release every sibling thread, then tear down the process
+    if (others > 0) {
+        for (int i = 0; i < TASK_MAX; i++) {
+            struct task *t = &task_table[i];
+            if (t == current || t->state == T_FREE || t->tgid != current->tgid)
+                continue;
+            task_thread_release(t, 0);   // not running: safe to free now
+        }
+    }
     task_close_fds(current, 0);
     task_mmap_teardown(current);
     vmm_destroy_user(current->pml4);
-    current->exit_code = code;
-    current->state = T_ZOMBIE;
-    // wake parent if waiting
-    if (current->parent && current->parent->state == T_BLOCKED &&
-        current->parent->wait_reason == WAIT_CHILD) {
-        current->parent->state = T_READY;
+    // leader slot stays for the parent's wait4 (zombie); if we are a stray
+    // non-leader whose group is gone, just vanish
+    struct task *leader = 0;
+    for (int i = 0; i < TASK_MAX; i++)
+        if (task_table[i].tgid == current->tgid && task_table[i].pid == task_table[i].tgid)
+            leader = &task_table[i];
+    if (leader) {
+        leader->exit_code = code;
+        leader->sig_death = sig_death;
+        leader->state = T_ZOMBIE;
+        if (leader->parent && leader->parent->state == T_BLOCKED &&
+            leader->parent->wait_reason == WAIT_CHILD)
+            leader->parent->state = T_READY;
+    }
+    if (current != leader) {
+        reap_push(current->kstack_top, current->kgs);
+        current->kstack_top = 0;
+        current->kgs = 0;
+        current->state = T_FREE;
     }
     return task_schedule(0);
+}
+
+uint64_t task_exit_current(int code) {
+    return exit_common(code, 0, 0);
+}
+
+uint64_t task_exit_current_group(int code) {
+    return exit_common(code, 0, 1);
+}
+
+uint64_t task_exit_current_sig(int sig) {
+    return exit_common(sig, 1, 1);
 }
 
 void task_wake_kbd(void) {
@@ -497,7 +716,30 @@ void task_wake_kbd(void) {
             task_table[i].state = T_READY;
 }
 
+void task_tick_wake(void) {
+    uint64_t now = pit_ticks();
+    for (int i = 0; i < TASK_MAX; i++)
+        if (task_table[i].state == T_BLOCKED &&
+            task_table[i].wait_reason == WAIT_SLEEP &&
+            now >= task_table[i].wake_tick) {
+            // nanosleep completes: deliver rax=0 into the saved frame.
+            // frame write only for still-blocked tasks: a task woken by a
+            // signal first is T_READY with a live kernel/user context whose
+            // rax we must not clobber
+            extern void task_frame_syscall_result(struct task *t, long ret);
+            if (task_table[i].state == T_BLOCKED) {
+                task_frame_syscall_result(&task_table[i], 0);
+                task_table[i].state = T_READY;
+            }
+        }
+}
+
 uint64_t task_schedule(uint64_t old_rsp) {
+    // the pick + state updates must be atomic against the tick: a tick
+    // mid-schedule would save the interrupted frame into whatever task
+    // `current` points at, mixing contexts. every exit path here resumes
+    // through iretq, which restores IF from the target frame
+    cli();
     if (!current)
         return old_rsp; // scheduler not initialized yet
     if (old_rsp)
@@ -527,8 +769,78 @@ uint64_t task_schedule(uint64_t old_rsp) {
     if (next == current)
         return current->rsp;
 
+    return task_switch_to(next);
+}
+
+// ring of recent switches for crash forensics: {pid, rsp, cs of the frame
+// we are about to iretq into}
+struct sw_rec { uint32_t pid; uint64_t rsp; uint64_t cs; };
+static struct sw_rec sw_ring[8];
+static int sw_head;
+void task_dump_switches(void) {
+    extern void serial_puts(const char *);
+    extern void serial_puthex(uint64_t);
+    for (int i = 0; i < 8; i++) {
+        int k = (sw_head + i) % 8;
+        serial_puts(i ? "," : "[sw ");
+        serial_puthex(sw_ring[k].pid);
+        serial_puts("@");
+        serial_puthex(sw_ring[k].rsp);
+        serial_puts("/");
+        serial_puthex(sw_ring[k].cs);
+    }
+    serial_puts("]\n");
+}
+
+// forensics: 1 if the frame lives on the task's kernel stack (or anywhere
+// when it is the idle task, which runs on the boot stack)
+int task_frame_owned(struct regs *fr) {
+    uint64_t f = (uint64_t)fr;
+    // idle: its own kstack slot or the boot stack (higher half via hhdm)
+    if (current->pid == 0)
+        return (f >= 0xffff800000000000ULL) ||
+               (f >= current->kstack_top - KSTACK_SIZE &&
+                f < current->kstack_top);
+    return f >= current->kstack_top - KSTACK_SIZE && f < current->kstack_top;
+}
+
+void task_dump_inversion(struct regs *r) {
+    extern void serial_puts(const char *);
+    extern void serial_puthex(uint64_t);
+    serial_puts("[TICK-INVERSION cur=idle rip="); serial_puthex(r->rip);
+    serial_puts(" rsp="); serial_puthex(r->rsp);
+    serial_puts(" fr=");
+    serial_puthex((uint64_t)r);
+    task_dump_switches();
+}
+
+uint64_t task_switch_to(struct task *next) {
+    // atomic switch: current, rsp0, cr3 and gs/fs must all move together.
+    // interrupts stay off; every resume goes through iretq which restores
+    // IF from the target's saved rflags
+    cli();
     current = next;
     current->state = T_RUNNING;
+    struct regs *fr = (struct regs *)next->rsp;
+    sw_ring[sw_head].pid = (uint32_t)next->pid;
+    sw_ring[sw_head].rsp = next->rsp;
+    sw_ring[sw_head].cs = fr ? fr->cs : 0;
+    sw_head = (sw_head + 1) % 8;
+    // a switch into the idle must always resume ring-0 context; a user
+    // frame on the idle means somebody corrupted idle->rsp — catch the
+    // first occurrence instead of letting the cascade begin
+    if (next->pid == 0 && (fr->cs & 3)) {
+        extern void serial_puts(const char *);
+        extern void serial_puthex(uint64_t);
+        serial_puts("[FAKE-RESUME idle user frame rsp=");
+        serial_puthex(next->rsp);
+        serial_puts(" frip=");
+        serial_puthex(fr->rip);
+        serial_puts(" ");
+        task_dump_switches();
+        for (;;)
+            __asm__ volatile("cli; hlt");
+    }
     tss_set_rsp0(current->kstack_top);
     vmm_switch(current->pml4);
     // gs points at this task's syscall scratch; fs carries user tls
@@ -542,10 +854,13 @@ void task_init(void) {
     // idle = kmain itself
     current = &task_table[0];
     current->pid = 0;
+    current->tgid = 0;
     current->state = T_RUNNING;
     current->pml4 = vmm_kernel_pml4();
-    current->kstack_top = KSTACK_VA_BASE; // unused, we live on boot stack
-    current->kgs = kgs_alloc(KSTACK_VA_BASE);
+    // give the idle slot a REAL stack: stale rsp0/gs from this slot would
+    // otherwise push into an unmapped page and triple-fault
+    map_kstack(current);
+    kgs_init(current);
     wrmsr(MSR_GS_BASE, current->kgs);
     tss_set_rsp0(current->kstack_top);
     next_pid = 1;

@@ -42,6 +42,15 @@ make run      # запустить в qemu
 - [x] **glibc запускается**: статические бинарники и динамические через
       настоящий ld.so + libc.so.6 с диска (auxv, TLS/arch_prctl, pread64,
       fstat/fstatat, writev, exit_group, getrandom)
+- [x] **углубление ядра под glibc**: rt_sigaction/rt_sigprocmask/rt_sigreturn
+      с доставкой сигналов в ring 3 (трамполин + sigreturn, SIGSEGV-хендлер
+      ловит настоящий #PF), futex WAIT/WAKE/REQUEUE (очереди по физическому
+      адресу слова) — на них работают настоящие pthread mutex/condvar,
+      ioctl(терминал): termios TCGETS/TCSETS, TIOCGWINSZ, isatty — плюс
+      канонический ввод с эхом и raw-режимом в клавиатурном драйвере,
+      clone(CLONE_VM|THREAD|SETTLS|CHILD_CLEARTID) для pthread_create,
+      нативный вход сисколлов через LSTAR/EFER.SCE (glibc вызывает syscall,
+      а не int 0x80), наносон/kill/tgkill/set_tid_address
 - [ ] портирование glibc дальше: полноценный libc userspace, dlopen и т.п.
 
 ## Как это устроено
@@ -83,9 +92,23 @@ AT_RANDOM/AT_EXECFN/...), ld.so через pread64/mmap с диска грузи
 и ядро приватизирует страницу. `forktest` это проверяет: трое детей
 портят общую память, родительские данные остаются целыми.
 
-Syscall-интерфейс: `int 0x80`, номера как в Linux — это задел
-под будущую glibc: когда ядро научится делать `mmap/brk/clone/...`,
-юзерспейс-бинарники с glibc смогут запускаться как есть.
+**Сигналы, futex, pthreads, tty.** Сигналы доставляются «перезаписью» кадра:
+на границе сисколла или по таймеру ядро строит glibc-совместимый rt_sigframe
+на стеке пользователя, подменяет rip на хендлер, а возврат идёт через
+rt_sigreturn — заблокированные сисколлы после хендлера просто переигрываются
+(SA_RESTART-семантика). SIGSEGV при этом ловит настоящий page fault: ядро
+мапит сегменты ELF с честными правами (W^X), запись в RO-страницу даёт #PF,
+и siglongjmp из хендлера работает. futex держит очереди ожидания по
+физическому адресу слова (потоки и процессы видят один ключ) — на нём стоят
+pthread_mutex/pthread_cond из настоящей glibc. pthread_create идёт через
+clone(CLONE_VM|CLONE_THREAD|CLONE_SETTLS|CLONE_PARENT_SETTID|
+CLONE_CHILD_CLEARTID): общий pml4, свой kstack и TLS, join — по futex на
+clear_child_tid. Клавиатура ведёт себя как tty: канонический режим с эхом
+и Ctrl-C (ISIG), raw-режим через tcsetattr — iotest проверяет isatty,
+tcgetattr, TIOCGWINSZ и оба режима чтения.
+
+Syscall-интерфейс: `int 0x80` + нативный `syscall` (LSTAR, EFER.SCE), номера
+как в Linux — glibc-бинарники вызывают сисколлы как на настоящем Linux.
 
 ## Лицензия
 

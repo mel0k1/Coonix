@@ -95,6 +95,12 @@ void kfree(void *ptr) {
     if (!ptr)
         return;
     struct chunk *c = (struct chunk *)((uint64_t)ptr - sizeof(struct chunk));
+    // poison freed payload: a use-after-free shows up as 0xdd patterns
+    {
+        uint64_t *p = (uint64_t *)ptr;
+        for (uint64_t i = 0; i < c->size / 8; i++)
+            p[i] = 0xddddddddddddddddULL;
+    }
     c->used = 0;
     // simple coalesce forward
     struct chunk *n;

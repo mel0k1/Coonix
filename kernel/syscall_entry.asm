@@ -7,6 +7,8 @@ extern syscall_dispatch
 
 section .text
 syscall_entry:
+    cli                          ; no ticks until iretq restores IF: the
+                                 ; entry must not be interrupted mid-frame
     mov qword [gs:8], rsp        ; stash user rsp
     mov rsp, [gs:0]              ; switch to the task kernel stack
 

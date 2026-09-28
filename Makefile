@@ -86,29 +86,53 @@ $(RAMDISK): $(USERS:%=$(RDISK_ROOT)/bin/%) $(RDISK_ROOT)/etc/motd
 LIBSTAMP := $(RDISK_ROOT)/lib64/.stamp
 
 GLIBC_PROGS := $(RDISK_ROOT)/bin/glibc_hello $(RDISK_ROOT)/bin/hello_dyn \
+	$(RDISK_ROOT)/bin/pthreadtest $(RDISK_ROOT)/bin/sigtest \
+	$(RDISK_ROOT)/bin/iotest \
 	$(LIBSTAMP)
 
 $(RDISK_ROOT)/bin/glibc_hello: user/glibc_hello.c
 	@if gcc -static -O2 -o $@ $< 2>/dev/null; then \
-		echo "glibc: built $@"; \
+	        echo "glibc: built $@"; \
 	else \
-		rm -f $@; echo "glibc: no static libc, skipping"; \
+	        rm -f $@; echo "glibc: no static libc, skipping"; \
 	fi
 
 # dynamically linked hello: needs the real ld.so + libc on the disk
 $(RDISK_ROOT)/bin/hello_dyn: user/glibc_hello.c
 	@if gcc -O2 -o $@ $< 2>/dev/null; then \
-		echo "glibc: built $@"; \
+	        echo "glibc: built $@"; \
 	else \
-		rm -f $@; echo "glibc: dynamic hello skipped"; \
+	        rm -f $@; echo "glibc: dynamic hello skipped"; \
+	fi
+
+# glibc feature tests: threads/signals/tty through the real libc
+$(RDISK_ROOT)/bin/pthreadtest: user/pthreadtest.c
+	@if gcc -O2 -Wall -o $@ $< 2>/dev/null; then \
+	        echo "glibc: built $@"; \
+	else \
+	        rm -f $@; echo "glibc: pthreadtest skipped"; \
+	fi
+
+$(RDISK_ROOT)/bin/sigtest: user/sigtest.c
+	@if gcc -O2 -Wall -o $@ $< 2>/dev/null; then \
+	        echo "glibc: built $@"; \
+	else \
+	        rm -f $@; echo "glibc: sigtest skipped"; \
+	fi
+
+$(RDISK_ROOT)/bin/iotest: user/iotest.c
+	@if gcc -O2 -Wall -o $@ $< 2>/dev/null; then \
+	        echo "glibc: built $@"; \
+	else \
+	        rm -f $@; echo "glibc: iotest skipped"; \
 	fi
 
 $(RDISK_ROOT)/lib64/.stamp:
 	@mkdir -p $(RDISK_ROOT)/lib64 $(RDISK_ROOT)/lib/x86_64-linux-gnu
 	@for d in lib64 lib/x86_64-linux-gnu; do \
-		for f in ld-linux-x86-64.so.2 libc.so.6; do \
-			cp /usr/lib/x86_64-linux-gnu/$$f $(RDISK_ROOT)/$$d/ 2>/dev/null || true; \
-		done; \
+	        for f in ld-linux-x86-64.so.2 libc.so.6; do \
+	                cp /usr/lib/x86_64-linux-gnu/$$f $(RDISK_ROOT)/$$d/ 2>/dev/null || true; \
+	        done; \
 	done
 	@touch $@
 

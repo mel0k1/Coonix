@@ -6,6 +6,7 @@
 #include "string.h"
 #include "task.h"
 #include "vmm.h"
+#include "signal.h"
 
 struct idt_entry {
     uint16_t offset_low;
@@ -103,16 +104,82 @@ static void print_dec(uint64_t v) {
 // returns the (possibly switched) kernel rsp to iretq from
 uint64_t isr_handler(struct regs *r) {
     if (r->int_no == 14) {
-        uint64_t cr2;
+        uint64_t cr2, cr3_now;
         __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3_now));
         // cow faults are handled quietly
         if (vmm_page_fault(r, cr2))
             return (uint64_t)r;
         // lazy fill of file-backed mappings
         if (task_mmap_fault(r, cr2))
             return (uint64_t)r;
-        // user-space fault (or kernel touching a bad user pointer): kill task
+        // user-space fault (or kernel touching a bad user pointer):
+        // a SIGSEGV handler gets it, default kills the task
+        if ((r->cs & 3) && current->pid == 0) {
+            extern void task_dump_switches(void);
+            serial_puts("[ANOMALY user-fault cur=idle frame=");
+            serial_puthex((uint64_t)r);
+            serial_puts(" rip=");
+            serial_puthex(r->rip);
+            serial_puts(" rsp=");
+            serial_puthex(r->rsp);
+            serial_puts(" rax=");
+            serial_puthex(r->rax);
+            serial_puts(" rbx=");
+            serial_puthex(r->rbx);
+            serial_puts(" rdi=");
+            serial_puthex(r->rdi);
+            serial_puts(" intno=");
+            serial_puthex(r->int_no);
+            serial_puts(" cr3=");
+            serial_puthex(cr3_now);
+            serial_puts(" idlersp=");
+            {
+                extern struct task *current;
+                serial_puthex(current->rsp);
+            }
+            serial_puts(" ");
+            task_dump_switches();
+            // full forensics: every live slot + the frame idle would resume
+            for (int i = 0; i < TASK_MAX; i++) {
+                struct task *t = &task_table[i];
+                if (t->state == T_FREE && !t->kstack_top)
+                    continue;
+                static const char *stname[] =
+                    { "FREE", "READY", "RUN ", "BLCK", "ZOMB" };
+                serial_puts(" t");
+                serial_puthex(t->pid);
+                serial_puts(":");
+                serial_puts(stname[t->state]);
+                serial_puts(" rsp=");
+                serial_puthex(t->rsp);
+                serial_puts(" kst=");
+                serial_puthex(t->kstack_top);
+                serial_puts(" pml4=");
+                serial_puthex(t->pml4);
+                if (t->rsp) {
+                    struct regs *fr = (struct regs *)t->rsp;
+                    serial_puts(" fcs=");
+                    serial_puthex(fr->cs);
+                    serial_puts(" frip=");
+                    serial_puthex(fr->rip);
+                }
+                serial_puts("\n");
+            }
+            serial_puts("[HALT for inspection]\n");
+            for (;;)
+                __asm__ volatile("cli; hlt");
+        }
         if ((r->cs & 3) || cr2 < 0x800000000000ULL) {
+            int have_handler = current->sigact[SIGSEGV].handler &&
+                               current->sigact[SIGSEGV].handler != 1 &&
+                               !(current->sig_mask & (1ULL << (SIGSEGV - 1)));
+            if (have_handler) {
+                signal_send_task(current, SIGSEGV);
+                uint64_t fr;
+                signal_deliver(r, &fr);
+                return fr;
+            }
             console_set_fg(0xff5555);
             console_puts("\nsegfault: pid ");
             print_dec(current->pid);
@@ -124,18 +191,42 @@ uint64_t isr_handler(struct regs *r) {
             print_hex64(r->err);
             console_puts("\n");
             console_set_fg(CONSOLE_FG);
-            return task_exit_current(139); // 128 + SIGSEGV
+            return task_exit_current_sig(SIGSEGV);
         }
         console_set_fg(0xff5555);
         console_puts("\npage fault in kernel at rip 0x");
         print_hex64(r->rip);
         console_puts(" cr2 0x");
         print_hex64(cr2);
+        console_puts(" rsp 0x");
+        print_hex64(r->rsp);
+        console_puts("\n  cur pid ");
+        print_dec(current->pid);
+        console_puts(" kgs 0x");
+        print_hex64(current->kgs);
+        console_puts(" kt 0x");
+        print_hex64(current->kstack_top);
         console_puts("\n");
         panic("page fault");
     }
 
     if (r->int_no < 32) {
+        // user-mode program faults become signals where one exists
+        if (r->cs & 3) {
+            int sig = 0;
+            if (r->int_no == 6)  sig = SIGILL;
+            if (r->int_no == 0)  sig = SIGFPE;
+            if (r->int_no == 3)  sig = SIGTRAP;
+            if (r->int_no == 4)  sig = SIGFPE;
+            if (sig && current->sigact[sig].handler &&
+                current->sigact[sig].handler != 1 &&
+                !(current->sig_mask & (1ULL << (sig - 1)))) {
+                signal_send_task(current, sig);
+                uint64_t fr;
+                signal_deliver(r, &fr);
+                return fr;
+            }
+        }
         uint64_t cr2;
         __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
         console_set_fg(0xff5555);
@@ -151,7 +242,19 @@ uint64_t isr_handler(struct regs *r) {
 
     if (r->int_no == 128) {
         extern uint64_t syscall_dispatch(struct regs *r);
-        return syscall_dispatch(r); // may switch tasks
+        uint64_t fr = syscall_dispatch(r); // may switch tasks
+        // red line: never iretq to ring 3 while the scheduler thinks the
+        // idle task is current — that context belongs to nobody
+        if (((struct regs *)fr)->cs & 3 && current->pid == 0) {
+            extern void task_dump_switches(void);
+            serial_puts("[REDLINE int80->user cur=idle fr=");
+            serial_puthex(fr);
+            serial_puts(" ");
+            task_dump_switches();
+            for (;;)
+                __asm__ volatile("cli; hlt");
+        }
+        return fr;
     }
 
     if (r->int_no >= 32 && r->int_no < 48) {
@@ -162,10 +265,32 @@ uint64_t isr_handler(struct regs *r) {
 
     if (irq_handlers[r->int_no]) {
         irq_handlers[r->int_no](r);
-        // timer tick: preempt, schedule() picks another task if any
+        // timer tick: deliver pending signals to the interrupted user
+        // context, then preempt
         if (r->int_no == 32) {
-            extern uint64_t task_schedule(uint64_t old_rsp);
-            return task_schedule((uint64_t)r);
+            extern void futex_tick(void);
+            extern void task_tick_wake(void);
+            futex_tick();
+            task_tick_wake();
+            uint64_t fr;
+            int act = signal_deliver(r, &fr);
+            if (act == 2)
+                return fr;   // signal killed us; it scheduled the next task
+            if (act == 1) {
+                // red line: the handler frame replaces ours — but only a
+                // real task may resume to ring 3 here
+                if (current->pid == 0) {
+                    extern void task_dump_switches(void);
+                    serial_puts("[REDLINE tick-signal cur=idle fr=");
+                    serial_puthex(fr);
+                    serial_puts(" ");
+                    task_dump_switches();
+                    for (;;)
+                        __asm__ volatile("cli; hlt");
+                }
+                return fr;   // handler frame replaces ours, no preemption
+            }
+            return task_schedule(fr);
         }
     }
     return (uint64_t)r;

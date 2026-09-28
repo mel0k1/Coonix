@@ -90,7 +90,12 @@ uint64_t elf_load_user_info(uint64_t pml4, const void *elf, size_t size,
         }
         if (ph[i].filesz)
             memcpy((void *)ph[i].vaddr, (const uint8_t *)elf + ph[i].offset, ph[i].filesz);
-        // TODO: drop write bit for read-only segments (W^X)
+        // relax the copy-time write bit: read-only segments (text, rodata,
+        // the elf header page) must actually fault on write, or the null
+        // page of a PIE (mapped at vaddr 0) silently accepts stores
+        if (!(ph[i].flags & PF_W))
+            vmm_mprotect(pml4, start, (end - start) / PAGE_SIZE, flags);
+        // TODO: drop exec from data segments too
         if (end > top)
             top = end;
     }
@@ -147,6 +152,8 @@ uint64_t elf_load_user_info(uint64_t pml4, const void *elf, size_t size,
             if (lph[i].filesz)
                 memcpy((void *)(INTERP_BASE + lph[i].vaddr),
                        (const uint8_t *)ldimg + lph[i].offset, lph[i].filesz);
+            if (!(lph[i].flags & PF_W))
+                vmm_mprotect(pml4, start, (end - start) / PAGE_SIZE, flags);
             uint64_t iend = INTERP_BASE +
                 ((lph[i].vaddr + lph[i].memsz + 0xfff) & ~0xfffULL);
             if (iend > top)

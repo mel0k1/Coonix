@@ -9,6 +9,7 @@
 #include "idt.h"
 #include "pit.h"
 #include "kbd.h"
+#include "signal.h"
 #include "task.h"
 #include "pmm.h"
 #include "vmm.h"
@@ -210,11 +211,23 @@ void kmain(void) {
     }
 
     task_init();
-    if (!task_spawn_user("/bin/shell", current))
+    signal_init();
+    struct task *shell = task_spawn_user("/bin/shell", current);
+    if (!shell)
         panic("no shell");
+    // the shell owns the console foreground group (ISIG ctrl-C target)
+    shell->pgid = shell->tgid;
+    tty_fg_pgid = shell->pgid;
     console_puts("ring 3 shell is up, kernel idles now\n");
 
+    // move the idle task onto its own kernel stack: every tick saves the
+    // interrupted frame at current->rsp, and the boot stack pages below the
+    // image are ordinary free memory for the PMM — a big allocation
+    // (pthread stacks) would clobber a saved idle frame and resurrect a
+    // random user context with kernel cr3
+    __asm__ volatile("mov %0, %%rsp" :: "r"(current->kstack_top) : "memory");
     for (;;) {
+        task_reap();
         __asm__ volatile("sti; hlt");
     }
 }

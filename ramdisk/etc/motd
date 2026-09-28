@@ -1,2 +1,2 @@
-Coonix 0.4.0 - ahci + ext2 rw + file mmap
-real glibc binaries now run, enot is proud
+Coonix 0.5.0 - signals, futex, pthreads, tty
+real glibc threads and signals work, enot is proud

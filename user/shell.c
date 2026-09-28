@@ -4,6 +4,13 @@
 #include "string.h"
 #include "coonix.h"
 
+// ctrl-C lands here while the shell sits in read(); print a fresh prompt
+// and let the sigreturn replay the read
+static void on_sigint(int sig) {
+    (void)sig;
+    printf("\ncoonix> ");
+}
+
 static void cat(const char *path) {
     long fd = open(path, 0, 0);
     if (fd < 0) {
@@ -42,31 +49,21 @@ int main(void) {
     char buf[128];
     int len;
 
+    sigaction(SIGINT, on_sigint, 0);
+
     // message of the day from the ramdisk
     cat("/etc/motd");
     printf("commands: help, echo, clear, ls [dir], cat <file>, pid, exit\n");
 
     for (;;) {
         printf("coonix> ");
-        len = 0;
-        while (len < (int)sizeof(buf) - 1) {
-            char c;
-            if (read(0, &c, 1) != 1)
-                continue;
-            if (c == '\n')
-                break;
-            if (c == '\b') {
-                if (len) {
-                    len--;
-                    write(1, "\b \b", 3);
-                }
-                continue;
-            }
-            buf[len++] = c;
-            write(1, &c, 1);
-        }
+        // canonical mode: the kernel echoes and hands us the whole line
+        len = read(0, buf, (int)sizeof(buf) - 1);
+        if (len <= 0)
+            continue;                  // eof (ctrl-D) or restart after signal
+        if (buf[len - 1] == '\n')
+            len--;
         buf[len] = 0;
-        write(1, "\n", 1);
         if (!len)
             continue;
 

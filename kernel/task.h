@@ -4,13 +4,26 @@
 #include "idt.h"
 #include "vfs.h"
 
-#define TASK_MAX 16
+#define TASK_MAX 32
 #define KSTACK_PAGES 4
 #define KSTACK_SIZE (KSTACK_PAGES * 4096)
 #define KSTACK_VA_BASE 0xffffffff90000000ULL  // per-pid slot, 64k each
 #define USER_STACK_TOP 0x7ffffffff000ULL
 #define USER_STACK_PAGES 16
 #define USER_MMAP_BASE 0x600000000000ULL      // mmap region grows up
+
+// signals 1..64 fit one u64 mask; bit(sig-1)
+#define SIG_MAX 64
+#define SIG_DFL 0
+#define SIG_IGN 1
+
+// what glibc passes to rt_sigaction (kernel_sigaction)
+struct k_sigaction {
+    uint64_t handler;     // SIG_DFL / SIG_IGN / user fn
+    uint64_t flags;       // SA_*; SA_RESTORER must be set (like linux x86_64)
+    uint64_t restorer;    // user trampoline that calls rt_sigreturn
+    uint64_t mask;        // signals to block while handling
+};
 
 // mmap reservation (syscall 9/11); file = 0 for anonymous
 struct mmap_region {
@@ -23,18 +36,21 @@ struct mmap_region {
 };
 
 enum { T_FREE, T_READY, T_RUNNING, T_BLOCKED, T_ZOMBIE };
-enum { WAIT_NONE = 0, WAIT_KBD = 1, WAIT_CHILD = 2 };
+enum { WAIT_NONE = 0, WAIT_KBD = 1, WAIT_CHILD = 2, WAIT_SLEEP = 3 };
 
 struct task {
-    int pid;
+    int pid;              // thread id (tid)
+    int tgid;             // thread group: the process id
+    int pgid;             // console foreground group
     int state;
-    int exit_code;
-    int wait_reason;      // 0 none, 1 kbd
+    int exit_code;        // wait4 sees: signal death -> the signal, else code<<8
+    int sig_death;        // exit_code was a killing signal
+    int wait_reason;      // WAIT_*
     struct task *parent;
     uint64_t rsp;         // kernel rsp (top: struct regs)
     uint64_t kstack_top;  // virtual
-    uint64_t pml4;        // phys
-    uint64_t wake_tick;
+    uint64_t pml4;        // phys; shared between threads of a group
+    uint64_t wake_tick;   // nanosleep deadline (tick units)
     struct file *fds[FILE_MAX];
     uint64_t brk_base;    // past the last elf segment
     uint64_t brk_cur;     // current program break
@@ -42,7 +58,16 @@ struct task {
     uint64_t fs_base;     // user tls (arch_prctl)
     uint64_t gs_base;
     uint64_t clear_tid;   // set_tid_address
-    uint64_t kgs;         // kernel gs scratch: {kstack_top, user_rsp}
+    uint64_t child_tid;   // clone CLONE_CHILD_CLEARTID: cleared + futex-woken on exit
+    uint64_t sig_pending; // awaiting delivery
+    uint64_t sig_mask;    // blocked
+    struct k_sigaction sigact[SIG_MAX + 1];
+    // syscall-entry scratch the gs base points at: {kstack_top, user_rsp}.
+    // lives INSIDE the task slot: a heap-allocated scratch would dangle
+    // after kfree (poisoned/reused) and a stale gs would send the syscall
+    // entry onto another task's kernel stack
+    uint64_t kgs_area[2];
+    uint64_t kgs;         // = &kgs_area[0], loaded into MSR_GS_BASE
     // elf image info for auxv
     uint64_t phdr_va, phent, phnum, entry_va;
 };
@@ -55,8 +80,18 @@ struct task *task_spawn_kernel(void (*entry)(void));
 struct task *task_spawn_user(const char *path, struct task *parent);
 void task_yield(void);           // called from irq context
 uint64_t task_schedule(uint64_t old_rsp);
+// direct switch to a specific task (clone returns straight into the child);
+// caller must have stored current->rsp already
+uint64_t task_switch_to(struct task *next);
 struct task *task_fork(struct regs *frame);
+// CLONE_THREAD clone: shared address space, new tid; 0 on failure
+struct task *task_clone_thread(struct regs *frame, uint64_t flags,
+                               uint64_t newsp, uint64_t parent_tid,
+                               uint64_t child_tid, uint64_t tls);
 uint64_t task_exit_current(int code);
+uint64_t task_exit_current_group(int code);   // SYS_exit_group: kill threads
+// killed by a signal: wait4 reports the signal number
+uint64_t task_exit_current_sig(int sig);
 void task_unmap_user(struct task *t);
 void task_mmap_teardown(struct task *t);   // writeback shared, drop regions
 void task_mmap_clone(struct task *dst, const struct task *src);
@@ -64,6 +99,10 @@ void task_mmap_clone(struct task *dst, const struct task *src);
 int task_mmap_fault(struct regs *r, uint64_t cr2);
 struct task *task_find_free(void);
 void task_wake_kbd(void);
+void task_tick_wake(void);      // unblock nanosleep deadlines
+void task_reap(void);           // idle loop: free parked kstacks
+int task_frame_owned(struct regs *fr);   // forensics
+int task_count_group(int tgid, struct task *except);
 // exec current task with a new image from a vnode; returns new frame rsp, 0 on fail
 uint64_t task_exec_current(struct vnode *vn);
 // same, but name becomes argv[0] and auxv gets a fresh elf image info
