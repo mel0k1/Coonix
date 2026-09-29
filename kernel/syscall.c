@@ -357,6 +357,9 @@ static uint64_t sys_open(struct regs *r) {
         r->rax = -ENOMEM;
         return (uint64_t)r;
     }
+    // absolute path for /proc/<pid>/fd readlink targets
+    strncpy(f->path, path, sizeof(f->path) - 1);
+    f->path[sizeof(f->path) - 1] = 0;
     int fd = task_fd_alloc(f);
     if (fd < 0) {
         vfs_close(f);
@@ -906,7 +909,9 @@ static uint64_t sys_set_tid_address(struct regs *r) {
 static uint64_t sys_newfstatat(struct regs *r) {
     struct stat_k *st = (struct stat_k *)r->rdx;
     const char *path = (const char *)r->rsi;
-    int empty = !path || !path[0] || (r->r10 & 0x1000);   // AT_EMPTY_PATH
+    int flags = (int)r->r10;
+    int empty = !path || !path[0] || (flags & 0x1000);   // AT_EMPTY_PATH
+    int nofollow = flags & 0x100;                        // AT_SYMLINK_NOFOLLOW
     if (!st || (!empty && !path)) {
         r->rax = -EFAULT;
         return (uint64_t)r;
@@ -922,7 +927,10 @@ static uint64_t sys_newfstatat(struct regs *r) {
             r->rax = -EFAULT;
             return (uint64_t)r;
         }
-        vn = vfs_resolve(p);
+        // lstat(): report the link itself, not its target (busybox ls -l
+        // on /proc/<pid>/fd otherwise chases the target and gets ENOENT
+        // for /dev/console which has no vnode)
+        vn = nofollow ? vfs_resolve_nofollow(p) : vfs_resolve(p);
     }
     if (!vn) {
         r->rax = -ENOENT;
@@ -1690,6 +1698,67 @@ static uint64_t sys_sysinfo(struct regs *r) {
     return (uint64_t)r;
 }
 
+// --- cpu accounting: times(43) and getrusage(98) -------------------------
+
+// glibc struct tms (x86_64: 4 clock_t = 32 bytes)
+struct tms_k {
+    int64_t utime, stime, cutime, cstime;
+};
+
+static uint64_t sys_times(struct regs *r) {
+    struct tms_k *tm = (struct tms_k *)r->rdi;
+    if (!tm) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    uint64_t u, s;
+    task_cpu_group(current->tgid, &u, &s);
+    tm->utime = (int64_t)u;
+    tm->stime = (int64_t)s;
+    tm->cutime = (int64_t)current->cutime;
+    tm->cstime = (int64_t)current->cstime;
+    r->rax = pit_ticks();          // uptime in clock ticks (CLK_TCK = 100)
+    return (uint64_t)r;
+}
+
+// glibc struct rusage (x86_64: 144 bytes)
+struct rusage_k {
+    int64_t utime_sec, utime_usec;   // ru_utime
+    int64_t stime_sec, stime_usec;   // ru_stime
+    int64_t rest[14];                // maxrss .. ru_nivcsw, all zeroed
+};
+
+_Static_assert(sizeof(struct rusage_k) == 144, "rusage layout");
+
+static void ticks_to_timeval(uint64_t ticks, int64_t *sec, int64_t *usec) {
+    *sec = (int64_t)(ticks / 100);
+    *usec = (int64_t)((ticks % 100) * 10000);   // 100 Hz -> 10 ms per tick
+}
+
+static uint64_t sys_getrusage(struct regs *r) {
+    int who = (int)r->rdi;
+    struct rusage_k *ru = (struct rusage_k *)r->rsi;
+    if (!ru) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    uint64_t u, s;
+    if (who == 1) {                // RUSAGE_THREAD: this thread only
+        u = current->utime;
+        s = current->stime;
+    } else if (who == (int)-1) {   // RUSAGE_CHILDREN: reaped children
+        u = current->cutime;
+        s = current->cstime;
+    } else {                       // RUSAGE_SELF: whole thread group
+        task_cpu_group(current->tgid, &u, &s);
+    }
+    memset(ru, 0, sizeof(*ru));
+    ticks_to_timeval(u, &ru->utime_sec, &ru->utime_usec);
+    ticks_to_timeval(s, &ru->stime_sec, &ru->stime_usec);
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
 static uint64_t sys_faccessat(struct regs *r) {
     char path[256];
     if (user_path(r->rsi, path, sizeof(path)) < 0) {
@@ -1981,6 +2050,8 @@ uint64_t syscall_dispatch(struct regs *r) {
     case SYS_link:    fr = sys_link(r); break;
     case 170 /* SYS_sync */: r->rax = 0; fr = (uint64_t)r; break;
     case SYS_sysinfo: fr = sys_sysinfo(r); break;
+    case SYS_times:   fr = sys_times(r); break;
+    case SYS_getrusage: fr = sys_getrusage(r); break;
     case SYS_faccessat: fr = sys_faccessat(r); break;
     case 21 /* SYS_access */: fr = sys_access(r); break;
     case SYS_gettimeofday: fr = sys_gettimeofday(r); break;

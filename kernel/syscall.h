@@ -22,6 +22,9 @@
 #define SYS_madvise 28
 #define SYS_nanosleep 35
 #define SYS_getpid  39
+/* x86_64 ABI: times = 100 (43 is i386 / accept here!), getrusage = 98 */
+#define SYS_times   100
+#define SYS_getrusage 98
 #define SYS_futex   202
 #define SYS_clone   56
 #define SYS_fork    57
