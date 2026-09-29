@@ -34,7 +34,7 @@ class Qmp:
         keys = [{"type": "qcode", "data": q} for q in qcodes]
         return self.cmd("send-key", {"keys": keys})
 
-    def type_str(self, text, delay=0.012):
+    def type_str(self, text, delay=0.03):
         specials = {" ": "spc", "\n": "ret", "-": "minus", "=": "equal",
                     "[": "bracket_left", "]": "bracket_right",
                     "/": "slash", ".": "dot", ",": "comma", ";": "semicolon"}
