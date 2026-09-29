@@ -62,6 +62,7 @@ struct file {
     uint64_t off;
     int refs;
     int is_console;
+    char path[56];         // absolute path (procfs fd readlink targets)
 };
 
 #define FILE_MAX 16

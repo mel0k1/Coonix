@@ -1,2 +1,2 @@
-Coonix 0.6.0 - busybox userspace, dlopen, fs syscalls
+Coonix 0.7.0 - w^x everywhere, cpu accounting, /proc/<pid>/fd
 real glibc threads, signals and busybox sh work, enot is proud

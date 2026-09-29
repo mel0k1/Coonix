@@ -172,11 +172,9 @@ struct file *vfs_open(struct vnode *vn) {
     struct file *f = kmalloc(sizeof(*f));
     if (!f)
         return 0;
+    memset(f, 0, sizeof(*f));   // path[] must start empty
     f->vn = vn;
-    f->pipe = 0;
-    f->off = 0;
     f->refs = 1;
-    f->is_console = 0;
     return f;
 }
 

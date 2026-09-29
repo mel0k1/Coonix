@@ -46,7 +46,7 @@ static const char *pfile_names[N_PFILES] = { "stat", "status", "cmdline",
 static const char *root_file_names[3] = { "meminfo", "mounts", "uptime" };
 #define N_ROOTFILES 3
 
-enum { PN_ROOT, PN_PIDDIR, PN_FILE, PN_LNK };
+enum { PN_ROOT, PN_PIDDIR, PN_FILE, PN_LNK, PN_FDDIR, PN_FDLNK };
 struct pnode {
     struct vnode vn;
     int used;
@@ -63,12 +63,18 @@ static struct vnode *procfs_parent;   // ".." from the root: mount dir
 //   root    = 1
 //   pid dir = 0x100000 + pid
 //   file    = 0x200000 + (pid + 1) * 16 + which   (which <= 8)
+//   fd dir  = 0x300000 + pid
+//   fd link = 0x2000000 + pid * 1024 + fd         (FILE_MAX = 16 << 1024)
 // pids grow unbounded, so the ranges must be far apart
 static uint64_t make_ino(int kind, int pid, int which) {
     if (kind == PN_ROOT)
         return 1;
     if (kind == PN_PIDDIR)
         return 0x100000 + (uint64_t)pid;
+    if (kind == PN_FDDIR)
+        return 0x300000 + (uint64_t)pid;
+    if (kind == PN_FDLNK)
+        return 0x2000000 + (uint64_t)pid * 1024 + (uint64_t)which;
     return 0x200000 + (uint64_t)(pid + 1) * 16 + (uint64_t)which;
 }
 
@@ -94,11 +100,13 @@ static struct vnode *pnode_get(int kind, int pid, int which) {
             switch (kind) {
             case PN_ROOT:
             case PN_PIDDIR:
+            case PN_FDDIR:
                 pn->vn.type = VNODE_DIR;
                 pn->vn.mode = 0x4000 | 0555;
                 pn->vn.size = 4096;
                 break;
             case PN_LNK:
+            case PN_FDLNK:
                 pn->vn.type = VNODE_LNK;
                 pn->vn.mode = 0xA000 | 0777;
                 pn->vn.size = 0;       // filled per lookup
@@ -225,12 +233,23 @@ static void gen_stat(struct task *t, struct sbuf *b) {
     sb_raw(b, " 0 ", 3);                         // tty_nr
     sb_i64(b, t->pgid);                          // tpgid
     sb_raw(b, " 0", 2);                          // flags
-    for (int i = 0; i < 8; i++)                  // minflt..cstime: 0
-        sb_raw(b, " 0", 2);
+    uint64_t uu, ss;
+    task_cpu_group(t->tgid, &uu, &ss);           // utime/stime: group sums
+    sb_raw(b, " 0 0 0 0", 8);                    // minflt cminflt majflt cmajflt
+    sb_raw(b, " ", 1);
+    sb_u64(b, uu);                               // utime
+    sb_raw(b, " ", 1);
+    sb_u64(b, ss);                               // stime
+    sb_raw(b, " ", 1);
+    sb_u64(b, t->cutime);                        // cutime
+    sb_raw(b, " ", 1);
+    sb_u64(b, t->cstime);                        // cstime
     sb_raw(b, " 20 0", 5);                       // priority, nice
     sb_raw(b, " ", 1);
     sb_u64(b, (uint64_t)task_threads(t));        // num_threads
-    sb_raw(b, " 0 0 ", 5);                       // itrealvalue, starttime
+    sb_raw(b, " 0 ", 3);                         // itrealvalue
+    sb_u64(b, pit_ticks() - t->start_tick);      // starttime (ticks)
+    sb_raw(b, " ", 1);
     sb_u64(b, task_vsize(t));                    // vsize
     sb_raw(b, " 0\n", 3);                        // rss
 }
@@ -315,6 +334,8 @@ static struct vnode *pfs_lookup_impl(struct vnode *dir, const char *name) {
     }
 
     if (d->kind == PN_PIDDIR) {
+        if (!strcmp(name, "fd"))
+            return pnode_get(PN_FDDIR, d->pid, 0);
         for (int w = 0; w < N_PFILES; w++) {
             if (!strcmp(name, pfile_names[w])) {
                 struct vnode *vn = pnode_get(
@@ -329,6 +350,22 @@ static struct vnode *pfs_lookup_impl(struct vnode *dir, const char *name) {
             }
         }
     }
+
+    if (d->kind == PN_FDDIR) {
+        // decimal fd only
+        int fd = 0, digits = 0;
+        for (const char *p = name; *p; p++, digits++) {
+            if (*p < '0' || *p > '9' || digits > 4)
+                return 0;
+            fd = fd * 10 + (*p - '0');
+        }
+        if (fd >= FILE_MAX)
+            return 0;
+        struct task *t = find_leader(d->pid);
+        if (!t || !t->fds[fd])
+            return 0;
+        return pnode_get(PN_FDLNK, d->pid, fd);
+    }
     return 0;
 }
 
@@ -336,8 +373,8 @@ static struct vnode *pfs_lookup_impl(struct vnode *dir, const char *name) {
 static long pfs_read_impl(struct vnode *vn, void *buf, uint64_t off,
                           uint64_t len) {
     struct pnode *pn = vn->fs_data;
-    if (pn->kind == PN_ROOT || pn->kind == PN_PIDDIR)
-        return -1;                   // dirs are not readable as files
+    if (pn->kind != PN_FILE)
+        return -1;                   // dirs/links are not readable as files
     if (!len)
         return 0;
 
@@ -452,17 +489,51 @@ static int pfs_readdir_impl(struct vnode *dir, uint64_t *ctx, uint64_t *ino,
             *type = i == P_CWD ? VNODE_LNK : VNODE_FILE;
             return 1;
         }
+        // last entry of the pid dir: the fd subdirectory
+        if (i == (uint64_t)N_PFILES) {
+            strncpy(name, "fd", name_cap - 1);
+            name[name_cap - 1] = 0;
+            *ino = make_ino(PN_FDDIR, d->pid, 0);
+            *type = VNODE_DIR;
+            return 1;
+        }
+    }
+
+    if (d->kind == PN_FDDIR) {
+        struct task *t = find_leader(d->pid);
+        if (!t)
+            return 0;
+        for (uint64_t i = *ctx; i < (uint64_t)FILE_MAX; i = *ctx) {
+            *ctx = i + 1;
+            if (!t->fds[i])
+                continue;
+            char tmp[8];
+            int j = 0;
+            int v = (int)i;
+            do {
+                tmp[j++] = '0' + v % 10;
+                v /= 10;
+            } while (v);
+            if (j + 1 > name_cap)
+                return 0;
+            for (int k = 0; k < j; k++)
+                name[k] = tmp[j - 1 - k];
+            name[j] = 0;
+            *ino = make_ino(PN_FDLNK, d->pid, (int)i);
+            *type = VNODE_LNK;
+            return 1;
+        }
     }
     return 0;
 }
 
 static long pfs_readlink_impl(struct vnode *vn, char *buf, uint64_t size) {
     struct pnode *pn = vn->fs_data;
-    if (pn->kind != PN_LNK)
+    if (pn->kind != PN_LNK && pn->kind != PN_FDLNK)
         return -1;
 
     // /proc/self: the CALLER's process, whatever task opens it
-    if (pn->which == P_SELF) {
+    if (pn->which == P_SELF && pn->kind == PN_LNK) {
         char tmp[12];
         int j = 0;
         int v = current->tgid;
@@ -483,6 +554,36 @@ static long pfs_readlink_impl(struct vnode *vn, char *buf, uint64_t size) {
     if (!t)
         return -1;
     const char *src = 0;
+    if (pn->kind == PN_FDLNK) {
+        // /proc/<pid>/fd/<n>: "<path>" | "pipe:[id]" | "/dev/console"
+        int fd = pn->which;
+        if (fd < 0 || fd >= FILE_MAX || !t->fds[fd])
+            return -1;
+        struct file *f = t->fds[fd];
+        char tgt[64];
+        struct sbuf tb = { .p = tgt, .left = (int)sizeof(tgt) };
+        tgt[0] = 0;
+        if (f->is_console) {
+            sb_str(&tb, "/dev/console");
+        } else if (f->pipe) {
+            sb_str(&tb, "pipe:[");
+            sb_u64(&tb, (uint64_t)f->pipe & 0xffffffffULL);
+            sb_str(&tb, "]");
+        } else if (f->vn) {
+            if (f->path[0])
+                sb_str(&tb, f->path);
+            else
+                sb_str(&tb, "file:[]");
+        } else {
+            return -1;
+        }
+        uint64_t tn = (uint64_t)(tb.p - tgt);
+        if (tn > size - 1)
+            tn = size - 1;
+        memcpy(buf, tgt, tn);
+        buf[tn] = 0;
+        return (long)tn;
+    }
     if (pn->which == P_CWD) {
         src = t->cwd;
     } else if (pn->which == P_EXE) {

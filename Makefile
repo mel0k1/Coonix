@@ -88,6 +88,7 @@ LIBSTAMP := $(RDISK_ROOT)/lib64/.stamp
 GLIBC_PROGS := $(RDISK_ROOT)/bin/hello_dyn \
 	$(RDISK_ROOT)/bin/pthreadtest $(RDISK_ROOT)/bin/sigtest \
 	$(RDISK_ROOT)/bin/iotest $(RDISK_ROOT)/bin/dltest \
+	$(RDISK_ROOT)/bin/wxtest $(RDISK_ROOT)/bin/timetest \
 	$(RDISK_ROOT)/lib/libfoo.so \
 	$(LIBSTAMP)
 
@@ -127,6 +128,22 @@ $(RDISK_ROOT)/bin/dltest: user/dltest.c
 		echo "glibc: built $@"; \
 	else \
 		rm -f $@; echo "glibc: dltest skipped"; \
+	fi
+
+# W^X enforcement: NX on data, mprotect promote/demote, RO text
+$(RDISK_ROOT)/bin/wxtest: user/wxtest.c
+	@if gcc -O2 -Wall -o $@ $< 2>/dev/null; then \
+		echo "glibc: built $@"; \
+	else \
+		rm -f $@; echo "glibc: wxtest skipped"; \
+	fi
+
+# cpu accounting: getrusage(98) and times(43) via the real libc
+$(RDISK_ROOT)/bin/timetest: user/timetest.c
+	@if gcc -O2 -Wall -o $@ $< 2>/dev/null; then \
+		echo "glibc: built $@"; \
+	else \
+		rm -f $@; echo "glibc: timetest skipped"; \
 	fi
 
 # freestanding .so (no DT_NEEDED) so the disk needs no extra libs

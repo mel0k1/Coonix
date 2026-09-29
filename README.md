@@ -69,7 +69,22 @@ make run      # запустить в qemu
 - [x] **procfs**: оверлей-монтирование /proc поверх корня (mount-таблица
       в VFS), /proc/<pid>/stat (linux-формат) / status / cmdline / cwd,
       ps-апплет поверх getdents64; коммит argv в task для cmdline
-- [ ] чистка W^X до конца: NX на kernel data-сегментах
+- [x] **W^X финализирован**: ELF-сегменты уже NX кроме PT_X, kernel
+      heap/stacks NX, mmap/brk NX без PROT_EXEC; fork теперь сохраняет NX
+      в COW-копиях (флаг копировался как pte&0xfff и терял бит 63), плюс
+      wxtest: RW-страница не исполняется, mprotect rx/rw туда-обратно,
+      .text только чтение, стек не исполняется
+- [x] **учёт процессорного времени**: getrusage(98) (SELF = сумма по
+      тред-группе, CHILDREN, THREAD) и times(100 — x86_64-номер; 43 это
+      accept!) через настоящую glibc; utime/stime копятся в планировщике
+      по ring-у прерванного кадра, cutime/cstime переезжают к родителю на
+      exit; /proc/<pid>/stat теперь несёт utime/stime/cutime/cstime и
+      starttime
+- [x] **/proc/<pid>/fd**: fd-каталог с симлинками 0..N (ls -l показывает
+      цели: /dev/console, pipe:[id], путь открытого файла — struct file
+      хранит путь с момента open), fstatat научился AT_SYMLINK_NOFOLLOW
+      (lstat больше не следует по линкам и не падает на /dev/console);
+      тесты: qfdtest.py (fd/симлинки/пайпы + ps/fsx регрессии)
 - [ ] портирование glibc дальше: полноценный libc userspace
 
 ## Как это устроено
