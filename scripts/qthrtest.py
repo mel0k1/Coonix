@@ -89,7 +89,8 @@ def main_setup(machine):
                  "-device", "ich9-ahci,id=ahci0",
                  "-device", "ide-hd,drive=hd0,bus=ahci0.0"]
     else:
-        drive = ["-drive", "file=build/disk.img,format=raw,if=ide,index=0"]
+        drive = ["-L", "/home/z/tools/local/usr/share/qemu",
+                 "-drive", "file=build/disk.img,format=raw,if=ide,index=0"]
 
     qemu = subprocess.Popen([
         "qemu-system-x86_64", "-M", machine, "-m", "2G",
