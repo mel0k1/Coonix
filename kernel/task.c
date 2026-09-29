@@ -378,6 +378,7 @@ struct task *task_spawn_user(const char *path, struct task *parent) {
     t->tgid = t->pid;         // fresh process: own group
     t->pgid = t->pid;
     t->parent = parent;
+    t->start_tick = pit_ticks();
 
     uint64_t pml4 = vmm_create_pml4();
     t->pml4 = pml4;
@@ -553,6 +554,7 @@ struct task *task_fork(struct regs *frame) {
     c->tgid = c->pid;
     c->pgid = current->pgid;      // same console group
     c->parent = current;
+    c->start_tick = pit_ticks();
     c->state = T_READY;
 
     uint64_t pml4 = vmm_create_pml4();
@@ -596,7 +598,10 @@ struct task *task_fork(struct regs *frame) {
                     uint64_t phys = pte & 0x000ffffffffff000ULL;
                     uint64_t va = ((uint64_t)i << 39) | ((uint64_t)j << 30) |
                                   ((uint64_t)k << 21) | ((uint64_t)m << 12);
-                    uint64_t flags = pte & 0xfff;   // incl. soft COW bit
+                    // w^x: 0xfff keeps PRESENT/WRITE/USER/COW, but NX
+                    // lives at bit 63 and must ride along too, or every
+                    // fork child gets executable data pages
+                    uint64_t flags = (pte & 0xfff) | (pte & VMM_NX);
                     if (pte & VMM_WRITE) {
                         flags &= ~VMM_WRITE;
                         flags |= VMM_COW;
@@ -662,6 +667,7 @@ struct task *task_clone_thread(struct regs *frame, uint64_t flags,
     c->pid = next_pid++;
     c->tgid = current->tgid;
     c->pgid = current->pgid;
+    c->start_tick = pit_ticks();
     c->parent = current->parent ? current->parent : current;
     c->state = T_READY;
     c->pml4 = current->pml4;      // shared address space
@@ -702,6 +708,20 @@ struct task *task_clone_thread(struct regs *frame, uint64_t flags,
         cr->rsp = newsp;
     c->rsp = (uint64_t)cr;
     return c;
+}
+
+// summed cpu time of every live/zombie thread of the group
+void task_cpu_group(int tgid, uint64_t *utime, uint64_t *stime) {
+    uint64_t u = 0, s = 0;
+    for (int i = 0; i < TASK_MAX; i++) {
+        struct task *t = &task_table[i];
+        if (t->state != T_FREE && t->tgid == tgid) {
+            u += t->utime;
+            s += t->stime;
+        }
+    }
+    *utime = u;
+    *stime = s;
 }
 
 int task_count_group(int tgid, struct task *except) {
@@ -749,6 +769,20 @@ static uint64_t exit_common(int code, int sig_death, int force_group) {
         // pthread_exit from a worker: only this thread goes away
         task_thread_release(current, 1);
         return task_schedule(0);
+    }
+    // the dying group's cpu totals move to the parent (getrusage children)
+    // BEFORE sibling release flips their slots to T_FREE
+    if (current->parent) {
+        uint64_t gu = 0, gs = 0;
+        for (int i = 0; i < TASK_MAX; i++) {
+            struct task *t = &task_table[i];
+            if (t->state != T_FREE && t->tgid == current->tgid) {
+                gu += t->utime;
+                gs += t->stime;
+            }
+        }
+        current->parent->cutime += gu;
+        current->parent->cstime += gs;
     }
     // group death: release every sibling thread, then tear down the process
     if (others > 0) {
@@ -839,8 +873,18 @@ uint64_t task_schedule(uint64_t old_rsp) {
     cli();
     if (!current)
         return old_rsp; // scheduler not initialized yet
-    if (old_rsp)
+    if (old_rsp) {
         current->rsp = old_rsp;
+        // cpu accounting: the frame we just saved tells the mode the task
+        // ran in since its last schedule (ring 3 = user, else kernel)
+        if (current->pid != 0) {
+            struct regs *fr = (struct regs *)old_rsp;
+            if ((fr->cs & 3) == 3)
+                current->utime++;
+            else
+                current->stime++;
+        }
+    }
 
     // pick next ready task
     struct task *next = 0;

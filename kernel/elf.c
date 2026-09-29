@@ -95,7 +95,6 @@ uint64_t elf_load_user_info(uint64_t pml4, const void *elf, size_t size,
         // page of a PIE (mapped at vaddr 0) silently accepts stores
         if (!(ph[i].flags & PF_W))
             vmm_mprotect(pml4, start, (end - start) / PAGE_SIZE, flags);
-        // TODO: drop exec from data segments too
         if (end > top)
             top = end;
     }

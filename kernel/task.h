@@ -53,6 +53,11 @@ struct task {
     uint64_t kstack_top;  // virtual
     uint64_t pml4;        // phys; shared between threads of a group
     uint64_t wake_tick;   // nanosleep deadline (tick units)
+    // cpu accounting (ticks, 100 Hz): utime/stime are this thread's
+    // runtime, cutime/cstime sum the reaped children's totals
+    uint64_t utime, stime;
+    uint64_t cutime, cstime;
+    uint64_t start_tick;  // spawn tick: /proc stat starttime, times()
     struct file *fds[FILE_MAX];
     uint8_t fd_flags[FILE_MAX];     // FD_CLOEXEC per fd
     char cwd[192];        // current directory (absolute, kernel-side)
@@ -89,6 +94,8 @@ struct task *task_spawn_kernel(void (*entry)(void));
 struct task *task_spawn_user(const char *path, struct task *parent);
 void task_yield(void);           // called from irq context
 uint64_t task_schedule(uint64_t old_rsp);
+// summed utime/stime over every thread of the group (getrusage SELF, times)
+void task_cpu_group(int tgid, uint64_t *utime, uint64_t *stime);
 // direct switch to a specific task (clone returns straight into the child);
 // caller must have stored current->rsp already
 uint64_t task_switch_to(struct task *next);
