@@ -74,6 +74,11 @@ struct task {
     uint64_t kgs;         // = &kgs_area[0], loaded into MSR_GS_BASE
     // elf image info for auxv
     uint64_t phdr_va, phent, phnum, entry_va;
+    // /proc metadata: comm = basename(argv[0]); cmdline = the argv block
+    // adopted from execve (NUL-separated strings, kernel heap)
+    char comm[16];
+    char *cmdline;
+    int cmdline_len;
 };
 
 extern struct task task_table[TASK_MAX];
@@ -121,6 +126,8 @@ typedef struct exec_args {
 } exec_args_t;
 uint64_t task_execve(struct vnode *vn, const char *name,
                      const exec_args_t *ea);
+// /proc comm: basename of name into t->comm
+void task_set_comm(struct task *t, const char *name);
 // lowest free fd >= 0, or -1
 int task_fd_alloc(struct file *f);
 void task_close_fds(struct task *t, int keep_console);

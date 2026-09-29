@@ -71,6 +71,13 @@ struct file {
 
 void vfs_init(void);
 void vfs_mount_root(struct vnode *vn);
+// overlay mount: `cover` (a fs root vnode) becomes visible at `path`,
+// shadowing whatever directory entry is there; the covered dir must exist
+// as a path but its entries are hidden while mounted. no refcounts: the
+// cover vnode is expected to be permanent (static pool like procfs)
+int vfs_mount_at(const char *path, struct vnode *cover);
+// the root vnode (for fs drivers that need ".." at the mount origin)
+struct vnode *vfs_get_root(void);
 
 // absolute paths; symlink components are followed (last one too)
 struct vnode *vfs_resolve(const char *path);

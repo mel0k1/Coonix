@@ -48,9 +48,24 @@ static struct file console_fds[3] = {
 
 struct task *task_find_free(void) {
     for (int i = 0; i < TASK_MAX; i++)
-        if (task_table[i].state == T_FREE)
+        if (task_table[i].state == T_FREE) {
+            // reclaim /proc leftovers from the previous occupant; callers
+            // memset the slot right after this returns
+            if (task_table[i].cmdline)
+                kfree(task_table[i].cmdline);
             return &task_table[i];
+        }
     return 0;
+}
+
+// /proc comm: last path component, truncated to fit
+void task_set_comm(struct task *t, const char *name) {
+    const char *base = name;
+    for (const char *p = name; p && *p; p++)
+        if (*p == '/')
+            base = p + 1;
+    strncpy(t->comm, base, sizeof(t->comm) - 1);
+    t->comm[sizeof(t->comm) - 1] = 0;
 }
 
 static int next_pid = 1;
@@ -386,6 +401,13 @@ struct task *task_spawn_user(const char *path, struct task *parent) {
     user_stack_setup(t->pml4);
     fds_init(t);
     strcpy(t->cwd, "/");
+    task_set_comm(t, path);
+    uint64_t plen = strlen(path) + 1;
+    t->cmdline = kmalloc(plen);
+    if (t->cmdline) {
+        memcpy(t->cmdline, path, plen);
+        t->cmdline_len = (int)plen;
+    }
 
     uint64_t entry_rsp = user_stack_build_args(t->pml4, path, &ei, 0);
 
@@ -460,6 +482,25 @@ uint64_t task_execve(struct vnode *vn, const char *name,
     }
 
     uint64_t entry_rsp = user_stack_build_args(pml4, name, &ei, ea);
+
+    // adopt argv for /proc/<pid>/cmdline (the block was kmalloc'd by the
+    // execve syscall layer; on failure paths it stays with the caller).
+    // runs after the last failure return: exec cannot fail past here
+    char *old_cmdline = current->cmdline;
+    current->cmdline = 0;
+    current->cmdline_len = 0;
+    const char *comm_src = name;
+    if (ea && ea->argv) {
+        int len = 0;
+        for (const char *p = ea->argv; *p; p += strlen(p) + 1)
+            len += (int)strlen(p) + 1;
+        current->cmdline = ea->argv;
+        current->cmdline_len = len;
+        comm_src = ea->argv;          // argv[0]
+    }
+    task_set_comm(current, comm_src);
+    if (old_cmdline)
+        kfree(old_cmdline);
 
     // fresh iret frame on our kernel stack
     struct regs *fr = (struct regs *)current->rsp;
@@ -636,6 +677,7 @@ struct task *task_clone_thread(struct regs *frame, uint64_t flags,
         }
     memcpy(c->fd_flags, current->fd_flags, sizeof(c->fd_flags));
     strcpy(c->cwd, current->cwd);
+    memcpy(c->comm, current->comm, sizeof(c->comm));   // threads share comm
     c->brk_base = current->brk_base;
     c->brk_cur = current->brk_cur;
     task_mmap_clone(c, current);

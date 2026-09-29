@@ -66,6 +66,9 @@ make run      # запустить в qemu
       (динамический, живёт на уже настроенном ld.so-пути), applet-симлинки
       на диске, sh с пайплайнами и редиректами, ls/cp/mv/rm/grep/cat и
       ещё ~30 апплетов; тесты: qbbtest.py, qfsxtest.py, qdltest.py
+- [x] **procfs**: оверлей-монтирование /proc поверх корня (mount-таблица
+      в VFS), /proc/<pid>/stat (linux-формат) / status / cmdline / cwd,
+      ps-апплет поверх getdents64; коммит argv в task для cmdline
 - [ ] чистка W^X до конца: NX на kernel data-сегментах
 - [ ] портирование glibc дальше: полноценный libc userspace
 

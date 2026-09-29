@@ -21,6 +21,7 @@
 #include "ahci.h"
 #include "ext2.h"
 #include "blkdev.h"
+#include "procfs.h"
 
 // --- limine boot protocol requests ---
 
@@ -209,6 +210,10 @@ void kmain(void) {
         initramfs_load();
         console_puts("vfs: tmpfs root + initramfs (disk boot failed)\n");
     }
+
+    // /proc over the root, whatever it is (procfs root has no deps)
+    if (vfs_mount_at("/proc", procfs_mount(vfs_get_root())) == 0)
+        console_puts("vfs: procfs mounted at /proc\n");
 
     task_init();
     signal_init();

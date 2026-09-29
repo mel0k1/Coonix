@@ -4,10 +4,58 @@
 #include "string.h"
 #include "console.h"
 
+static struct vnode *resolve_parent(const char *path, char *name, int nsize);
+
 static struct vnode *vfs_root;
+
+// --- overlay mounts -----------------------------------------------------
+// keyed by (parent vnode, name): when resolution walks into the named
+// entry under the recorded parent, the cover vnode is returned instead of
+// consulting the underlying fs. ext2/tmpfs hand out stable vnodes (node
+// caches), so parent pointers are safe to keep
+#define MOUNT_MAX 8
+static struct mount_ent {
+    struct vnode *parent;
+    char name[32];
+    struct vnode *cover;
+} mounts[MOUNT_MAX];
+static int mount_used;
+
+// shadow check during path walks
+static struct vnode *mount_check(struct vnode *dir, const char *name) {
+    for (int i = 0; i < mount_used; i++)
+        if (mounts[i].parent == dir && !strcmp(mounts[i].name, name))
+            return mounts[i].cover;
+    return 0;
+}
+
+int vfs_mount_at(const char *path, struct vnode *cover) {
+    if (!cover || !path || path[0] != '/')
+        return -1;
+    char name[64];
+    struct vnode *parent = resolve_parent(path, name, sizeof(name));
+    if (!parent || !*name)
+        return -1;
+    if (mount_used >= MOUNT_MAX)
+        return -1;
+    for (int i = 0; i < mount_used; i++)
+        if (mounts[i].parent == parent && !strcmp(mounts[i].name, name))
+            return -1;   // already mounted there
+    struct mount_ent *m = &mounts[mount_used++];
+    m->parent = parent;
+    strncpy(m->name, name, sizeof(m->name) - 1);
+    m->name[sizeof(m->name) - 1] = 0;
+    m->cover = cover;
+    return 0;
+}
+
+struct vnode *vfs_get_root(void) {
+    return vfs_root;
+}
 
 void vfs_init(void) {
     vfs_root = 0;
+    mount_used = 0;
 }
 
 void vfs_mount_root(struct vnode *vn) {
@@ -59,7 +107,9 @@ static struct vnode *resolve_from(struct vnode *start, const char *path,
         }
         if (dir->type != VNODE_DIR)
             return 0;
-        struct vnode *vn = dir->ops->lookup(dir, comp);
+        struct vnode *vn = mount_check(dir, comp);
+        if (!vn)
+            vn = dir->ops->lookup(dir, comp);
         if (!vn)
             return 0;
 
@@ -216,7 +266,9 @@ static struct vnode *resolve_parent(const char *path, char *name, int nsize) {
             name[nsize - 1] = 0;
             return vn;
         }
-        struct vnode *c = vn->ops->lookup(vn, comp);
+        struct vnode *c = mount_check(vn, comp);
+        if (!c)
+            c = vn->ops->lookup(vn, comp);
         if (!c)
             return 0;
         if (c->type == VNODE_LNK) {
@@ -257,11 +309,36 @@ int vfs_truncate(struct vnode *vn) {
     return vn->ops->truncate(vn);
 }
 
+// mount entries ride behind fs entries via a ctx high bit: fs cursors
+// (ext2 block<<32|off, tmpfs index) never set bit 63
+#define MOUNT_CTX_BIT (1ULL << 63)
+
 int vfs_readdir(struct vnode *dir, uint64_t *ctx, uint64_t *ino, int *type,
                 char *name, int name_cap) {
-    if (!dir || dir->type != VNODE_DIR || !dir->ops->readdir)
+    if (!dir || dir->type != VNODE_DIR)
         return 0;
-    return dir->ops->readdir(dir, ctx, ino, type, name, name_cap);
+    if (!(*ctx & MOUNT_CTX_BIT) && dir->ops->readdir) {
+        if (dir->ops->readdir(dir, ctx, ino, type, name, name_cap))
+            return 1;
+        *ctx = MOUNT_CTX_BIT;   // fs exhausted: switch to mount entries
+    }
+    if (*ctx & MOUNT_CTX_BIT) {
+        uint64_t i = *ctx & ~MOUNT_CTX_BIT;
+        while (i < (uint64_t)mount_used) {
+            struct mount_ent *m = &mounts[i];
+            i++;
+            if (m->parent != dir)
+                continue;
+            strncpy(name, m->name, name_cap - 1);
+            name[name_cap - 1] = 0;
+            *ino = m->cover->ino;
+            *type = VNODE_DIR;
+            *ctx = MOUNT_CTX_BIT | i;
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
 }
 
 // generic helpers: resolve the parent, apply the last component

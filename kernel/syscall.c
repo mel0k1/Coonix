@@ -741,8 +741,12 @@ static uint64_t sys_execve(struct regs *r) {
     capture_strv(r->rdx, &ea.envp, &ea.envc);
 
     uint64_t fr = task_execve(vn, path, &ea);
-    if (ea.argv)
-        kfree(ea.argv);
+    if (!fr) {
+        // exec failed: the captures are still ours to free. on success the
+        // task adopts argv for /proc/<pid>/cmdline
+        if (ea.argv)
+            kfree(ea.argv);
+    }
     if (ea.envp)
         kfree(ea.envp);
     if (!fr) {
