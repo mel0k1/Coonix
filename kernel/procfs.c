@@ -6,6 +6,8 @@
 #include "task.h"
 #include "heap.h"
 #include "string.h"
+#include "pmm.h"
+#include "pit.h"
 
 // --- forward declarations (ops table needs the cli-guarded wrappers) ---
 static struct vnode *pfs_lookup_impl(struct vnode *dir, const char *name);
@@ -34,10 +36,15 @@ struct vfs_ops pfs_ops = {
 // them (this vfs does not refcount vnodes); a fixed pool keyed by ino
 // mirrors the ext2 node cache. slots are recycled on lookup by ino match
 
-enum { P_STAT, P_STATUS, P_CMDLINE, P_CWD };
-#define N_PFILES 4
+enum { P_STAT, P_STATUS, P_CMDLINE, P_CWD, P_EXE, P_SELF,
+       P_MEMINFO, P_MOUNTS, P_UPTIME };
+// per-pid entries (index into pfile_names; the rest are root-level)
+#define N_PFILES 5
 static const char *pfile_names[N_PFILES] = { "stat", "status", "cmdline",
-                                             "cwd" };
+                                             "cwd", "exe" };
+// root-level generated files (alongside the pid dirs)
+static const char *root_file_names[3] = { "meminfo", "mounts", "uptime" };
+#define N_ROOTFILES 3
 
 enum { PN_ROOT, PN_PIDDIR, PN_FILE, PN_LNK };
 struct pnode {
@@ -54,14 +61,15 @@ static struct vnode *procfs_parent;   // ".." from the root: mount dir
 
 // ino layout (stable across lookups, drives pool recycling):
 //   root    = 1
-//   pid dir = 0x1000 + pid
-//   file    = 0x2000 + pid * 8 + which
+//   pid dir = 0x100000 + pid
+//   file    = 0x200000 + (pid + 1) * 16 + which   (which <= 8)
+// pids grow unbounded, so the ranges must be far apart
 static uint64_t make_ino(int kind, int pid, int which) {
     if (kind == PN_ROOT)
         return 1;
     if (kind == PN_PIDDIR)
-        return 0x1000 + (uint64_t)pid;
-    return 0x2000 + (uint64_t)pid * 8 + (uint64_t)which;
+        return 0x100000 + (uint64_t)pid;
+    return 0x200000 + (uint64_t)(pid + 1) * 16 + (uint64_t)which;
 }
 
 static struct vnode *pnode_get(int kind, int pid, int which) {
@@ -246,6 +254,37 @@ static void gen_status(struct task *t, struct sbuf *b) {
     sb_raw(b, "\n", 1);
 }
 
+// /proc/meminfo, the fields busybox free wants (kB, like linux)
+static void gen_meminfo(struct sbuf *b) {
+    uint64_t total = pmm_total_mem() >> 10;
+    uint64_t free_ = pmm_free_mem() >> 10;
+    sb_str(b, "MemTotal:\t");
+    sb_u64(b, total);
+    sb_str(b, " kB\nMemFree:\t");
+    sb_u64(b, free_);
+    sb_str(b, " kB\nMemAvailable:\t");
+    sb_u64(b, free_);
+    sb_str(b, " kB\n");
+}
+
+// /proc/mounts: the two mounts we always have
+static void gen_mounts(struct sbuf *b) {
+    sb_str(b, "rootfs / ext2 rw 0 0\nproc /proc proc rw 0 0\n");
+}
+
+// /proc/uptime: "<up> <idle>", 100 Hz tick
+static void gen_uptime(struct sbuf *b) {
+    uint64_t cs = pit_ticks();          // centiseconds since boot
+    sb_u64(b, cs / 100);
+    sb_raw(b, ".", 1);
+    sb_u64(b, cs % 100);
+    sb_raw(b, " ", 1);
+    sb_u64(b, cs / 200);                // idle: half, close enough
+    sb_raw(b, ".", 1);
+    sb_u64(b, (cs / 2) % 100);
+    sb_raw(b, "\n", 1);
+}
+
 // --- ops ----------------------------------------------------------------
 
 static struct vnode *pfs_lookup_impl(struct vnode *dir, const char *name) {
@@ -256,6 +295,11 @@ static struct vnode *pfs_lookup_impl(struct vnode *dir, const char *name) {
             return procfs_parent;
         if (!*name)
             return 0;
+        if (!strcmp(name, "self"))
+            return pnode_get(PN_LNK, 0, P_SELF);
+        for (int w = 0; w < N_ROOTFILES; w++)
+            if (!strcmp(name, root_file_names[w]))
+                return pnode_get(PN_FILE, 0, P_MEMINFO + w);
         // decimal only
         int pid = 0, digits = 0;
         for (const char *p = name; *p; p++, digits++) {
@@ -273,8 +317,9 @@ static struct vnode *pfs_lookup_impl(struct vnode *dir, const char *name) {
     if (d->kind == PN_PIDDIR) {
         for (int w = 0; w < N_PFILES; w++) {
             if (!strcmp(name, pfile_names[w])) {
-                struct vnode *vn = pnode_get(w == P_CWD ? PN_LNK : PN_FILE,
-                                             d->pid, w);
+                struct vnode *vn = pnode_get(
+                    (w == P_CWD || w == P_EXE) ? PN_LNK : PN_FILE,
+                    d->pid, w);
                 if (vn && w == P_CWD) {
                     struct task *t = find_leader(d->pid);
                     if (t)
@@ -295,6 +340,30 @@ static long pfs_read_impl(struct vnode *vn, void *buf, uint64_t off,
         return -1;                   // dirs are not readable as files
     if (!len)
         return 0;
+
+    // root-level generated files: meminfo / mounts / uptime
+    if (pn->which >= P_MEMINFO) {
+        char *gen = kmalloc(1024);
+        if (!gen)
+            return -1;
+        struct sbuf b = { .p = gen, .left = 1024 };
+        gen[0] = 0;
+        if (pn->which == P_MEMINFO)
+            gen_meminfo(&b);
+        else if (pn->which == P_MOUNTS)
+            gen_mounts(&b);
+        else
+            gen_uptime(&b);
+        uint64_t total = (uint64_t)(b.p - gen);
+        if (off >= total) {
+            kfree(gen);
+            return 0;
+        }
+        uint64_t n = total - off < len ? total - off : len;
+        memcpy(buf, gen + off, n);
+        kfree(gen);
+        return (long)n;
+    }
 
     struct task *t = find_leader(pn->pid);
     if (!t)
@@ -360,6 +429,16 @@ static int pfs_readdir_impl(struct vnode *dir, uint64_t *ctx, uint64_t *ino,
             *type = VNODE_DIR;
             return 1;
         }
+        // tasks exhausted: root-level files follow (ctx = TASK_MAX + idx)
+        uint64_t idx = *ctx - (uint64_t)TASK_MAX;
+        *ctx = *ctx + 1;
+        if (idx < (uint64_t)N_ROOTFILES) {
+            strncpy(name, root_file_names[idx], name_cap - 1);
+            name[name_cap - 1] = 0;
+            *ino = make_ino(PN_FILE, 0, P_MEMINFO + (int)idx);
+            *type = VNODE_FILE;
+            return 1;
+        }
         return 0;
     }
 
@@ -379,15 +458,43 @@ static int pfs_readdir_impl(struct vnode *dir, uint64_t *ctx, uint64_t *ino,
 
 static long pfs_readlink_impl(struct vnode *vn, char *buf, uint64_t size) {
     struct pnode *pn = vn->fs_data;
-    if (pn->kind != PN_LNK || pn->which != P_CWD)
+    if (pn->kind != PN_LNK)
         return -1;
+
+    // /proc/self: the CALLER's process, whatever task opens it
+    if (pn->which == P_SELF) {
+        char tmp[12];
+        int j = 0;
+        int v = current->tgid;
+        do {
+            tmp[j++] = '0' + v % 10;
+            v /= 10;
+        } while (v);
+        uint64_t n = (uint64_t)j;
+        if (n > size - 1)
+            n = size - 1;
+        for (uint64_t k = 0; k < n; k++)
+            buf[k] = tmp[j - 1 - k];
+        buf[n] = 0;
+        return (long)n;
+    }
+
     struct task *t = find_leader(pn->pid);
     if (!t)
         return -1;
-    uint64_t n = strlen(t->cwd);
+    const char *src = 0;
+    if (pn->which == P_CWD) {
+        src = t->cwd;
+    } else if (pn->which == P_EXE) {
+        // argv[0]: first string of the adopted cmdline block
+        src = t->cmdline && t->cmdline_len ? t->cmdline : t->comm;
+    } else {
+        return -1;
+    }
+    uint64_t n = strlen(src);
     if (n > size - 1)
         n = size - 1;
-    memcpy(buf, t->cwd, n);
+    memcpy(buf, src, n);
     buf[n] = 0;
     return (long)n;
 }

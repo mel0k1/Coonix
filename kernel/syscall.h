@@ -41,7 +41,7 @@
 #define SYS_gettid  186
 #define SYS_tkill   200
 #define SYS_time    201
-#define SYS_sysinfo 179
+#define SYS_sysinfo 99
 #define SYS_sched_getaffinity 203
 #define SYS_set_tid_address 218
 #define SYS_clock_gettime 228
