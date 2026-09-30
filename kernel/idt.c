@@ -306,6 +306,9 @@ uint64_t isr_handler(struct regs *r) {
                 }
                 return fr;   // handler frame replaces ours, no preemption
             }
+            // user-mode preemption: the tick may preempt user code only
+            // when another task is ready; kernel-mode interruption still
+            // runs its handler and returns into the interrupted task
             return task_schedule(fr);
         }
     }

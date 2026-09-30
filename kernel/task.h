@@ -84,6 +84,12 @@ struct task {
     char comm[16];
     char *cmdline;
     int cmdline_len;
+    // fxsave area (512 bytes) + "was initialized" flag. glibc code is
+    // sse-heavy; without save/restore parallel processes clobber each
+    // other's xmm state mid-computation (ld.so hash tables come out
+    // garbage -> "Relink" warnings, lookup asserts, random segfaults)
+    uint8_t fpu_area[512] __attribute__((aligned(16)));
+    int fpu_ready;
 };
 
 extern struct task task_table[TASK_MAX];
@@ -138,3 +144,7 @@ void task_set_comm(struct task *t, const char *name);
 // lowest free fd >= 0, or -1
 int task_fd_alloc(struct file *f);
 void task_close_fds(struct task *t, int keep_console);
+// fpu state (see fpu section in task.c)
+void fpu_forget(struct task *t);
+void fpu_switch_to(struct task *next);   // eager switch (task_switch_to)
+void fpu_flush(struct task *t);          // snapshot live state (fork)

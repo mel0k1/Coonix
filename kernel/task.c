@@ -385,9 +385,15 @@ struct task *task_spawn_user(const char *path, struct task *parent) {
     map_kstack(t);
     kgs_init(t);
 
+    // same cr3-dance hazard as task_execve: elf_load runs on the new
+    // address space; keep the tick out of the copy (boot-time insurance)
+    uint64_t eflags;
+    __asm__ volatile("pushfq; popq %0" : "=r"(eflags));
+    cli();
     struct elf_info ei;
     uint64_t entry = elf_load_user_info(t->pml4, image, size, &ei);
     kfree(image);
+    __asm__ volatile("pushq %0; popfq" :: "r"(eflags) : "memory");
 
     if (!entry) {
         t->state = T_FREE;
@@ -431,12 +437,27 @@ uint64_t task_execve(struct vnode *vn, const char *name,
                      const exec_args_t *ea) {
     if (!vn || vn->type != VNODE_FILE)
         return 0;
+    // the whole image swap runs with interrupts off. elf_load switches
+    // cr3 to the new address space and copies segment bytes through USER
+    // virtual addresses; a tick mid-copy would park this task with the
+    // OLD pml4 in current->pml4, resume it on the OLD cr3, and the rest
+    // of the memcpy would land in the old address space — the new image
+    // keeps zeroed holes (ld.so: garbage relocs, lookup asserts, #GP).
+    // exec is short; non-preemptible is fine. the success return goes to
+    // the iretq of the new frame (IF restored); failure paths restore
+    // the saved flags explicitly
+    uint64_t eflags;
+    __asm__ volatile("pushfq; popq %0" : "=r"(eflags));
+    cli();
     void *image = kmalloc(vn->size ? vn->size : 1);
-    if (!image)
+    if (!image) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(eflags) : "memory");
         return 0;
+    }
     long size = vn->ops->read(vn, image, 0, vn->size);
     if (size < 0) {
         kfree(image);
+        __asm__ volatile("pushq %0; popfq" :: "r"(eflags) : "memory");
         return 0;
     }
 
@@ -450,6 +471,7 @@ uint64_t task_execve(struct vnode *vn, const char *name,
         // elf loader may have left us on the new pml4 — go back, then cleanup
         vmm_switch(old_cr3);
         vmm_destroy_user(pml4);
+        __asm__ volatile("pushq %0; popfq" :: "r"(eflags) : "memory");
         return 0;
     }
 
@@ -462,6 +484,7 @@ uint64_t task_execve(struct vnode *vn, const char *name,
     current->brk_cur = current->brk_base;
     current->fs_base = 0;
     current->gs_base = 0;
+    current->fpu_ready = 0;   // fresh image: fpu state resets
     wrmsr(MSR_FS_BASE, 0);   // drop the old image's tls; gs stays kernel-owned
     current->entry_va = ei.entry;
     current->phdr_va = ei.phdr_va;
@@ -549,6 +572,7 @@ struct task *task_fork(struct regs *frame) {
         sti();
         return 0;
     }
+    fpu_flush(current);   // snapshot live fpu state before copying
     memset(c, 0, sizeof(*c));
     c->pid = next_pid++;
     c->tgid = c->pid;
@@ -634,6 +658,9 @@ struct task *task_fork(struct regs *frame) {
     // signal state: handlers copied, pending dropped, mask kept (posix)
     memcpy(c->sigact, current->sigact, sizeof(c->sigact));
     c->sig_mask = current->sig_mask;
+    // fpu state is part of the execution context (posix fork semantics)
+    memcpy(c->fpu_area, current->fpu_area, sizeof(c->fpu_area));
+    c->fpu_ready = current->fpu_ready;
     c->tgid = c->pid;
     // tls: the child keeps the parent's thread pointer (glibc binaries
     // dereference %fs:... constantly; a zero fs_base sends them into the
@@ -663,6 +690,7 @@ struct task *task_clone_thread(struct regs *frame, uint64_t flags,
         sti();
         return 0;
     }
+    fpu_flush(current);   // snapshot live fpu state before copying
     memset(c, 0, sizeof(*c));
     c->pid = next_pid++;
     c->tgid = current->tgid;
@@ -699,6 +727,9 @@ struct task *task_clone_thread(struct regs *frame, uint64_t flags,
         *(int *)parent_tid = c->pid;
     if (flags & CLONE_CHILD_SETTID)
         *(int *)child_tid = c->pid;
+    // fpu state is part of the execution context (clone shares it)
+    memcpy(c->fpu_area, current->fpu_area, sizeof(c->fpu_area));
+    c->fpu_ready = current->fpu_ready;
 
     // child frame = parent's with rax=0 and the new user stack
     struct regs *cr = (struct regs *)(c->kstack_top - sizeof(struct regs));
@@ -747,6 +778,7 @@ static void task_thread_release(struct task *t, int self) {
     }
     task_close_fds(t, 0);
     task_mmap_teardown(t);        // own list copy: file refs back
+    fpu_forget(t);
     if (self) {
         reap_push(t->kstack_top, t->kgs);
         t->kstack_top = 0;
@@ -796,6 +828,7 @@ static uint64_t exit_common(int code, int sig_death, int force_group) {
     task_close_fds(current, 0);
     task_mmap_teardown(current);
     vmm_destroy_user(current->pml4);
+    fpu_forget(current);
     // leader slot stays for the parent's wait4 (zombie); if we are a stray
     // non-leader whose group is gone, just vanish
     struct task *leader = 0;
@@ -984,6 +1017,11 @@ uint64_t task_switch_to(struct task *next) {
     }
     tss_set_rsp0(current->kstack_top);
     vmm_switch(current->pml4);
+    // fpu: eager save/restore on every switch. the kernel never uses
+    // the fpu (built -mno-sse), so the live fpu always belongs to user
+    // code; without this, parallel sse-heavy tasks (glibc) clobber each
+    // other's xmm state at each tick (ld.so hash tables -> garbage)
+    fpu_switch_to(next);
     // gs points at this task's syscall scratch; fs carries user tls
     wrmsr(MSR_GS_BASE, current->kgs);
     wrmsr(MSR_FS_BASE, current->fs_base);
@@ -1005,6 +1043,46 @@ void task_init(void) {
     wrmsr(MSR_GS_BASE, current->kgs);
     tss_set_rsp0(current->kstack_top);
     next_pid = 1;
+}
+
+// -- fpu state --------------------------------------------------------------
+// the kernel itself never touches sse (built -mno-sse), so the fpu always
+// belongs to user code; glibc is sse-heavy, so its state must survive
+// every preemption/task switch
+
+static struct task *fpu_owner;
+
+static const uint16_t fpu_cw = 0x037f;       // all exceptions masked
+static const uint32_t fpu_mxcsr = 0x1f80;    // default sse control
+
+void fpu_forget(struct task *t) {
+    if (fpu_owner == t)
+        fpu_owner = 0;
+}
+
+// eager fpu switch: called from task_switch_to with interrupts off
+void fpu_switch_to(struct task *next) {
+    if (fpu_owner == next)
+        return;
+    if (fpu_owner && fpu_owner->fpu_ready)
+        __asm__ volatile("fxsave %0" :: "m"(fpu_owner->fpu_area) : "memory");
+    fpu_owner = next;
+    if (next->fpu_ready) {
+        __asm__ volatile("fxrstor %0" :: "m"(next->fpu_area) : "memory");
+    } else {
+        __asm__ volatile("fninit");
+        __asm__ volatile("fldcw %0" :: "m"(fpu_cw));
+        __asm__ volatile("ldmxcsr %0" :: "m"(fpu_mxcsr));
+        next->fpu_ready = 1;
+    }
+}
+
+// flush the live fpu state of t into t->fpu_area (fork/clone snapshot);
+// a no-op when t is not the current fpu owner or never used the fpu
+void fpu_flush(struct task *t) {
+    __asm__ volatile("clts");
+    if (fpu_owner == t && t->fpu_ready)
+        __asm__ volatile("fxsave %0" :: "m"(t->fpu_area) : "memory");
 }
 
 // compat: exec without a program name

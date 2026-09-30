@@ -7,6 +7,13 @@
 #define TYPE_USABLE 0
 #define TYPE_BL_RECLAIMABLE 5
 
+// allocators must be atomic vs the tick: syscalls enter through a trap
+// gate (IF stays 1), so a preempted task can sit mid-scan while the next
+// task allocates — both would claim the same page. pushfq/popfq keeps
+// nested callers (heap_grow inside kmalloc, exit under cli) correct
+#define PMM_ENTER uint64_t __pfl; __asm__ volatile("pushfq; popq %0; cli" : "=r"(__pfl))
+#define PMM_LEAVE __asm__ volatile("pushq %0; popfq" :: "r"(__pfl) : "memory")
+
 #define MAX_REGIONS 32
 
 struct region {
@@ -120,14 +127,17 @@ void pmm_reserve_range(uint64_t phys, uint64_t len) {
 }
 
 void *pmm_alloc(void) {
+    PMM_ENTER;
     for (uint64_t p = 0; p < pages_total; p++) {
         if (!bit_test(p)) {
             bit_set(p);
             refs[p] = 1;
             pages_used++;
+            PMM_LEAVE;
             return (void *)(base + p * PAGE_SIZE);
         }
     }
+    PMM_LEAVE;
     return 0;
 }
 
@@ -139,9 +149,11 @@ void *pmm_alloc_zeroed(void) {
 }
 
 void pmm_free(void *page) {
+    PMM_ENTER;
     uint64_t p = ((uint64_t)page - base) >> 12;
     if (refs[p] > 1) {
         refs[p]--;         // still shared (cow), keep allocated
+        PMM_LEAVE;
         return;
     }
     refs[p] = 0;
@@ -149,17 +161,23 @@ void pmm_free(void *page) {
         bit_clear(p);
         pages_used--;
     }
+    PMM_LEAVE;
 }
 
 void pmm_ref(void *page) {
+    PMM_ENTER;
     uint64_t p = ((uint64_t)page - base) >> 12;
     if (refs[p] < 0xffff)
         refs[p]++;
+    PMM_LEAVE;
 }
 
 int pmm_refcount(void *page) {
+    PMM_ENTER;
     uint64_t p = ((uint64_t)page - base) >> 12;
-    return refs[p];
+    int rc = refs[p];
+    PMM_LEAVE;
+    return rc;
 }
 
 uint64_t pmm_total_mem(void) {

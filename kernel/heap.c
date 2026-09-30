@@ -13,6 +13,14 @@ struct chunk {
 
 #define HEAP_CHUNK_PAGES 16   // grow heap by 64k at a time
 
+// the free-list must be atomic vs the tick: syscalls enter through a trap
+// gate (IF stays 1), so a preempted task can sit between the first-fit
+// probe and used=1 while the next task kmallocs — both would claim the
+// same chunk (or tear the list apart in kfree coalesce). pushfq/popfq
+// keeps nested callers correct (heap_grow->pmm_alloc, fork under cli)
+#define HEAP_ENTER uint64_t __hfl; __asm__ volatile("pushfq; popq %0; cli" : "=r"(__hfl))
+#define HEAP_LEAVE __asm__ volatile("pushq %0; popfq" :: "r"(__hfl) : "memory")
+
 static struct chunk *head;
 static uint64_t heap_pml4;
 
@@ -59,12 +67,8 @@ void heap_init(void) {
     heap_grow(HEAP_CHUNK_PAGES * PAGE_SIZE);
 }
 
-void *kmalloc(size_t size) {
-    if (!size)
-        return 0;
-    size = (size + 15) & ~15UL; // 16-byte align
-
-    // first fit
+// scan the free list; caller holds the heap lock
+static void *heap_scan(size_t size) {
     for (struct chunk *c = head; c; c = c->next) {
         if (!c->used && c->size >= size) {
             // split if plenty of room
@@ -80,8 +84,25 @@ void *kmalloc(size_t size) {
             return (void *)((uint64_t)c + sizeof(struct chunk));
         }
     }
-    heap_grow(size + sizeof(struct chunk));
-    return kmalloc(size); // retry once on fresh space
+    return 0;
+}
+
+void *kmalloc(size_t size) {
+    if (!size)
+        return 0;
+    size = (size + 15) & ~15UL; // 16-byte align
+
+    HEAP_ENTER;
+    // first fit
+    void *r = heap_scan(size);
+    if (!r) {
+        // grow under the same lock: two preempted tasks must never both
+        // walk to the same heap tail and carve chunks from one VA
+        heap_grow(size + sizeof(struct chunk));
+        r = heap_scan(size);
+    }
+    HEAP_LEAVE;
+    return r;
 }
 
 void *kzalloc(size_t size) {
@@ -94,6 +115,7 @@ void *kzalloc(size_t size) {
 void kfree(void *ptr) {
     if (!ptr)
         return;
+    HEAP_ENTER;
     struct chunk *c = (struct chunk *)((uint64_t)ptr - sizeof(struct chunk));
     // poison freed payload: a use-after-free shows up as 0xdd patterns
     {
@@ -108,4 +130,5 @@ void kfree(void *ptr) {
         c->size += sizeof(struct chunk) + n->size;
         c->next = n->next;
     }
+    HEAP_LEAVE;
 }
