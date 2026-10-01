@@ -70,6 +70,8 @@ struct task {
     uint64_t child_tid;   // clone CLONE_CHILD_CLEARTID: cleared + futex-woken on exit
     uint64_t sig_pending; // awaiting delivery
     uint64_t sig_mask;    // blocked
+    uint64_t alt_sp;      // sigaltstack base (0 = disabled, posix: not
+    uint64_t alt_size;    //   inherited across fork/exec)
     struct k_sigaction sigact[SIG_MAX + 1];
     // syscall-entry scratch the gs base points at: {kstack_top, user_rsp}.
     // lives INSIDE the task slot: a heap-allocated scratch would dangle

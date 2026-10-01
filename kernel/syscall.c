@@ -1179,6 +1179,41 @@ static uint64_t sys_nanosleep(struct regs *r) {
     return task_schedule((uint64_t)r);
 }
 
+// clock_nanosleep(230): what modern glibc actually calls for sleep().
+// TIMER_ABSTIME uses our tick-based clock directly (realtime and
+// monotonic share the tick epoch here); relative waits block like
+// nanosleep. the rem pointer is a nanosleep-only concept — ignored
+#define TIMER_ABSTIME 1
+static uint64_t sys_clock_nanosleep(struct regs *r) {
+    int clk = (int)r->rdi;
+    int flags = (int)r->rsi;
+    const uint64_t *req = (const uint64_t *)r->rdx;
+    if (!req || (flags & ~TIMER_ABSTIME) ||
+        (clk != CLOCK_REALTIME && clk != CLOCK_MONOTONIC)) {
+        r->rax = (uint64_t)-EINVAL;
+        return (uint64_t)r;
+    }
+    uint64_t target = req[0] * 100 + req[1] / 10000000;
+    uint64_t t;
+    if (flags & TIMER_ABSTIME) {
+        t = target > pit_ticks() ? target - pit_ticks() : 0;
+    } else {
+        t = target;
+        if (!t)
+            t = 1;
+    }
+    if (!t) {
+        r->rax = 0;   // deadline already passed
+        return (uint64_t)r;
+    }
+    cli();               // blocking window must be atomic (see sys_read)
+    replay_fixup(r);
+    current->wake_tick = pit_ticks() + t;
+    current->wait_reason = WAIT_SLEEP;
+    current->state = T_BLOCKED;
+    return task_schedule((uint64_t)r);
+}
+
 static uint64_t sys_clock_gettime(struct regs *r) {
     uint64_t *tp = (uint64_t *)r->rsi;
     int clk = (int)r->rdi;
@@ -1946,10 +1981,12 @@ static uint64_t sys_getpgid(struct regs *r) {
     return (uint64_t)r;
 }
 
-// stubs: accepted, no state
+// sigaltstack(2): real alternate signal stack state lives in signal.c;
+// user_rsp decides the SS_ONSTACK report (posix: cannot swap while on it)
 static uint64_t sys_sigaltstack(struct regs *r) {
-    (void)r;
-    r->rax = 0;
+    long ret = signal_sys_sigaltstack((const uint64_t *)r->rdi,
+                                      (uint64_t *)r->rsi, r->rsp);
+    r->rax = (uint64_t)ret;
     return (uint64_t)r;
 }
 
@@ -2002,10 +2039,11 @@ uint64_t syscall_dispatch(struct regs *r) {
             __asm__ volatile("cli; hlt");
     }
     // pending signals land before the syscall: the handler frame replaces
-    // ours and rt_sigreturn replays the syscall afterwards (SA_RESTART
-    // style). the syscall itself must not run with rewritten registers
+    // ours. this is syscall ENTRY — the syscall has not run, so the
+    // delivery decides its fate (SA_RESTART replays, otherwise the frame
+    // reports -EINTR; see signal_deliver_entry)
     uint64_t fr;
-    int act = signal_deliver(r, &fr);
+    int act = signal_deliver_entry(r, &fr);
     if (act)
         return fr;   // 1: handler frame in place; 2: killed, already scheduled
 
@@ -2058,6 +2096,18 @@ uint64_t syscall_dispatch(struct regs *r) {
     case SYS_setpgid: fr = sys_setpgid(r); break;
     case SYS_getpgid: fr = sys_getpgid(r); break;
     case SYS_sigaltstack: fr = sys_sigaltstack(r); break;
+    case SYS_rt_sigpending: {
+        // posix sigpending: pending, blocked or not
+        uint64_t *u = (uint64_t *)r->rdi;
+        if (!u || r->rsi != 8) {
+            r->rax = -EINVAL;
+        } else {
+            *u = current->sig_pending;
+            r->rax = 0;
+        }
+        fr = (uint64_t)r;
+        break;
+    }
     case SYS_utimensat: fr = sys_utimensat(r); break;
     case SYS_getpid:  r->rax = (uint64_t)(long)current->tgid; fr = (uint64_t)r; break;
     case SYS_gettid:  r->rax = (uint64_t)(long)current->pid; fr = (uint64_t)r; break;
@@ -2093,6 +2143,7 @@ uint64_t syscall_dispatch(struct regs *r) {
     case SYS_set_robust_list: r->rax = 0; fr = (uint64_t)r; break;
     case SYS_arch_prctl: fr = sys_arch_prctl(r); break;
     case SYS_nanosleep: fr = sys_nanosleep(r); break;
+    case SYS_clock_nanosleep: fr = sys_clock_nanosleep(r); break;
     case SYS_clock_gettime: fr = sys_clock_gettime(r); break;
     case SYS_time:    fr = sys_time(r); break;
     case SYS_sched_getaffinity: fr = sys_sched_getaffinity(r); break;

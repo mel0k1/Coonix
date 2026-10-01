@@ -48,6 +48,7 @@
 #define SYS_sched_getaffinity 203
 #define SYS_set_tid_address 218
 #define SYS_clock_gettime 228
+#define SYS_clock_nanosleep 230
 #define SYS_exit_group 231
 #define SYS_tgkill  234
 #define SYS_prlimit64 302
@@ -77,7 +78,8 @@
 #define SYS_gettimeofday 96
 #define SYS_getpgid 121
 #define SYS_setpgid 109
-#define SYS_sigaltstack 132
+#define SYS_sigaltstack 131
+#define SYS_rt_sigpending 127
 #define SYS_getdents64 217
 #define SYS_faccessat 269
 #define SYS_fchmodat 268

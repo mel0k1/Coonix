@@ -34,7 +34,7 @@
 #define SA_NOCLDSTOP 1
 #define SA_NOCLDWAIT 2
 #define SA_SIGINFO   4
-#define SA_ONSTACK   8
+#define SA_ONSTACK   0x08000000
 #define SA_RESTART   0x10000000
 #define SA_NODEFER   0x40000000
 #define SA_RESETHAND 0x80000000
@@ -58,6 +58,10 @@ long signal_sys_rt_sigaction(int sig, const struct k_sigaction *act,
                              struct k_sigaction *oact, uint64_t sigsetsize);
 long signal_sys_rt_sigprocmask(int how, const uint64_t *set, uint64_t *oldset,
                                uint64_t sigsetsize);
+// sigaltstack(2): uss/ouss are glibc stack_t {sp, flags, size} in user
+// memory; user_rsp is the interrupted user rsp (on-altstack detection)
+long signal_sys_sigaltstack(const uint64_t *uss, uint64_t *ouss,
+                            uint64_t user_rsp);
 
 // deliver pending signals by rewriting the user frame.
 // return 0 = nothing was pending, frame untouched
@@ -65,6 +69,11 @@ long signal_sys_rt_sigprocmask(int how, const uint64_t *set, uint64_t *oldset,
 //            the syscall must NOT run; rt_sigreturn will replay it)
 // return 2 = the signal killed the task; *out is the next task's frame rsp
 int signal_deliver(struct regs *r, uint64_t *out);
+// variant for syscall ENTRY: the interrupted syscall has not run yet, so
+// its fate is decided here — SA_RESTART replays it (rip rewound onto the
+// instruction), otherwise the frame returns -EINTR; rt_sigreturn and the
+// exit family always replay
+int signal_deliver_entry(struct regs *r, uint64_t *out);
 
 // rt_sigreturn(2): restore the frame saved at signal time
 uint64_t signal_sigreturn(struct regs *r);

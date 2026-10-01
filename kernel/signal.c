@@ -2,10 +2,22 @@
 #include "task.h"
 #include "string.h"
 #include "serial.h"
+#include "syscall.h"
 
-// EBADF..: minimal errno set for signals
+// minimal errno set for signals
+#define EPERM    1
+#define EINTR    4
 #define ESRCH    3
 #define EINVAL  22
+#define ENOMEM  12
+
+#define SS_ONSTACK  1
+#define SS_DISABLE  2
+#define MINSIGSTKSZ 2048
+
+// sigframe layout: the packed glibc-compatible frame, then a 512-byte
+// fxsave area (16-aligned) the fpstate field points at
+#define FXAREA_SIZE 528   // 512 + pad to keep the frame size 16-aligned
 
 #define SIGBIT(sig) (1ULL << ((sig) - 1))
 
@@ -141,7 +153,8 @@ static void set_gregs(uint64_t *g, const struct regs *r) {
 // rewrite the user frame so the handler runs with a valid way back.
 // returns the frame rsp to resume (or a schedule() result when the
 // default action kills the task; *killed tells the caller which one)
-static uint64_t deliver_one(struct regs *r, int sig, int *killed) {
+static uint64_t deliver_one(struct regs *r, int sig, int *killed,
+                            int at_syscall_entry) {
     *killed = 0;
     struct k_sigaction *sa = &current->sigact[sig];
     uint64_t handler = sa->handler;
@@ -156,9 +169,15 @@ static uint64_t deliver_one(struct regs *r, int sig, int *killed) {
         return task_exit_current_sig(sig);
     }
 
-    // user handler: build the frame below the interrupted rsp
-    uint64_t sp = (r->rsp - 128) & ~0xfULL;
-    sp -= sizeof(struct rt_sigframe_k);
+    // user handler: build the frame below the interrupted rsp (or on the
+    // alternate signal stack when SA_ONSTACK asks for it)
+    uint64_t base = r->rsp;
+    if ((sa->flags & SA_ONSTACK) && current->alt_size &&
+        !(base >= current->alt_sp &&
+          base < current->alt_sp + current->alt_size))
+        base = current->alt_sp + current->alt_size;
+    uint64_t sp = (base - 128) & ~0xfULL;
+    sp -= sizeof(struct rt_sigframe_k) + FXAREA_SIZE;
     struct rt_sigframe_k *f = (struct rt_sigframe_k *)sp;
     memset(f, 0, sizeof(*f));
     set_gregs(f->gregs, r);
@@ -167,9 +186,38 @@ static uint64_t deliver_one(struct regs *r, int sig, int *killed) {
     // siginfo pointer: process only reads si_signo/si_code realistically
     f->info[0] = (uint64_t)sig;    // si_signo
     f->info[2] = -6;               // si_code = SI_TKILL
+    // ucontext.uc_stack: reports the altstack (glibc makecontext users)
+    f->uc_stack[0] = current->alt_sp;
+    f->uc_stack[2] = current->alt_size;
 
-    uint64_t old_mask = current->sig_mask;
-    current->sig_mask |= sa->mask | SIGBIT(sig);
+    // fpu: snapshot the interrupted state into the frame. the handler
+    // runs with live xmm/x87 registers and clobbers them freely; without
+    // the frame copy the interrupted code resumes on the handler's trash
+    uint64_t fxva = ((uint64_t)f + sizeof(*f) + 15) & ~15ULL;
+    if (current->fpu_ready) {
+        __asm__ volatile("fxsave (%0)" :: "r"(fxva) : "memory");
+        f->fpstate = fxva;
+    }
+
+    // a syscall interrupted BEFORE it ran: SA_RESTART replays it (rip
+    // rewound onto the instruction, rax keeps the number — the same
+    // rewind blocking syscalls already carry); otherwise the frame
+    // returns -EINTR. sigreturn/exit replay unconditionally: faking
+    // their result would skip a frame restore or let exit()ed code run
+    if (at_syscall_entry && (r->int_no == 128 || r->int_no == 64)) {
+        if ((sa->flags & SA_RESTART) || r->rax == SYS_rt_sigreturn ||
+            r->rax == SYS_exit || r->rax == SYS_exit_group ||
+            r->rax == SYS_execve)
+            f->gregs[GR_RIP] -= 2;      // CD 80 / 0F 05: re-execute
+        else
+            f->gregs[GR_RAX] = (uint64_t)-EINTR;
+    }
+
+    current->sig_mask |= sa->mask;
+    if (!(sa->flags & SA_NODEFER))
+        current->sig_mask |= SIGBIT(sig);
+    if (sa->flags & SA_RESETHAND)
+        current->sigact[sig].handler = 0;   // SIG_DFL on re-entry
 
     r->rdi = (uint64_t)sig;
     r->rsi = (uint64_t)(void *)f + __builtin_offsetof(struct rt_sigframe_k, info);
@@ -177,11 +225,10 @@ static uint64_t deliver_one(struct regs *r, int sig, int *killed) {
     r->rax = 0;
     r->rip = handler;
     r->rsp = (uint64_t)&f->pretcode;
-    (void)old_mask;
     return (uint64_t)r;
 }
 
-int signal_deliver(struct regs *r, uint64_t *out) {
+static int signal_deliver_inner(struct regs *r, uint64_t *out, int at_entry) {
     *out = (uint64_t)r;
     if (!current || !(r->cs & 3))
         return 0;
@@ -192,16 +239,65 @@ int signal_deliver(struct regs *r, uint64_t *out) {
         if (deliverable & SIGBIT(sig)) {
             current->sig_pending &= ~SIGBIT(sig);
             int killed = 0;
-            *out = deliver_one(r, sig, &killed);
+            *out = deliver_one(r, sig, &killed, at_entry);
             return killed ? 2 : 1;
         }
     }
     return 0;
 }
 
+int signal_deliver(struct regs *r, uint64_t *out) {
+    return signal_deliver_inner(r, out, 0);
+}
+
+int signal_deliver_entry(struct regs *r, uint64_t *out) {
+    return signal_deliver_inner(r, out, 1);
+}
+
+// sigaltstack(2). glibc stack_t is {void *ss_sp; int ss_flags; size_t
+// ss_size}: sp at 0, flags as a 32-BIT int at 8 (the upper half is
+// uninitialized padding — reading it as u64 broke the flag check),
+// size at 16
+long signal_sys_sigaltstack(const uint64_t *uss, uint64_t *ouss,
+                            uint64_t user_rsp) {
+    int on_alt = current->alt_size && user_rsp >= current->alt_sp &&
+                 user_rsp < current->alt_sp + current->alt_size;
+    if (ouss) {
+        ouss[0] = current->alt_sp;
+        *((uint32_t *)ouss + 2) =
+            !current->alt_size ? SS_DISABLE : (on_alt ? SS_ONSTACK : 0);
+        ouss[2] = current->alt_size;
+    }
+    if (!uss)
+        return 0;
+    if (on_alt)
+        return -EPERM;              // cannot swap stacks from itself
+    uint32_t fl = *((const uint32_t *)uss + 2);
+    if (fl & ~(uint32_t)SS_DISABLE)
+        return -EINVAL;
+    if (fl & SS_DISABLE) {
+        current->alt_sp = 0;
+        current->alt_size = 0;
+        return 0;
+    }
+    if (uss[2] < MINSIGSTKSZ)
+        return -ENOMEM;
+    current->alt_sp = uss[0];
+    current->alt_size = uss[2];
+    return 0;
+}
+
 uint64_t signal_sigreturn(struct regs *r) {
     // user rsp at syscall time = just past pretcode = &uc_flags
     struct rt_sigframe_k *f = (struct rt_sigframe_k *)(r->rsp - 8);
+    // restore the interrupted fpu state saved at delivery time. only the
+    // fxsave area of THIS frame is accepted: a crafted fpstate pointer
+    // would feed fxrstor arbitrary memory
+    if (f->fpstate) {
+        uint64_t fxva = ((uint64_t)f + sizeof(*f) + 15) & ~15ULL;
+        if (f->fpstate == fxva)
+            __asm__ volatile("fxrstor (%0)" :: "r"(fxva) : "memory");
+    }
     current->sig_mask = f->gregs[GR_OLDMASK];
     r->r8 = f->gregs[GR_R8];    r->r9 = f->gregs[GR_R9];
     r->r10 = f->gregs[GR_R10];  r->r11 = f->gregs[GR_R11];

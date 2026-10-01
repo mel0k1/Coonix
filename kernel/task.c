@@ -493,6 +493,13 @@ uint64_t task_execve(struct vnode *vn, const char *name,
     current->clear_tid = 0;
     current->child_tid = 0;
     current->sig_pending = 0;
+    // posix exec: caught dispositions reset to SIG_DFL (SIG_IGN survives),
+    // the alternate signal stack does not survive exec; mask is kept
+    for (int s = 1; s <= SIG_MAX; s++)
+        if (current->sigact[s].handler > 1)
+            current->sigact[s].handler = 0;
+    current->alt_sp = 0;
+    current->alt_size = 0;
     user_stack_setup(pml4);
     // exec: only CLOEXEC fds close (posix); console + redirect targets stay
     for (int i = 0; i < FILE_MAX; i++) {
