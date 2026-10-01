@@ -104,8 +104,8 @@ def main():
     print(run("cat /shared.txt"))
     print("=== cat /test.txt ===")
     print(run("cat /test.txt"))
-    print("=== glibc_hello ===")
-    print(run("glibc_hello", 12))
+    # hello_dyn (built from glibc_hello.c since 5c6b550) is the dynamic
+    # glibc smoke test; there is no /bin/glibc_hello on the disk
     print("=== hello_dyn ===")
     print(run("hello_dyn", 15))
     print("=== ls / ===")
