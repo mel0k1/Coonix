@@ -37,7 +37,7 @@ struct mmap_region {
 
 enum { T_FREE, T_READY, T_RUNNING, T_BLOCKED, T_ZOMBIE };
 enum { WAIT_NONE = 0, WAIT_KBD = 1, WAIT_CHILD = 2, WAIT_SLEEP = 3,
-       WAIT_PIPE = 4 };
+       WAIT_PIPE = 4, WAIT_SIGNAL = 5 };
 
 struct task {
     int pid;              // thread id (tid)
@@ -70,6 +70,15 @@ struct task {
     uint64_t child_tid;   // clone CLONE_CHILD_CLEARTID: cleared + futex-woken on exit
     uint64_t sig_pending; // awaiting delivery
     uint64_t sig_mask;    // blocked
+    // pause/rt_sigsuspend/rt_sigtimedwait wait state. sig_woke_rewind:
+    // the saved frame was replay-rewound (replay_fixup), so a handler
+    // delivery at re-entry must unwind the rewind for its -EINTR return
+    int sig_woke_rewind;
+    int sig_wait_kind;          // SW_* (signal.h), 0 = none
+    uint64_t sig_wait_set;      // rt_sigtimedwait wait set
+    uint64_t sig_wait_saved_mask; // rt_sigsuspend: mask to restore
+    int sig_wait_result;        // rt_sigtimedwait: signal consumed while
+                                // queued, reported by the re-entered body
     uint64_t alt_sp;      // sigaltstack base (0 = disabled, posix: not
     uint64_t alt_size;    //   inherited across fork/exec)
     struct k_sigaction sigact[SIG_MAX + 1];

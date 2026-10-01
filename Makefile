@@ -87,9 +87,9 @@ LIBSTAMP := $(RDISK_ROOT)/lib64/.stamp
 
 GLIBC_PROGS := $(RDISK_ROOT)/bin/hello_dyn \
 	$(RDISK_ROOT)/bin/pthreadtest $(RDISK_ROOT)/bin/sigtest \
-	$(RDISK_ROOT)/bin/iotest $(RDISK_ROOT)/bin/dltest \
-	$(RDISK_ROOT)/bin/wxtest $(RDISK_ROOT)/bin/timetest \
-	$(RDISK_ROOT)/lib/libfoo.so \
+	$(RDISK_ROOT)/bin/sigwaittest $(RDISK_ROOT)/bin/iotest \
+	$(RDISK_ROOT)/bin/dltest $(RDISK_ROOT)/bin/wxtest \
+	$(RDISK_ROOT)/bin/timetest $(RDISK_ROOT)/lib/libfoo.so \
 	$(LIBSTAMP)
 
 # dynamically linked hello: needs the real ld.so + libc on the disk
@@ -144,6 +144,14 @@ $(RDISK_ROOT)/bin/timetest: user/timetest.c
 		echo "glibc: built $@"; \
 	else \
 		rm -f $@; echo "glibc: timetest skipped"; \
+	fi
+
+# signal waits: pause / sigsuspend / sigtimedwait via the real libc
+$(RDISK_ROOT)/bin/sigwaittest: user/sigwaittest.c
+	@if gcc -O2 -Wall -o $@ $< 2>/dev/null; then \
+		echo "glibc: built $@"; \
+	else \
+		rm -f $@; echo "glibc: sigwaittest skipped"; \
 	fi
 
 # freestanding .so (no DT_NEEDED) so the disk needs no extra libs

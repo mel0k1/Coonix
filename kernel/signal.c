@@ -106,12 +106,48 @@ int signal_send_task(struct task *t, int sig) {
         // unblockable: force through
         t->sigact[sig].handler = 0;
     }
-    if (t->sigact[sig].handler == 1 /* SIG_IGN */ &&
+    uint64_t bit = SIGBIT(sig);
+    uint64_t handler = t->sigact[sig].handler;
+    // catchable = a delivery would do anything at all. ignored (SIG_IGN
+    // or default-ignorable) sends are dropped — except a sigwait, which
+    // accepts ignored signals (posix)
+    int catchable = handler != 1 &&
+                    !(handler == 0 && signal_default_ignores(sig));
+    int wait_signal = t->state == T_BLOCKED &&
+                      t->wait_reason == WAIT_SIGNAL;
+    int sigwait_accept = wait_signal && t->sig_wait_kind == SW_SIGWAIT &&
+                         (t->sig_wait_set & bit);
+    if (handler == 1 && !sigwait_accept &&
         sig != SIGKILL && sig != SIGSTOP)
         return 0;   // dropped
-    t->sig_pending |= SIGBIT(sig);
-    if (t->state == T_BLOCKED)
-        t->state = T_READY;   // replay path will deliver
+    t->sig_pending |= bit;
+    if (t->state != T_BLOCKED)
+        return 0;
+    if (t->wait_reason != WAIT_SIGNAL) {
+        // generic replay wake: read/pipe/kbd/wait4 re-run their syscall
+        t->state = T_READY;
+        return 0;
+    }
+    if (sigwait_accept) {
+        // accepted by the wait itself: consumed, no handler runs. the
+        // signal number is parked on the task; the re-entered syscall
+        // body reports it. rewind the frame so the body re-enters
+        t->sig_pending &= ~bit;
+        t->sig_wait_result = sig;
+        t->sig_woke_rewind = 1;
+        struct regs *fr = (struct regs *)t->rsp;
+        if (fr->int_no == 128 || fr->int_no == 64)
+            fr->rip -= 2;
+        t->state = T_READY;
+        return 0;
+    }
+    // deliverable under the CURRENT mask: for rt_sigsuspend that is the
+    // temp mask from the argument (posix: sigsuspend wakes for signals
+    // not in the arg; the handler then runs with the original restored
+    // by rt_sigreturn, see deliver_one). ignored/dead signals never wake
+    int deliverable = !(t->sig_mask & bit);
+    if (catchable && deliverable)
+        t->state = T_READY;   // rip already rewound: re-entry delivers
     return 0;
 }
 
@@ -152,7 +188,14 @@ static void set_gregs(uint64_t *g, const struct regs *r) {
 
 // rewrite the user frame so the handler runs with a valid way back.
 // returns the frame rsp to resume (or a schedule() result when the
-// default action kills the task; *killed tells the caller which one)
+// default action kills the task; *killed tells the caller which one).
+// 0 = the signal needed no delivery (ignored/default-ignore): the frame
+// is UNTOUCHED and the pending bit is already consumed — the interrupted
+// syscall must run normally (returning the same frame as "handled" made
+// the dispatcher skip it forever: user re-executed the insn, the same
+// pending bit hit again, an endless re-entry loop for rt_sigreturn)
+#define DELIVER_NOOP 0ULL
+
 static uint64_t deliver_one(struct regs *r, int sig, int *killed,
                             int at_syscall_entry) {
     *killed = 0;
@@ -163,11 +206,17 @@ static uint64_t deliver_one(struct regs *r, int sig, int *killed,
     if (handler == 0) {
         if (signal_default_ignores(sig)) {
             current->sigact[sig].handler = 1;   // ignore from now on
-            return (uint64_t)r;
+            return DELIVER_NOOP;
         }
         *killed = 1;
         return task_exit_current_sig(sig);
     }
+
+    // SIG_IGN while pending (installed after the signal was queued):
+    // discard quietly. falling through would build a handler frame with
+    // rip = 1 and jump into the void
+    if (handler == 1)
+        return DELIVER_NOOP;
 
     // user handler: build the frame below the interrupted rsp (or on the
     // alternate signal stack when SA_ONSTACK asks for it)
@@ -181,7 +230,6 @@ static uint64_t deliver_one(struct regs *r, int sig, int *killed,
     struct rt_sigframe_k *f = (struct rt_sigframe_k *)sp;
     memset(f, 0, sizeof(*f));
     set_gregs(f->gregs, r);
-    f->gregs[GR_OLDMASK] = current->sig_mask;
     f->pretcode = sa->restorer;
     // siginfo pointer: process only reads si_signo/si_code realistically
     f->info[0] = (uint64_t)sig;    // si_signo
@@ -189,6 +237,16 @@ static uint64_t deliver_one(struct regs *r, int sig, int *killed,
     // ucontext.uc_stack: reports the altstack (glibc makecontext users)
     f->uc_stack[0] = current->alt_sp;
     f->uc_stack[2] = current->alt_size;
+
+    // old mask for rt_sigreturn: normally the mask at delivery time, but
+    // a rt_sigsuspend waiter delivers under its TEMP mask and must resume
+    // with the ORIGINAL one (posix: sigsuspend restores the old mask)
+    uint64_t oldmask = current->sig_mask;
+    if (current->sig_wait_kind == SW_SUSPEND) {
+        oldmask = current->sig_wait_saved_mask;
+        current->sig_wait_kind = 0;   // consumed
+    }
+    f->gregs[GR_OLDMASK] = oldmask;
 
     // fpu: snapshot the interrupted state into the frame. the handler
     // runs with live xmm/x87 registers and clobbers them freely; without
@@ -205,12 +263,26 @@ static uint64_t deliver_one(struct regs *r, int sig, int *killed,
     // returns -EINTR. sigreturn/exit replay unconditionally: faking
     // their result would skip a frame restore or let exit()ed code run
     if (at_syscall_entry && (r->int_no == 128 || r->int_no == 64)) {
-        if ((sa->flags & SA_RESTART) || r->rax == SYS_rt_sigreturn ||
-            r->rax == SYS_exit || r->rax == SYS_exit_group ||
-            r->rax == SYS_execve)
-            f->gregs[GR_RIP] -= 2;      // CD 80 / 0F 05: re-execute
-        else
+        // sig_woke_rewind: the frame was already rewound when the task
+        // blocked (replay_fixup), so the rewind must not repeat (a double
+        // rewind would re-execute the middle of the mov before the int)
+        int woken = current->sig_woke_rewind;
+        current->sig_woke_rewind = 0;
+        // pause/sigsuspend/sigtimedwait never restart, even with
+        // SA_RESTART set (posix: they report -EINTR after the handler)
+        int force_eintr = !(sa->flags & SA_RESTART) ||
+            r->rax == SYS_rt_sigreturn || r->rax == SYS_exit ||
+            r->rax == SYS_exit_group || r->rax == SYS_execve ||
+            r->rax == SYS_pause || r->rax == SYS_rt_sigsuspend ||
+            r->rax == SYS_rt_sigtimedwait;
+        if (force_eintr) {
             f->gregs[GR_RAX] = (uint64_t)-EINTR;
+            if (woken)
+                f->gregs[GR_RIP] += 2;   // unwind the block-time rewind
+        } else if (!woken) {
+            f->gregs[GR_RIP] -= 2;      // fresh entry: re-execute
+        }
+        // woken + SA_RESTART: rip already sits on the insn, keep it
     }
 
     current->sig_mask |= sa->mask;
@@ -239,7 +311,12 @@ static int signal_deliver_inner(struct regs *r, uint64_t *out, int at_entry) {
         if (deliverable & SIGBIT(sig)) {
             current->sig_pending &= ~SIGBIT(sig);
             int killed = 0;
-            *out = deliver_one(r, sig, &killed, at_entry);
+            uint64_t fr = deliver_one(r, sig, &killed, at_entry);
+            if (fr == DELIVER_NOOP) {
+                *out = (uint64_t)r;   // frame untouched
+                return 0;             // the syscall proceeds normally
+            }
+            *out = fr;
             return killed ? 2 : 1;
         }
     }

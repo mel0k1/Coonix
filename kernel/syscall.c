@@ -1214,6 +1214,147 @@ static uint64_t sys_clock_nanosleep(struct regs *r) {
     return task_schedule((uint64_t)r);
 }
 
+// --- signal waits: pause / rt_sigsuspend / rt_sigtimedwait ----------------
+
+// bits whose handler would do nothing on delivery (SIG_IGN or a default
+// action of ignore): they must not wake a signal waiter
+static uint64_t sigwait_catchable_mask(void) {
+    uint64_t m = 0;
+    for (int s = 1; s <= SIG_MAX; s++) {
+        uint64_t h = current->sigact[s].handler;
+        if (h != 1 && !(h == 0 && signal_default_ignores(s)))
+            m |= 1ULL << (s - 1);
+    }
+    return m;
+}
+
+// pause(34): sleeps until a catchable signal is delivered (handler runs,
+// then -EINTR) or kills the task. never restarts (posix)
+static uint64_t sys_pause(struct regs *r) {
+    cli();               // check/block window must be atomic vs senders
+    replay_fixup(r);     // re-enter for the delivery, then return EINTR
+    current->wait_reason = WAIT_SIGNAL;
+    current->sig_wait_kind = SW_PAUSE;
+    current->wake_tick = 0;
+    // a catchable signal already pending: take the delivery right away
+    // (posix: the handler runs before pause returns). nothing would wake
+    // us later for it — wake-ups fire on sends only
+    if (current->sig_pending & ~current->sig_mask & sigwait_catchable_mask())
+        current->state = T_READY;
+    else
+        current->state = T_BLOCKED;
+    return task_schedule((uint64_t)r);
+}
+
+// rt_sigsuspend(130): mask = arg until a non-arg signal is delivered; the
+// handler runs, the ORIGINAL mask is restored by rt_sigreturn and the
+// syscall reports -EINTR (never restarts)
+static uint64_t sys_sigsuspend(struct regs *r) {
+    const uint64_t *uset = (const uint64_t *)r->rdi;
+    if (!uset || r->rsi != 8) {
+        r->rax = (uint64_t)-EINVAL;
+        return (uint64_t)r;
+    }
+    uint64_t newmask = *uset & ~((1ULL << (SIGKILL - 1)) |
+                                 (1ULL << (SIGSTOP - 1)));
+    cli();
+    uint64_t saved = current->sig_mask;
+    current->sig_mask = newmask;
+    // a catchable signal already deliverable under the temp mask: take
+    // the delivery now (posix: the handler runs before sigsuspend
+    // returns) — rewind + ready re-enters the dispatcher for it
+    if (current->sig_pending & ~newmask & sigwait_catchable_mask())
+        current->state = T_READY;
+    else
+        current->state = T_BLOCKED;
+    replay_fixup(r);
+    current->wait_reason = WAIT_SIGNAL;
+    current->sig_wait_kind = SW_SUSPEND;
+    current->sig_wait_saved_mask = saved;
+    current->wake_tick = 0;
+    return task_schedule((uint64_t)r);
+}
+
+// rt_sigtimedwait(128): like sigwaitinfo — signals in set are CONSUMED
+// (no handler runs) and returned as the syscall result; optional timeout
+// reports -EAGAIN. siginfo goes to the user when asked. layout must stay
+// 128 bytes: that is what glibc's siginfo_t allocates on the stack
+struct siginfo_k { int signo, errno_, code; uint64_t pad[14]; };
+
+static uint64_t sys_sigtimedwait(struct regs *r) {
+    const uint64_t *uset = (const uint64_t *)r->rdi;
+    struct siginfo_k *uinfo = (struct siginfo_k *)r->rsi;
+    const uint64_t *ts = (const uint64_t *)r->rdx;
+    if (!uset || r->r10 != 8) {   // arg4 (sigsetsize) rides r10
+        r->rax = (uint64_t)-EINVAL;
+        return (uint64_t)r;
+    }
+    uint64_t set = *uset & ~((1ULL << (SIGKILL - 1)) |
+                             (1ULL << (SIGSTOP - 1)));
+    cli();
+    // a signal consumed while queued (sender parked sig_wait_result and
+    // rewound us back here): report it
+    if (current->sig_wait_result) {
+        int sig = current->sig_wait_result;
+        current->sig_wait_result = 0;
+        current->sig_woke_rewind = 0;
+        sti();
+        if (uinfo) {
+            memset(uinfo, 0, sizeof(*uinfo));
+            uinfo->signo = sig;
+            uinfo->code = -6;   // SI_TKILL
+        }
+        r->rax = (uint64_t)sig;
+        return (uint64_t)r;
+    }
+    // pending in set right now: consume directly (ignored signals are
+    // accepted too — posix sigwait semantics)
+    uint64_t hit = current->sig_pending & set;
+    if (hit) {
+        int sig = 1;
+        while (!(hit & (1ULL << (sig - 1))))
+            sig++;
+        current->sig_pending &= ~(1ULL << (sig - 1));
+        sti();
+        if (uinfo) {
+            memset(uinfo, 0, sizeof(*uinfo));
+            uinfo->signo = sig;
+            uinfo->code = -6;
+        }
+        r->rax = (uint64_t)sig;
+        return (uint64_t)r;
+    }
+    if (ts && !ts[0] && !ts[1]) {   // zero timeout: poll
+        sti();
+        r->rax = (uint64_t)-EAGAIN;
+        return (uint64_t)r;
+    }
+    // block. the frame is NOT rewound: wakes stuff the result (timeout,
+    // consume-at-wake rewinds, see signal_send_task) instead of re-entry
+    current->wait_reason = WAIT_SIGNAL;
+    current->sig_wait_kind = SW_SIGWAIT;
+    current->sig_wait_set = set;
+    current->sig_wait_result = 0;
+    current->wake_tick = ts ? futex_deadline_from_timespec(ts, 0) : 0;
+    current->state = T_BLOCKED;
+    return task_schedule((uint64_t)r);
+}
+
+// setsid(106): new session = own process group (no session tracking yet;
+// busybox init asks for exactly this). EPERM when a group leader exists
+// with our pid
+static uint64_t sys_setsid(struct regs *r) {
+    for (int i = 0; i < TASK_MAX; i++)
+        if (task_table[i].state != T_FREE &&
+            task_table[i].pgid == current->pid) {
+            r->rax = (uint64_t)-EPERM;
+            return (uint64_t)r;
+        }
+    current->pgid = current->tgid;
+    r->rax = (uint64_t)(long)current->tgid;
+    return (uint64_t)r;
+}
+
 static uint64_t sys_clock_gettime(struct regs *r) {
     uint64_t *tp = (uint64_t *)r->rsi;
     int clk = (int)r->rdi;
@@ -2046,6 +2187,7 @@ uint64_t syscall_dispatch(struct regs *r) {
     int act = signal_deliver_entry(r, &fr);
     if (act)
         return fr;   // 1: handler frame in place; 2: killed, already scheduled
+    current->sig_woke_rewind = 0;   // stale only if no delivery consumed it
 
     switch (r->rax) {
     case SYS_read:    fr = sys_read(r); break;
@@ -2144,6 +2286,10 @@ uint64_t syscall_dispatch(struct regs *r) {
     case SYS_arch_prctl: fr = sys_arch_prctl(r); break;
     case SYS_nanosleep: fr = sys_nanosleep(r); break;
     case SYS_clock_nanosleep: fr = sys_clock_nanosleep(r); break;
+    case SYS_pause:     fr = sys_pause(r); break;
+    case SYS_rt_sigsuspend: fr = sys_sigsuspend(r); break;
+    case SYS_rt_sigtimedwait: fr = sys_sigtimedwait(r); break;
+    case SYS_setsid:    fr = sys_setsid(r); break;
     case SYS_clock_gettime: fr = sys_clock_gettime(r); break;
     case SYS_time:    fr = sys_time(r); break;
     case SYS_sched_getaffinity: fr = sys_sched_getaffinity(r); break;

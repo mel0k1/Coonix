@@ -73,6 +73,9 @@ void task_frame_syscall_result(struct task *t, long ret) {
     r->rax = (uint64_t)ret;
     if (r->int_no == 128 || r->int_no == 64)
         r->rip += 2;
+    // the frame leaves the kernel for user right away: any rewind marker
+    // it still carries is stale and must not leak into a later delivery
+    t->sig_woke_rewind = 0;
 }
 
 static int wake_match(int n, uint64_t key, int bitset) {

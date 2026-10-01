@@ -1,6 +1,11 @@
 #include "task.h"
 #include "kernel.h"
 #include "vmm.h"
+
+// deliver a syscall result straight into a blocked task's saved frame
+// (body lives in futex.c next to its futex-wake users)
+void task_frame_syscall_result(struct task *t, long ret);
+
 #include "pmm.h"
 #include "console.h"
 #include "string.h"
@@ -889,20 +894,28 @@ void task_wake_pipe(struct pipe *p) {
 
 void task_tick_wake(void) {
     uint64_t now = pit_ticks();
-    for (int i = 0; i < TASK_MAX; i++)
-        if (task_table[i].state == T_BLOCKED &&
-            task_table[i].wait_reason == WAIT_SLEEP &&
-            now >= task_table[i].wake_tick) {
+    for (int i = 0; i < TASK_MAX; i++) {
+        struct task *t = &task_table[i];
+        if (t->state != T_BLOCKED || !t->wake_tick || now < t->wake_tick)
+            continue;
+        if (t->wait_reason == WAIT_SLEEP) {
             // nanosleep completes: deliver rax=0 into the saved frame.
             // frame write only for still-blocked tasks: a task woken by a
             // signal first is T_READY with a live kernel/user context whose
             // rax we must not clobber
-            extern void task_frame_syscall_result(struct task *t, long ret);
-            if (task_table[i].state == T_BLOCKED) {
-                task_frame_syscall_result(&task_table[i], 0);
-                task_table[i].state = T_READY;
-            }
+            task_frame_syscall_result(t, 0);
+            t->state = T_READY;
+        } else if (t->wait_reason == WAIT_SIGNAL &&
+                   t->sig_wait_kind == SW_SIGWAIT) {
+            // rt_sigtimedwait timeout: -EAGAIN. the frame was NOT rewound
+            // (sigwait blocks without replay_fixup), so stuff rax only —
+            // task_frame_syscall_result would skip 2 bytes of user code
+            t->sig_wait_kind = 0;
+            ((struct regs *)t->rsp)->rax = (uint64_t)-11;   // -EAGAIN
+            t->sig_woke_rewind = 0;
+            t->state = T_READY;
         }
+    }
 }
 
 uint64_t task_schedule(uint64_t old_rsp) {

@@ -45,6 +45,11 @@
 #define SIG_UNBLOCK   1
 #define SIG_SETMASK   2
 
+// signal-wait primitives (task->sig_wait_kind while WAIT_SIGNAL-blocked)
+#define SW_PAUSE    1     // pause(34): wake on any catchable signal
+#define SW_SUSPEND  2     // rt_sigsuspend(130): wake per temp mask
+#define SW_SIGWAIT  3     // rt_sigtimedwait(128): set-matched, consumed
+
 void signal_init(void);
 
 // set/clear a pending bit; wakes a blocked target. returns 0 ok,

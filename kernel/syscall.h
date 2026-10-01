@@ -21,6 +21,7 @@
 #define SYS_writev  20
 #define SYS_madvise 28
 #define SYS_nanosleep 35
+#define SYS_pause 34
 #define SYS_getpid  39
 /* x86_64 ABI: times = 100 (43 is i386 / accept here!), getrusage = 98 */
 #define SYS_times   100
@@ -34,6 +35,7 @@
 #define SYS_wait4   61
 #define SYS_kill    62
 #define SYS_uname   63
+#define SYS_setsid  106
 #define SYS_getuid  102
 #define SYS_getgid  104
 #define SYS_geteuid 107
@@ -80,6 +82,8 @@
 #define SYS_setpgid 109
 #define SYS_sigaltstack 131
 #define SYS_rt_sigpending 127
+#define SYS_rt_sigtimedwait 128
+#define SYS_rt_sigsuspend 130
 #define SYS_getdents64 217
 #define SYS_faccessat 269
 #define SYS_fchmodat 268
