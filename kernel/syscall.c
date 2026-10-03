@@ -589,6 +589,11 @@ static uint64_t sys_mmap(struct regs *r) {
         }
         start = hint;
     }
+    // kernel half is off limits no matter how the spot was picked
+    if (start >= USER_LIMIT || len > USER_LIMIT - start) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
 
     // overlaps are a bug unless MAP_FIXED, which carves out its range
     // (linux semantics: only [start, start+len) is replaced, the rest of
