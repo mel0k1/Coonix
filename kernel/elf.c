@@ -137,6 +137,15 @@ uint64_t elf_load_user_info(uint64_t pml4, const void *elf, size_t size,
             return 0;
         }
         const struct elf64_hdr *le = ldimg;
+        // same trust level as the main image: header + phdr bounds first
+        if ((uint64_t)ldsz < sizeof(*le) || le->ident[0] != 0x7f || le->ident[1] != 'E' ||
+            le->phentsize < sizeof(struct elf64_phdr) ||
+            le->phoff > (uint64_t)ldsz ||
+            (uint64_t)le->phnum * sizeof(struct elf64_phdr) > (uint64_t)ldsz - le->phoff) {
+            kfree(ldimg);
+            vmm_switch(old);
+            return 0;
+        }
         const struct elf64_phdr *lph =
             (const void *)((const uint8_t *)ldimg + le->phoff);
         for (int i = 0; i < le->phnum; i++) {
@@ -150,6 +159,15 @@ uint64_t elf_load_user_info(uint64_t pml4, const void *elf, size_t size,
             uint64_t start = INTERP_BASE + (lph[i].vaddr & ~0xfffULL);
             uint64_t end = INTERP_BASE +
                 ((lph[i].vaddr + lph[i].memsz + 0xfff) & ~0xfffULL);
+            // segment bytes must live in the image, mapping in the user half
+            if (lph[i].offset > (uint64_t)ldsz ||
+                lph[i].filesz > (uint64_t)ldsz - lph[i].offset ||
+                lph[i].filesz > lph[i].memsz || end <= start ||
+                end > 0x800000000000ULL) {
+                kfree(ldimg);
+                vmm_switch(old);
+                return 0;
+            }
             uint64_t wflags = flags | VMM_WRITE;
             for (uint64_t va = start; va < end; va += PAGE_SIZE) {
                 void *page = pmm_alloc_zeroed();
