@@ -37,6 +37,10 @@ uint64_t elf_load_user_info(uint64_t pml4, const void *elf, size_t size,
     const struct elf64_hdr *eh = elf;
     if (size < sizeof(*eh) || eh->ident[0] != 0x7f || eh->ident[1] != 'E')
         return 0;
+    // program header table must sit inside the image
+    if (eh->phentsize < sizeof(struct elf64_phdr) || eh->phoff > size ||
+        (uint64_t)eh->phnum * sizeof(struct elf64_phdr) > size - eh->phoff)
+        return 0;
 
     if (info) {
         info->entry = 0;
@@ -78,6 +82,14 @@ uint64_t elf_load_user_info(uint64_t pml4, const void *elf, size_t size,
 
         uint64_t start = ph[i].vaddr & ~0xfffULL;
         uint64_t end = (ph[i].vaddr + ph[i].memsz + 0xfff) & ~0xfffULL;
+        // segment bytes must live in the image, the mapping in the user
+        // half; filesz > memsz would write past the mapped range
+        if (ph[i].offset > size || ph[i].filesz > size - ph[i].offset ||
+            ph[i].filesz > ph[i].memsz || end <= start ||
+            end > 0x800000000000ULL) {
+            vmm_switch(old);
+            return 0;
+        }
         // map writable for the copy, relax perms afterwards
         uint64_t wflags = flags | VMM_WRITE;
         for (uint64_t va = start; va < end; va += PAGE_SIZE) {
