@@ -1071,6 +1071,8 @@ static int e2_truncate_to_impl(struct vnode *vn, uint64_t size) {
     struct e2_node *n = vn->fs_data;
     if (vn->type != VNODE_FILE)
         return -1;
+    if (size > 0xffffffffULL)
+        return -1;   // inode size field is 32-bit here
     if (size == 0)
         return e2_truncate(vn);
     if (size >= vn->size) {
