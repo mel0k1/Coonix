@@ -831,21 +831,35 @@ static uint64_t exit_common(int code, int sig_death, int force_group) {
     task_mmap_teardown(current);
     vmm_destroy_user(current->pml4);
     fpu_forget(current);
-    // leader slot stays for the parent's wait4 (zombie); if we are a stray
-    // non-leader whose group is gone, just vanish
+    // reparent children: there is no init, so orphans lose their parent
+    // and zombie orphans are reaped at once (nobody would wait4 them)
+    for (int i = 0; i < TASK_MAX; i++) {
+        struct task *t = &task_table[i];
+        if (t == current || t->state == T_FREE || t->parent != current)
+            continue;
+        t->parent = 0;
+        if (t->state == T_ZOMBIE) {
+            kfree(t->cmdline);
+            t->cmdline = 0;
+            free_kstack(t);
+            t->state = T_FREE;
+        }
+    }
+    // leader slot stays for the parent's wait4 (zombie); an orphan group
+    // has nobody to wait4 it: vanish instead
     struct task *leader = 0;
     for (int i = 0; i < TASK_MAX; i++)
         if (task_table[i].tgid == current->tgid && task_table[i].pid == task_table[i].tgid)
             leader = &task_table[i];
-    if (leader) {
+    if (leader && leader->parent) {
         leader->exit_code = code;
         leader->sig_death = sig_death;
         leader->state = T_ZOMBIE;
-        if (leader->parent && leader->parent->state == T_BLOCKED &&
+        if (leader->parent->state == T_BLOCKED &&
             leader->parent->wait_reason == WAIT_CHILD)
             leader->parent->state = T_READY;
     }
-    if (current != leader) {
+    if (!leader || !leader->parent || current != leader) {
         reap_push(current->kstack_top, current->kgs);
         current->kstack_top = 0;
         current->kgs = 0;
