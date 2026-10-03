@@ -36,21 +36,28 @@ uint32_t pipe_avail(struct pipe *p) {
 }
 
 uint64_t pipe_read_nb(struct pipe *p, uint8_t *dst, uint64_t len) {
+    // ring state is shared: a tick mid-loop would let another task race it
+    uint64_t fl;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl));
     uint64_t moved = 0;
     while (moved < len && p->count) {
         dst[moved++] = p->buf[p->ridx];
         p->ridx = (p->ridx + 1) % PIPE_CAP;
         p->count--;
     }
+    __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory");
     return moved;
 }
 
 uint64_t pipe_write_nb(struct pipe *p, const uint8_t *src, uint64_t len) {
+    uint64_t fl;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl));
     uint64_t moved = 0;
     while (moved < len && p->count < PIPE_CAP) {
         p->buf[p->widx] = src[moved++];
         p->widx = (p->widx + 1) % PIPE_CAP;
         p->count++;
     }
+    __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory");
     return moved;
 }
