@@ -160,6 +160,6 @@ uint64_t futex_deadline_from_timespec(const void *ts, int absolute) {
     uint64_t nsec = *((const uint64_t *)ts + 1);
     uint64_t t = sec * 100 + nsec / 10000000;
     if (absolute)
-        return t;
+        return t ? t : 1;   // 0 means "no deadline", past due is 1
     return pit_ticks() + (t ? t : 1);
 }
