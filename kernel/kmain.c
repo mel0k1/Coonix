@@ -232,7 +232,6 @@ void kmain(void) {
     // random user context with kernel cr3
     __asm__ volatile("mov %0, %%rsp" :: "r"(current->kstack_top) : "memory");
     for (;;) {
-        task_reap();
         __asm__ volatile("sti; hlt");
     }
 }

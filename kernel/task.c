@@ -75,6 +75,28 @@ void task_set_comm(struct task *t, const char *name) {
 
 static int next_pid = 1;
 
+// per-pid kstack window: 0x70000000 / 64k per slot below the VA top
+#define KSTACK_PID_MAX 0x7000
+
+// lowest free pid >= next_pid; pids must be recycled or the kstack VA
+// window walks off the top of the address space
+static int pid_alloc(void) {
+    for (int n = 0; n < KSTACK_PID_MAX; n++) {
+        int p = next_pid + n <= KSTACK_PID_MAX ? next_pid + n : 1 + n;
+        int used = 0;
+        for (int i = 0; i < TASK_MAX; i++)
+            if (task_table[i].state != T_FREE && task_table[i].pid == p) {
+                used = 1;
+                break;
+            }
+        if (!used) {
+            next_pid = p < KSTACK_PID_MAX ? p + 1 : 1;
+            return p;
+        }
+    }
+    return 0;
+}
+
 // map kernel stack of task: 4 pages at its per-pid slot
 static void map_kstack(struct task *t) {
     t->kstack_top = KSTACK_VA_BASE + (uint64_t)t->pid * 0x10000 + KSTACK_SIZE;
@@ -109,40 +131,9 @@ static void free_kstack(struct task *t) {
     t->kgs = 0;   // scratch is in the slot: nothing to free
 }
 
-// a task cannot unmap the kernel stack it is running on. exiting threads
-// park their stack here and the idle loop frees it later
-#define REAP_MAX 16
-static uint64_t reap_q[REAP_MAX][2];   // {kstack_top, kgs}
-static int reap_rh, reap_rt;
-
-static void reap_push(uint64_t ktop, uint64_t kgs) {
-    if (!ktop)
-        return;                       // nothing to reap
-    int next = (reap_rt + 1) % REAP_MAX;
-    if (next == reap_rh)
-        return;                       // queue full: drop (leak, not crash)
-    reap_q[reap_rt][0] = ktop;
-    reap_q[reap_rt][1] = kgs;
-    reap_rt = next;
-}
-
-void task_reap(void) {
-    cli();
-    while (reap_rh != reap_rt) {
-        uint64_t top = reap_q[reap_rh][0];
-        reap_rh = (reap_rh + 1) % REAP_MAX;
-        uint64_t va = top - KSTACK_SIZE;
-        for (int i = 0; i < KSTACK_PAGES; i++) {
-            uint64_t phys = vmm_get_phys(vmm_kernel_pml4(),
-                                         va + i * PAGE_SIZE);
-            vmm_unmap(vmm_kernel_pml4(), va + i * PAGE_SIZE);
-            if (phys)
-                pmm_free((void *)phys);
-        }
-    }
-    sti();
-}
-
+// exiting threads leave their kstack mapped in the slot: nobody may
+// unmap the stack a task still runs on, and map_kstack replaces the
+// stale frames when a recycled pid re-enters service
 static void fds_init(struct task *t) {
     for (int i = 0; i < 3; i++) {
         t->fds[i] = &console_fds[i];
@@ -155,7 +146,9 @@ struct task *task_spawn_kernel(void (*entry)(void)) {
     if (!t)
         panic("task table full");
     memset(t, 0, sizeof(*t));
-    t->pid = next_pid++;
+    t->pid = pid_alloc();
+    if (!t->pid)
+        panic("task: no free pid");
     t->state = T_READY;
     t->pml4 = vmm_kernel_pml4();
     map_kstack(t);
@@ -379,8 +372,10 @@ struct task *task_spawn_user(const char *path, struct task *parent) {
     if (!t)
         return 0;
     memset(t, 0, sizeof(*t));
-    t->pid = next_pid++;
+    t->pid = pid_alloc();
     t->tgid = t->pid;         // fresh process: own group
+    if (!t->pid)
+        return 0;
     t->pgid = t->pid;
     t->parent = parent;
     t->start_tick = pit_ticks();
@@ -586,7 +581,11 @@ struct task *task_fork(struct regs *frame) {
     }
     fpu_flush(current);   // snapshot live fpu state before copying
     memset(c, 0, sizeof(*c));
-    c->pid = next_pid++;
+    c->pid = pid_alloc();
+    if (!c->pid) {
+        sti();
+        return 0;
+    }
     c->tgid = c->pid;
     c->pgid = current->pgid;      // same console group
     c->parent = current;
@@ -694,7 +693,11 @@ struct task *task_clone_thread(struct regs *frame, uint64_t flags,
     }
     fpu_flush(current);   // snapshot live fpu state before copying
     memset(c, 0, sizeof(*c));
-    c->pid = next_pid++;
+    c->pid = pid_alloc();
+    if (!c->pid) {
+        sti();
+        return 0;
+    }
     c->tgid = current->tgid;
     c->pgid = current->pgid;
     c->start_tick = pit_ticks();
@@ -782,8 +785,7 @@ static void task_thread_release(struct task *t, int self) {
     task_mmap_teardown(t);        // own list copy: file refs back
     fpu_forget(t);
     if (self) {
-        reap_push(t->kstack_top, t->kgs);
-        t->kstack_top = 0;
+        // keep the stack mapped, slot reuse frees it (see map_kstack)
         t->kgs = 0;
     } else {
         free_kstack(t);
@@ -860,8 +862,7 @@ static uint64_t exit_common(int code, int sig_death, int force_group) {
             leader->parent->state = T_READY;
     }
     if (!leader || !leader->parent || current != leader) {
-        reap_push(current->kstack_top, current->kgs);
-        current->kstack_top = 0;
+        // stack stays mapped for slot reuse; we still run on it
         current->kgs = 0;
         current->state = T_FREE;
     }

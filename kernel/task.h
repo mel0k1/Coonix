@@ -134,7 +134,6 @@ struct task *task_find_free(void);
 void task_wake_kbd(void);
 void task_wake_pipe(struct pipe *p);   // unblock WAIT_PIPE tasks on p
 void task_tick_wake(void);      // unblock nanosleep deadlines
-void task_reap(void);           // idle loop: free parked kstacks
 int task_frame_owned(struct regs *fr);   // forensics
 int task_count_group(int tgid, struct task *except);
 // exec current task with a new image from a vnode; returns new frame rsp, 0 on fail
