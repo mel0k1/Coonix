@@ -281,6 +281,16 @@ static uint64_t sys_write(struct regs *r) {
     long n = file_write(f, buf, len);
     if (n >= 0 && f->pipe)
         task_wake_pipe(f->pipe);
+    if (f->pipe && n == 0 && len) {
+        // full ring: park until a reader drains, then replay the write.
+        // returning 0 here would read as EOF and truncate pipelines
+        cli();
+        replay_fixup(r);
+        current->wait_reason = WAIT_PIPE;
+        current->wait_pipe = f->pipe;
+        current->state = T_BLOCKED;
+        return task_schedule((uint64_t)r);
+    }
     r->rax = n < 0 ? (uint64_t)-EIO : (uint64_t)n;
     return (uint64_t)r;
 }
