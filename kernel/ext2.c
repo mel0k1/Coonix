@@ -331,7 +331,10 @@ static void block_free(uint32_t blk) {
     if (blk < fs.first_data_block || blk >= fs.blocks_count)
         return;
     uint32_t i = blk - fs.first_data_block;
-    uint8_t *bm = blk_rw(((const struct e2_bgd *)blk_get(fs.bgd_block))->block_bitmap);
+    const struct e2_bgd *bgd = (const struct e2_bgd *)blk_get(fs.bgd_block);
+    if (!bgd)
+        return;
+    uint8_t *bm = blk_rw(bgd->block_bitmap);
     if (!bm)
         return;
     if (bm[i >> 3] & (1 << (i & 7))) {
