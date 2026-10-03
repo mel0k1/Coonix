@@ -293,13 +293,13 @@ static uint64_t user_stack_build_args(uint64_t pml4, const char *prog,
         for (const char *p = ea->argv; *p && argc < EXEC_ARG_MAX;
              p += strlen(p) + 1)
             av[argc++] = p;
-    else
-        av[argc++] = prog;
+    if (!argc)
+        av[argc++] = prog;   // empty argv still needs argv[0] for auxv
     if (ea && ea->envp)
         for (const char *p = ea->envp; *p && envc < EXEC_ARG_MAX;
              p += strlen(p) + 1)
             ev[envc++] = p;
-    else
+    if (!envc)
         ev[envc++] = "PATH=/bin";
 
     // strings grow down from the top of the stack
@@ -597,18 +597,8 @@ struct task *task_fork(struct regs *frame) {
     c->pml4 = pml4;
 
     // map child kernel stack first (shared kernel half trick: map into
-    // current pml4 since kernel half is common)
-    c->kstack_top = KSTACK_VA_BASE + (uint64_t)c->pid * 0x10000 + KSTACK_SIZE;
-    uint64_t kva = KSTACK_VA_BASE + (uint64_t)c->pid * 0x10000;
-    for (int i = 0; i < KSTACK_PAGES; i++) {
-        void *p = pmm_alloc();
-        if (!p) {
-            sti();
-            return 0;
-        }
-        vmm_map(vmm_kernel_pml4(), kva + i * PAGE_SIZE, (uint64_t)p,
-                VMM_PRESENT | VMM_WRITE);
-    }
+    // current pml4 since kernel half is common); map_kstack gives nx
+    map_kstack(c);
     kgs_init(c);
 
     // cow-share user address space (pml4 entries 0..255): writable pages
