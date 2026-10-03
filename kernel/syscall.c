@@ -323,7 +323,10 @@ static uint64_t sys_read(struct regs *r) {
         return task_schedule((uint64_t)r);
     }
     if (f->is_console) { // console: line discipline read
-        long n = tty_read(buf, r->rdx ? (int)r->rdx : 1);
+        uint64_t rl = r->rdx ? r->rdx : 1;
+        if (rl > 0x7fffffff)
+            rl = 0x7fffffff;   // tty_read takes an int: keep it positive
+        long n = tty_read(buf, (int)rl);
         if (n < 0) {
             // sleep until a key arrives; replay the syscall on wake.
             // cli first: the blocked state + saved frame + schedule pick
