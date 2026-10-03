@@ -396,6 +396,7 @@ struct task *task_spawn_user(const char *path, struct task *parent) {
     __asm__ volatile("pushq %0; popfq" :: "r"(eflags) : "memory");
 
     if (!entry) {
+        vmm_destroy_user(pml4);
         t->state = T_FREE;
         return 0;
     }
