@@ -23,6 +23,9 @@
 #define MAP_FIXED      0x10
 #define MAP_ANONYMOUS  0x20
 
+// top of the user half: anything at or above belongs to the kernel
+#define USER_LIMIT     0x800000000000ULL
+
 #define PROT_READ  0x1
 #define PROT_WRITE 0x2
 #define PROT_EXEC  0x4
@@ -540,6 +543,12 @@ static uint64_t sys_mmap(struct regs *r) {
         r->rax = -1ULL;
         return (uint64_t)r;
     }
+    // MAP_FIXED must land inside the user half
+    if ((flags & MAP_FIXED) &&
+        (addr >= USER_LIMIT || len > USER_LIMIT - addr)) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
 
     if (!(flags & MAP_ANONYMOUS)) {
         // file-backed: fd must name a regular file, offset page aligned
@@ -610,15 +619,34 @@ static uint64_t sys_mmap(struct regs *r) {
             vflags |= VMM_NX;
         for (uint64_t va = start; va < start + len; va += PAGE_SIZE) {
             void *p = pmm_alloc_zeroed();
-            if (!p)
-                panic("mmap: out of pages");
+            if (!p) {
+                // report ENOMEM, never panic on user-caused oom
+                for (uint64_t u = start; u < va; u += PAGE_SIZE) {
+                    uint64_t ph = vmm_get_phys(pml4, u);
+                    vmm_unmap(pml4, u);
+                    if (ph)
+                        pmm_free((void *)ph);
+                }
+                r->rax = -ENOMEM;
+                return (uint64_t)r;
+            }
             vmm_map(pml4, va, (uint64_t)p, vflags);
         }
     }
 
     struct mmap_region *m = kmalloc(sizeof(*m));
-    if (!m)
-        panic("mmap: out of kernel heap");
+    if (!m) {
+        if (!file) {
+            for (uint64_t va = start; va < start + len; va += PAGE_SIZE) {
+                uint64_t ph = vmm_get_phys(pml4, va);
+                vmm_unmap(pml4, va);
+                if (ph)
+                    pmm_free((void *)ph);
+            }
+        }
+        r->rax = -ENOMEM;
+        return (uint64_t)r;
+    }
     m->start = start;
     m->end = start + len;
     m->file = file;
@@ -644,7 +672,13 @@ static uint64_t sys_mprotect(struct regs *r) {
         r->rax = -1ULL;
         return (uint64_t)r;
     }
-    uint64_t pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    // keep protection changes out of the kernel half
+    if (addr >= USER_LIMIT || len > USER_LIMIT - addr) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
+    uint64_t pages = len / PAGE_SIZE;
     uint64_t vflags = VMM_PRESENT | VMM_USER;
     if (prot & PROT_WRITE)
         vflags |= VMM_WRITE;
@@ -676,18 +710,25 @@ static uint64_t sys_brk(struct regs *r) {
         r->rax = cur;   // refuse
         return (uint64_t)r;
     }
+    if (want > USER_MMAP_BASE) {
+        r->rax = cur;   // keep the break inside the user half
+        return (uint64_t)r;
+    }
     uint64_t pml4 = current->pml4;
     if (want > cur) {
+        // stop at the first failed alloc, report what stuck
+        uint64_t top = cur;
         for (uint64_t va = (cur + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
              va < want; va += PAGE_SIZE) {
             void *p = pmm_alloc_zeroed();
             if (!p)
-                panic("brk: out of pages");
+                break;
             vmm_map(pml4, va, (uint64_t)p,
                     VMM_PRESENT | VMM_WRITE | VMM_USER | VMM_NX);
+            top = va + PAGE_SIZE;
         }
-        current->brk_cur = want;
-        r->rax = want;
+        current->brk_cur = top < want ? top : want;
+        r->rax = current->brk_cur;
     } else {
         for (uint64_t va = (want + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
              va < cur; va += PAGE_SIZE) {
@@ -2010,15 +2051,32 @@ static uint64_t sys_mremap(struct regs *r) {
         vflags |= VMM_NX;
     for (uint64_t va = start; va < start + new_len; va += PAGE_SIZE) {
         void *pg = pmm_alloc_zeroed();
-        if (!pg)
-            panic("mremap: out of pages");
+        if (!pg) {
+            // unwind what this grow mapped so far, report ENOMEM
+            for (uint64_t u = start; u < va; u += PAGE_SIZE) {
+                uint64_t ph = vmm_get_phys(current->pml4, u);
+                vmm_unmap(current->pml4, u);
+                if (ph)
+                    pmm_free((void *)ph);
+            }
+            r->rax = -ENOMEM;
+            return (uint64_t)r;
+        }
         vmm_map(current->pml4, va, (uint64_t)pg, vflags);
     }
     uint64_t copy = old_len < new_len ? old_len : new_len;
     memcpy((void *)start, (const void *)addr, copy);
     struct mmap_region *nm = kmalloc(sizeof(*nm));
-    if (!nm)
-        panic("mremap: out of kernel heap");
+    if (!nm) {
+        for (uint64_t va = start; va < start + new_len; va += PAGE_SIZE) {
+            uint64_t ph = vmm_get_phys(current->pml4, va);
+            vmm_unmap(current->pml4, va);
+            if (ph)
+                pmm_free((void *)ph);
+        }
+        r->rax = -ENOMEM;
+        return (uint64_t)r;
+    }
     *nm = *m;
     nm->start = start;
     nm->end = start + new_len;
@@ -2061,6 +2119,10 @@ static uint64_t sys_munmap(struct regs *r) {
     len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     if (!len)
         len = PAGE_SIZE;
+    if (addr >= USER_LIMIT || len > USER_LIMIT - addr) {
+        r->rax = -1ULL;
+        return (uint64_t)r;
+    }
     if (munmap_range(addr, len) < 0) {
         r->rax = -1ULL;
         return (uint64_t)r;
