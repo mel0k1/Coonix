@@ -2308,7 +2308,7 @@ uint64_t syscall_dispatch(struct regs *r) {
     case SYS_fchmod:  fr = sys_fchmod(r); break;
     case SYS_fchmodat: fr = sys_fchmodat(r); break;
     case SYS_link:    fr = sys_link(r); break;
-    case 170 /* SYS_sync */: r->rax = 0; fr = (uint64_t)r; break;
+    case 162 /* SYS_sync */: r->rax = 0; fr = (uint64_t)r; break;
     case SYS_sysinfo: fr = sys_sysinfo(r); break;
     case SYS_times:   fr = sys_times(r); break;
     case SYS_getrusage: fr = sys_getrusage(r); break;
