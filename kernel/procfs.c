@@ -28,7 +28,7 @@ static long pfs_readlink(struct vnode *vn, char *buf, uint64_t size);
 struct vfs_ops pfs_ops = {
     pfs_lookup, pfs_read, 0, 0, 0,
     pfs_readdir, 0, 0, 0,
-    pfs_readlink, 0, 0, 0, 0
+    pfs_readlink, 0, 0, 0, 0, 0
 };
 
 // --- node pool ---------------------------------------------------------

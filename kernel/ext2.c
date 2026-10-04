@@ -68,7 +68,7 @@ static int e2_link(struct vnode *dir, struct vnode *vn, const char *name);
 struct vfs_ops e2_ops = {
     e2_lookup, e2_read, e2_write, e2_create, e2_truncate,
     e2_readdir, e2_unlink, e2_mkdir, e2_rmdir, e2_readlink, e2_symlink,
-    e2_truncate_to, e2_chmod, e2_link
+    e2_truncate_to, e2_chmod, e2_link, 0
 };
 
 
