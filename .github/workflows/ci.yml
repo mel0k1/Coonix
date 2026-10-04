@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  boot-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nasm xorriso qemu-system-x86
+
+      - name: build kernel and userland
+        run: make -j$(nproc) all
+
+      - name: build iso and disk
+        run: make iso disk
+
+      - name: boot test in qemu (TCG)
+        run: python3 scripts/ci_test.py
+
+      - name: upload serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serial-log
+          path: /tmp/coonix-ci-serial.log
+          if-no-files-found: ignore
