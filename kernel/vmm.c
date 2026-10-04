@@ -148,7 +148,23 @@ void vmm_mprotect(uint64_t pml4, uint64_t vaddr, uint64_t pages, uint64_t flags)
         uint64_t *pte = &pt[(va >> 12) & 0x1ff];
         if (!(*pte & VMM_PRESENT))
             continue;
-        *pte = (*pte & ~0x1fe & ~VMM_NX) | (flags & 0x1fe) | (flags & VMM_NX);
+        uint64_t old = *pte;
+        uint64_t nw = (old & ~0x1fe & ~VMM_NX) | (flags & 0x1fe) | (flags & VMM_NX);
+        if ((flags & VMM_WRITE) && (old & VMM_COW)) {
+            // granting W on a cow page must resolve the sharing first,
+            // else both sides write one frame with no fault, no copy
+            uint64_t phys = old & 0x000ffffffffff000ULL;
+            if (pmm_refcount((void *)phys) > 1) {
+                void *np = pmm_alloc();
+                if (!np)
+                    continue;   // stay cow: a write fault resolves later
+                memcpy(phys2virt((uint64_t)np), phys2virt(phys), PAGE_SIZE);
+                pmm_free((void *)phys);
+                phys = (uint64_t)np;
+            }
+            nw &= ~VMM_COW;   // private now (copied or last holder)
+        }
+        *pte = nw;
         __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
     }
 }
