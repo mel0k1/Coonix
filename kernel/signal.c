@@ -234,12 +234,28 @@ static uint64_t deliver_one(struct regs *r, int sig, int *killed,
     // user handler: build the frame below the interrupted rsp (or on the
     // alternate signal stack when SA_ONSTACK asks for it)
     uint64_t base = r->rsp;
+    int on_alt = 0;
     if ((sa->flags & SA_ONSTACK) && current->alt_size &&
         !(base >= current->alt_sp &&
-          base < current->alt_sp + current->alt_size))
+          base < current->alt_sp + current->alt_size)) {
         base = current->alt_sp + current->alt_size;
+        on_alt = 1;
+    }
+    // the frame write targets user memory picked from user state: a tiny
+    // rsp would wrap below 0 into the kernel half. broken stack = the
+    // handler cannot run: fall back from altstack, else kill (posix)
+#define SIGFRAME_BYTES (sizeof(struct rt_sigframe_k) + FXAREA_SIZE + 16)
     uint64_t sp = (base - 128) & ~0xfULL;
-    sp -= sizeof(struct rt_sigframe_k) + FXAREA_SIZE;
+    sp -= SIGFRAME_BYTES;
+    if (!vmm_user_range_ok(current->pml4, sp, SIGFRAME_BYTES, 1) && on_alt) {
+        base = r->rsp;
+        sp = (base - 128) & ~0xfULL;
+        sp -= SIGFRAME_BYTES;
+    }
+    if (!vmm_user_range_ok(current->pml4, sp, SIGFRAME_BYTES, 1)) {
+        *killed = 1;
+        return task_exit_current_sig(SIGSEGV);
+    }
     struct rt_sigframe_k *f = (struct rt_sigframe_k *)sp;
     memset(f, 0, sizeof(*f));
     set_gregs(f->gregs, r);
@@ -384,6 +400,11 @@ long signal_sys_sigaltstack(const uint64_t *uss, uint64_t *ouss,
 uint64_t signal_sigreturn(struct regs *r) {
     // user rsp at syscall time = just past pretcode = &uc_flags
     struct rt_sigframe_k *f = (struct rt_sigframe_k *)(r->rsp - 8);
+    // the restore reads user-picked memory in kernel mode: a bad rsp
+    // would page-fault inside the kernel; demand a mapped frame instead
+    if (!vmm_user_range_ok(current->pml4, (uint64_t)f,
+                           sizeof(struct rt_sigframe_k), 0))
+        return task_exit_current_sig(SIGSEGV);
     // restore the interrupted fpu state saved at delivery time. only the
     // fxsave area of THIS frame is accepted: a crafted fpstate pointer
     // would feed fxrstor arbitrary memory
