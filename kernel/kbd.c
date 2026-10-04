@@ -96,7 +96,9 @@ static void line_input(char c) {
         return;
     }
     if (c == '\b' || c == 0x7f) {               // VERASE
-        if (line_len) {
+        // only un-consumed chars: line_pos chars were already handed to
+        // a reader, erasing below it makes avail negative
+        if (line_len > line_pos) {
             line_len--;
             if (lflag & ECHOE)
                 console_puts("\b \b");
@@ -115,24 +117,39 @@ static void line_input(char c) {
 // kernel-side read: -1 = nothing yet (caller blocks on WAIT_KBD)
 int tty_read(char *out, int len) {
     if (tty_termios.lflag & ICANON) {
-        if (!line_ready)
+        // line state is shared with kbd_irq (line_input/erase/^C): hold
+        // interrupts for the whole examine+copy so the line cannot change
+        // under us
+        uint64_t fl;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl));
+        if (!line_ready) {
+            __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory");
             return -1;
+        }
         int avail = line_len - line_pos;
+        if (avail <= 0) {
+            // erase/^C shrunk the line below our read offset
+            line_reset();
+            __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory");
+            return -1;
+        }
         int n = len < avail ? len : avail;
         memcpy(out, line + line_pos, n);
         line_pos += n;
+        int eof_empty = 0;
         if (line_pos >= line_len) {
-            if (line_eof && line_pos == 0) {
-                // ^D on empty line: one zero-length read, then re-arm
-                line_reset();
-                return 0;
-            }
+            eof_empty = line_eof && line_pos == 0;
+            // ^D on empty line: one zero-length read, then re-arm
             line_reset();
         }
-        if (line_eof && n == 0) {
+        int eof_zero = line_eof && n == 0;
+        if (eof_zero)
             line_reset();
+        __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory");
+        if (eof_empty)
             return 0;
-        }
+        if (eof_zero)
+            return 0;
         return n;
     }
     // raw: whatever accumulated
