@@ -175,6 +175,7 @@ struct file *vfs_open(struct vnode *vn) {
     memset(f, 0, sizeof(*f));   // path[] must start empty
     f->vn = vn;
     f->refs = 1;
+    vn->refs++;   // keep the vnode alive while any fd points at it
     return f;
 }
 
@@ -205,6 +206,12 @@ void vfs_close(struct file *f) {
         return; // static console slots are never freed
     if (f->pipe)
         pipe_release_end(f->pipe, f->pipe_writer);
+    if (f->vn) {
+        if (f->vn->refs > 0)
+            f->vn->refs--;
+        if (f->vn->ops->release)
+            f->vn->ops->release(f->vn);   // frees unlinked nodes
+    }
     kfree(f);
 }
 

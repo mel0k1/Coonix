@@ -42,6 +42,9 @@ struct vfs_ops {
     // add a second directory entry pointing at an existing vnode (hard
     // link); bumps the link count; 0 ok
     int (*link)(struct vnode *dir, struct vnode *vn, const char *name);
+    // last struct file referencing vn closed; fs drivers free the
+    // backing node here when it was already unlinked
+    void (*release)(struct vnode *vn);
 };
 
 struct vnode {
@@ -52,6 +55,7 @@ struct vnode {
     void *fs_data;         // fs-private inode
     uint64_t ino;          // fs inode number (st_ino)
     uint64_t dev;          // per-fs device id (st_dev)
+    int refs;              // open struct files pointing at this vnode
 };
 
 // open file description, shared across fork
