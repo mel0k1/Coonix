@@ -5,10 +5,12 @@
 #include "console.h"
 
 #define NAME_MAX 56
+#define TMPFS_MAX_FILE (64ULL << 20)   // ram fs: keep off+len sane
 
 struct tnode {
     char name[NAME_MAX];
     int type;
+    int unlinked;          // detached from the tree, alive for open fds
     struct tnode *parent, *child, *sibling;
     uint8_t *data;
     uint64_t size, cap;
@@ -81,6 +83,10 @@ static long tmpfs_write(struct vnode *vn, const void *buf, uint64_t off, uint64_
     struct tnode *t = vn2t(vn);
     if (t->type != VNODE_FILE)
         return -1;
+    // reject wrap-around offsets (lseek to -8 then write) before the
+    // grow: off+len must not overflow
+    if (off > TMPFS_MAX_FILE || len > TMPFS_MAX_FILE - off)
+        return -1;
     if (tnode_grow(t, off + len) < 0)
         return -1;
     memcpy(t->data + off, buf, len);
@@ -129,6 +135,17 @@ static int tmpfs_readdir(struct vnode *dir, uint64_t *ctx, uint64_t *ino,
     return 0;
 }
 
+// last open fd dropped the vnode: free it if unlink already detached it
+static void tmpfs_release(struct vnode *vn) {
+    struct tnode *t = vn2t(vn);
+    if (t->unlinked && !vn->refs) {
+        if (t->data)
+            kfree(t->data);
+        kfree(t);
+        nnodes--;
+    }
+}
+
 static int tmpfs_unlink(struct vnode *dir, const char *name) {
     struct tnode *t = vn2t(dir);
     struct tnode **pp = &t->child;
@@ -138,10 +155,11 @@ static int tmpfs_unlink(struct vnode *dir, const char *name) {
                 return -1;
             struct tnode *dead = *pp;
             *pp = dead->sibling;
-            if (dead->data)
-                kfree(dead->data);
-            kfree(dead);
-            nnodes--;
+            // detach, keep alive while open fds still point at it
+            dead->sibling = 0;
+            dead->parent = 0;
+            dead->unlinked = 1;
+            tmpfs_release(&dead->vn);
             return 0;
         }
         pp = &(*pp)->sibling;
@@ -220,6 +238,7 @@ void tmpfs_mount(void) {
     tmpfs_ops.truncate = tmpfs_truncate;
     tmpfs_ops.readdir = tmpfs_readdir;
     tmpfs_ops.unlink = tmpfs_unlink;
+    tmpfs_ops.release = tmpfs_release;
     tmpfs_ops.mkdir = tmpfs_mkdir;
     tmpfs_ops.rmdir = tmpfs_rmdir;
     troot = tnode_new("", VNODE_DIR, 0);
