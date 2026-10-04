@@ -1160,6 +1160,14 @@ static uint64_t sys_futex(struct regs *r) {
         replay_fixup(r);
         uint64_t deadline = futex_deadline_from_timespec(
             timeout, op == FUT_WAIT_BITSET);
+        // lost wakeup guard: re-read the word now that we sit inside the
+        // cli window — a waker that changed it after the preemptible
+        // check above must not strand us on the queue forever
+        if (*uaddr != val) {
+            sti();
+            task_frame_syscall_result(current, -EAGAIN);
+            return (uint64_t)r;
+        }
         return futex_wait_key(key, deadline, (uint64_t)r);
     }
     case FUT_WAKE:
