@@ -3,6 +3,7 @@
 #include "string.h"
 #include "serial.h"
 #include "syscall.h"
+#include "vmm.h"
 
 // minimal errno set for signals
 #define EPERM    1
@@ -10,6 +11,7 @@
 #define ESRCH    3
 #define EINVAL  22
 #define ENOMEM  12
+#define EFAULT  14
 
 #define SS_ONSTACK  1
 #define SS_DISABLE  2
@@ -59,6 +61,12 @@ long signal_sys_rt_sigaction(int sig, const struct k_sigaction *act,
         return -EINVAL;
     if (sig == SIGKILL || sig == SIGSTOP)
         return -EINVAL;
+    if (oact &&
+        !vmm_user_range_ok(current->pml4, (uint64_t)oact, sizeof(*oact), 1))
+        return -EFAULT;
+    if (act &&
+        !vmm_user_range_ok(current->pml4, (uint64_t)act, sizeof(*act), 0))
+        return -EFAULT;
     if (oact) {
         memcpy((void *)oact, &current->sigact[sig], sizeof(*oact));
     }
@@ -82,6 +90,11 @@ long signal_sys_rt_sigprocmask(int how, const uint64_t *set, uint64_t *oldset,
                                uint64_t sigsetsize) {
     if (sigsetsize != 8)
         return -EINVAL;
+    if (oldset &&
+        !vmm_user_range_ok(current->pml4, (uint64_t)oldset, 8, 1))
+        return -EFAULT;
+    if (set && !vmm_user_range_ok(current->pml4, (uint64_t)set, 8, 0))
+        return -EFAULT;
     if (oldset)
         *oldset = current->sig_mask;
     if (set) {
@@ -340,6 +353,8 @@ long signal_sys_sigaltstack(const uint64_t *uss, uint64_t *ouss,
     int on_alt = current->alt_size && user_rsp >= current->alt_sp &&
                  user_rsp < current->alt_sp + current->alt_size;
     if (ouss) {
+        if (!vmm_user_range_ok(current->pml4, (uint64_t)ouss, 24, 1))
+            return -EFAULT;
         ouss[0] = current->alt_sp;
         *((uint32_t *)ouss + 2) =
             !current->alt_size ? SS_DISABLE : (on_alt ? SS_ONSTACK : 0);
@@ -347,6 +362,8 @@ long signal_sys_sigaltstack(const uint64_t *uss, uint64_t *ouss,
     }
     if (!uss)
         return 0;
+    if (!vmm_user_range_ok(current->pml4, (uint64_t)uss, 24, 0))
+        return -EFAULT;
     if (on_alt)
         return -EPERM;              // cannot swap stacks from itself
     uint32_t fl = *((const uint32_t *)uss + 2);

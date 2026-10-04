@@ -945,10 +945,18 @@ static uint64_t sys_arch_prctl(struct regs *r) {
         r->rax = 0;
         break;
     case 0x1003:
+        if (!vmm_user_range_ok(current->pml4, arg, 8, 1)) {
+            r->rax = -EFAULT;
+            break;
+        }
         *(uint64_t *)arg = current->fs_base;
         r->rax = 0;
         break;
     case 0x1004:
+        if (!vmm_user_range_ok(current->pml4, arg, 8, 1)) {
+            r->rax = -EFAULT;
+            break;
+        }
         *(uint64_t *)arg = current->gs_base;
         r->rax = 0;
         break;
@@ -959,6 +967,12 @@ static uint64_t sys_arch_prctl(struct regs *r) {
 }
 
 static uint64_t sys_set_tid_address(struct regs *r) {
+    // the kernel writes *clear_tid = 0 on exit: only accept a mapped
+    // user-writable word, anything else would be a kernel write
+    if (!vmm_user_range_ok(current->pml4, r->rdi, 4, 1)) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
     current->clear_tid = r->rdi;
     r->rax = (uint64_t)(long)current->pid;
     return (uint64_t)r;
@@ -1133,6 +1147,11 @@ static uint64_t sys_futex(struct regs *r) {
             r->rax = -EAGAIN;
             return (uint64_t)r;
         }
+        if (timeout &&
+            !vmm_user_range_ok(current->pml4, (uint64_t)timeout, 16, 0)) {
+            r->rax = -EFAULT;
+            return (uint64_t)r;
+        }
         // WAIT: relative timespec; WAIT_BITSET: absolute.
         // rewind so the resume re-executes (or the wake unwinds it after
         // stuffing the result); futex_wait_key returns the frame rsp the
@@ -1223,7 +1242,7 @@ static uint64_t sys_tkill(struct regs *r) {
 // nanosleep: block until the tick deadline
 static uint64_t sys_nanosleep(struct regs *r) {
     const uint64_t *ts = (const uint64_t *)r->rdi;
-    if (!ts) {
+    if (!ts || !vmm_user_range_ok(current->pml4, (uint64_t)ts, 16, 0)) {
         r->rax = -EFAULT;
         return (uint64_t)r;
     }
@@ -1250,6 +1269,10 @@ static uint64_t sys_clock_nanosleep(struct regs *r) {
     if (!req || (flags & ~TIMER_ABSTIME) ||
         (clk != CLOCK_REALTIME && clk != CLOCK_MONOTONIC)) {
         r->rax = (uint64_t)-EINVAL;
+        return (uint64_t)r;
+    }
+    if (!vmm_user_range_ok(current->pml4, (uint64_t)req, 16, 0)) {
+        r->rax = (uint64_t)-EFAULT;
         return (uint64_t)r;
     }
     uint64_t target = req[0] * 100 + req[1] / 10000000;
@@ -1310,7 +1333,8 @@ static uint64_t sys_pause(struct regs *r) {
 // syscall reports -EINTR (never restarts)
 static uint64_t sys_sigsuspend(struct regs *r) {
     const uint64_t *uset = (const uint64_t *)r->rdi;
-    if (!uset || r->rsi != 8) {
+    if (!uset || r->rsi != 8 ||
+        !vmm_user_range_ok(current->pml4, (uint64_t)uset, 8, 0)) {
         r->rax = (uint64_t)-EINVAL;
         return (uint64_t)r;
     }
@@ -1344,7 +1368,11 @@ static uint64_t sys_sigtimedwait(struct regs *r) {
     const uint64_t *uset = (const uint64_t *)r->rdi;
     struct siginfo_k *uinfo = (struct siginfo_k *)r->rsi;
     const uint64_t *ts = (const uint64_t *)r->rdx;
-    if (!uset || r->r10 != 8) {   // arg4 (sigsetsize) rides r10
+    if (!uset || r->r10 != 8 ||   // arg4 (sigsetsize) rides r10
+        !vmm_user_range_ok(current->pml4, (uint64_t)uset, 8, 0) ||
+        (uinfo && !vmm_user_range_ok(current->pml4, (uint64_t)uinfo,
+                                     sizeof(*uinfo), 1)) ||
+        (ts && !vmm_user_range_ok(current->pml4, (uint64_t)ts, 16, 0))) {
         r->rax = (uint64_t)-EINVAL;
         return (uint64_t)r;
     }
@@ -1421,6 +1449,10 @@ static uint64_t sys_clock_gettime(struct regs *r) {
         r->rax = (uint64_t)-EINVAL;
         return (uint64_t)r;
     }
+    if (!vmm_user_range_ok(current->pml4, (uint64_t)tp, 16, 1)) {
+        r->rax = (uint64_t)-EFAULT;
+        return (uint64_t)r;
+    }
     uint64_t t = pit_ticks();
     tp[0] = t / 100;
     tp[1] = (t % 100) * 10000000ULL;
@@ -1431,6 +1463,10 @@ static uint64_t sys_clock_gettime(struct regs *r) {
 static uint64_t sys_time(struct regs *r) {
     uint64_t *tp = (uint64_t *)r->rdi;
     uint64_t t = pit_ticks() / 100;
+    if (tp && !vmm_user_range_ok(current->pml4, (uint64_t)tp, 8, 1)) {
+        r->rax = (uint64_t)-EFAULT;
+        return (uint64_t)r;
+    }
     if (tp)
         *tp = t;
     r->rax = t;

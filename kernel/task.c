@@ -729,9 +729,12 @@ struct task *task_clone_thread(struct regs *frame, uint64_t flags,
     memcpy(c->sigact, current->sigact, sizeof(c->sigact));
     c->sig_mask = current->sig_mask;
 
-    if (flags & CLONE_PARENT_SETTID)
+    // kernel writes into user memory: only through mapped user pages
+    if (flags & CLONE_PARENT_SETTID &&
+        vmm_user_range_ok(current->pml4, (uint64_t)parent_tid, 4, 1))
         *(int *)parent_tid = c->pid;
-    if (flags & CLONE_CHILD_SETTID)
+    if (flags & CLONE_CHILD_SETTID &&
+        vmm_user_range_ok(current->pml4, (uint64_t)child_tid, 4, 1))
         *(int *)child_tid = c->pid;
     // fpu state is part of the execution context (clone shares it)
     memcpy(c->fpu_area, current->fpu_area, sizeof(c->fpu_area));
@@ -775,9 +778,11 @@ int task_count_group(int tgid, struct task *except) {
 // the kernel stack cannot be unmapped while we run on it, so it goes to
 // the reap queue for the idle task
 static void task_thread_release(struct task *t, int self) {
-    // joiners watch *child_tid: zero it and wake the futex
+    // joiners watch *child_tid: zero it and wake the futex; the pointer
+    // was validated at set_tid_address/clone time, re-check before the
+    // write in case user unmapped it since
     uint64_t ct = t->child_tid ? t->child_tid : t->clear_tid;
-    if (ct) {
+    if (ct && vmm_user_range_ok(t->pml4, ct, 4, 1)) {
         *(uint32_t *)ct = 0;
         extern void futex_wake_addr(uint64_t uaddr, int n);
         futex_wake_addr(ct, -1);
