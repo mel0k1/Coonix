@@ -92,6 +92,42 @@ uint64_t vmm_get_pte(uint64_t pml4_phys, uint64_t vaddr) {
     return pt[(vaddr >> 12) & 0x1ff];
 }
 
+// 1 if [uaddr, uaddr+len) is fully mapped user memory. own walk (not
+// vmm_get_pte): 2M user pages don't exist here, so a PS-bit entry must
+// fail closed rather than be dereferenced as a page table
+int vmm_user_range_ok(uint64_t pml4_phys, uint64_t uaddr, uint64_t len,
+                      int need_write) {
+    if (!len)
+        return 1;
+    if (uaddr >= VMM_USER_LIMIT || len > VMM_USER_LIMIT - uaddr)
+        return 0;
+    uint64_t last = (uaddr + len - 1) & ~0xfffULL;
+    uint64_t va = uaddr & ~0xfffULL;
+    for (;;) {
+        uint64_t *pml4 = phys2virt(pml4_phys);
+        uint64_t e = pml4[(va >> 39) & 0x1ff];
+        if (!(e & VMM_PRESENT) || !(e & VMM_USER))
+            return 0;
+        uint64_t *pdp = phys2virt(e & 0x000ffffffffff000ULL);
+        e = pdp[(va >> 30) & 0x1ff];
+        if (!(e & VMM_PRESENT) || !(e & VMM_USER))
+            return 0;
+        uint64_t *pd = phys2virt(e & 0x000ffffffffff000ULL);
+        e = pd[(va >> 21) & 0x1ff];
+        if (!(e & VMM_PRESENT) || !(e & VMM_USER) || (e & 0x080))
+            return 0;   // PS set: no 2M user pages in this kernel
+        uint64_t *pt = phys2virt(e & 0x000ffffffffff000ULL);
+        e = pt[(va >> 12) & 0x1ff];
+        if (!(e & VMM_PRESENT) || !(e & VMM_USER))
+            return 0;
+        if (need_write && !(e & (VMM_WRITE | VMM_COW)))
+            return 0;
+        if (va == last)
+            return 1;
+        va += PAGE_SIZE;
+    }
+}
+
 // re-protect an existing range (mprotect); pages must be mapped
 void vmm_mprotect(uint64_t pml4, uint64_t vaddr, uint64_t pages, uint64_t flags) {
     uint64_t *pml4t = phys2virt(pml4);
