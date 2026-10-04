@@ -111,6 +111,8 @@ struct task *task_spawn_kernel(void (*entry)(void));
 struct task *task_spawn_user(const char *path, struct task *parent);
 void task_yield(void);           // called from irq context
 uint64_t task_schedule(uint64_t old_rsp);
+// stuff a syscall result into a blocked task's saved frame
+void task_frame_syscall_result(struct task *t, long ret);
 // summed utime/stime over every thread of the group (getrusage SELF, times)
 void task_cpu_group(int tgid, uint64_t *utime, uint64_t *stime);
 // direct switch to a specific task (clone returns straight into the child);

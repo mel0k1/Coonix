@@ -915,6 +915,10 @@ void task_tick_wake(void) {
             // signal first is T_READY with a live kernel/user context whose
             // rax we must not clobber
             task_frame_syscall_result(t, 0);
+            // stale state must not outlive the wake: a later futex block
+            // with leftover WAIT_SLEEP+wake_tick gets spuriously tick-woken
+            t->wake_tick = 0;
+            t->wait_reason = WAIT_NONE;
             t->state = T_READY;
         } else if (t->wait_reason == WAIT_SIGNAL &&
                    t->sig_wait_kind == SW_SIGWAIT) {
@@ -924,6 +928,8 @@ void task_tick_wake(void) {
             t->sig_wait_kind = 0;
             ((struct regs *)t->rsp)->rax = (uint64_t)-11;   // -EAGAIN
             t->sig_woke_rewind = 0;
+            t->wake_tick = 0;
+            t->wait_reason = WAIT_NONE;
             t->state = T_READY;
         }
     }

@@ -54,6 +54,11 @@ uint64_t futex_wait_key(uint64_t key, uint64_t deadline, uint64_t frame_rsp) {
     struct futex_q **head = bucket_of(key);
     q->next = *head;          // LIFO wake is fine for round-robin tests
     *head = q;
+    // deadlines live in q->deadline (futex_tick): drop any leftover sleep
+    // state so the tick never fires a stale WAIT_SLEEP wake into the
+    // futex frame
+    current->wake_tick = 0;
+    current->wait_reason = WAIT_NONE;
     current->rsp = frame_rsp;      // resume here when woken
     current->state = T_BLOCKED;
     // the wake (or timeout) stuffs the syscall result straight into the
