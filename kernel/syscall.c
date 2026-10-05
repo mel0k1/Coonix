@@ -215,6 +215,10 @@ __attribute__((unused)) static long file_read(struct file *f, void *buf, uint64_
 #define O_TRUNC 0x200
 #define O_CLOEXEC 0x80000
 
+// cap for one read/write: user_range_ok walks every 4k page, an
+// unchecked SIZE_MAX count would spin the walker forever
+#define MAX_RW (16 << 20)
+
 #define SIGPIPE 13
 
 #define F_GETFD 1
@@ -273,6 +277,18 @@ static uint64_t sys_write(struct regs *r) {
         r->rax = -EBADF;
         return (uint64_t)r;
     }
+    if (len > MAX_RW)
+        len = MAX_RW;
+    // the buffer is copied from inside the kernel: a bad user pointer
+    // would page-fault in kernel mode and kill the task with SIGSEGV
+    if (len && !task_user_range_ok(current, (uint64_t)buf, len, 0)) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    // fault lazy pages in up front: a fill mid-file_write would nest an
+    // ext2 read inside a disk op
+    if (len)
+        task_prefault_range(current, (uint64_t)buf, len);
     if (f->pipe && !f->pipe->readers) {
         signal_send_task(current, SIGPIPE);   // default kills
         r->rax = -EPIPE;
@@ -302,6 +318,16 @@ static uint64_t sys_read(struct regs *r) {
         r->rax = -EBADF;
         return (uint64_t)r;
     }
+    // every path below copies into the user buffer in kernel mode
+    uint64_t rlen = r->rdx ? r->rdx : 1;
+    if (rlen > MAX_RW)
+        rlen = MAX_RW;
+    if (!task_user_range_ok(current, (uint64_t)buf, rlen, 1)) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
+    // same as sys_write: prefault before the kernel copies through here
+    task_prefault_range(current, (uint64_t)buf, rlen);
     if (f->pipe) {
         // pipe: return what fits; block only when empty and writers live
         uint64_t n = pipe_read_nb(f->pipe, (uint8_t *)buf,
@@ -829,6 +855,14 @@ static uint64_t sys_writev(struct regs *r) {
     int fd = (int)r->rdi;
     const struct iovec *iv = (const struct iovec *)r->rsi;
     uint64_t cnt = r->rdx;
+    if (cnt > 1024)
+        cnt = 1024;
+    // the vector array itself lives in user memory
+    if (cnt && !task_user_range_ok(current, (uint64_t)iv,
+                                  cnt * sizeof(struct iovec), 0)) {
+        r->rax = -EFAULT;
+        return (uint64_t)r;
+    }
     uint64_t total = 0;
     for (uint64_t i = 0; i < cnt; i++) {
         // reuse the write path by hand: fd may be the console or a pipe
@@ -837,7 +871,17 @@ static uint64_t sys_writev(struct regs *r) {
             r->rax = -EBADF;
             return (uint64_t)r;
         }
-        long n = file_write(f, iv[i].base, iv[i].len);
+        uint64_t len = iv[i].len;
+        if (len > MAX_RW)
+            len = MAX_RW;
+        if (len && !task_user_range_ok(current,
+                                      (uint64_t)iv[i].base, len, 0)) {
+            r->rax = -EFAULT;
+            return (uint64_t)r;
+        }
+        if (len)
+            task_prefault_range(current, (uint64_t)iv[i].base, len);
+        long n = file_write(f, iv[i].base, len);
         if (n < 0) {
             r->rax = -EIO;
             return (uint64_t)r;
@@ -945,7 +989,7 @@ static uint64_t sys_arch_prctl(struct regs *r) {
         r->rax = 0;
         break;
     case 0x1003:
-        if (!vmm_user_range_ok(current->pml4, arg, 8, 1)) {
+        if (!task_user_range_ok(current, arg, 8, 1)) {
             r->rax = -EFAULT;
             break;
         }
@@ -953,7 +997,7 @@ static uint64_t sys_arch_prctl(struct regs *r) {
         r->rax = 0;
         break;
     case 0x1004:
-        if (!vmm_user_range_ok(current->pml4, arg, 8, 1)) {
+        if (!task_user_range_ok(current, arg, 8, 1)) {
             r->rax = -EFAULT;
             break;
         }
@@ -969,7 +1013,7 @@ static uint64_t sys_arch_prctl(struct regs *r) {
 static uint64_t sys_set_tid_address(struct regs *r) {
     // the kernel writes *clear_tid = 0 on exit: only accept a mapped
     // user-writable word, anything else would be a kernel write
-    if (!vmm_user_range_ok(current->pml4, r->rdi, 4, 1)) {
+    if (!task_user_range_ok(current, r->rdi, 4, 1)) {
         r->rax = -EFAULT;
         return (uint64_t)r;
     }
@@ -1148,7 +1192,7 @@ static uint64_t sys_futex(struct regs *r) {
             return (uint64_t)r;
         }
         if (timeout &&
-            !vmm_user_range_ok(current->pml4, (uint64_t)timeout, 16, 0)) {
+            !task_user_range_ok(current, (uint64_t)timeout, 16, 0)) {
             r->rax = -EFAULT;
             return (uint64_t)r;
         }
@@ -1250,7 +1294,7 @@ static uint64_t sys_tkill(struct regs *r) {
 // nanosleep: block until the tick deadline
 static uint64_t sys_nanosleep(struct regs *r) {
     const uint64_t *ts = (const uint64_t *)r->rdi;
-    if (!ts || !vmm_user_range_ok(current->pml4, (uint64_t)ts, 16, 0)) {
+    if (!ts || !task_user_range_ok(current, (uint64_t)ts, 16, 0)) {
         r->rax = -EFAULT;
         return (uint64_t)r;
     }
@@ -1279,7 +1323,7 @@ static uint64_t sys_clock_nanosleep(struct regs *r) {
         r->rax = (uint64_t)-EINVAL;
         return (uint64_t)r;
     }
-    if (!vmm_user_range_ok(current->pml4, (uint64_t)req, 16, 0)) {
+    if (!task_user_range_ok(current, (uint64_t)req, 16, 0)) {
         r->rax = (uint64_t)-EFAULT;
         return (uint64_t)r;
     }
@@ -1342,7 +1386,7 @@ static uint64_t sys_pause(struct regs *r) {
 static uint64_t sys_sigsuspend(struct regs *r) {
     const uint64_t *uset = (const uint64_t *)r->rdi;
     if (!uset || r->rsi != 8 ||
-        !vmm_user_range_ok(current->pml4, (uint64_t)uset, 8, 0)) {
+        !task_user_range_ok(current, (uint64_t)uset, 8, 0)) {
         r->rax = (uint64_t)-EINVAL;
         return (uint64_t)r;
     }
@@ -1377,10 +1421,10 @@ static uint64_t sys_sigtimedwait(struct regs *r) {
     struct siginfo_k *uinfo = (struct siginfo_k *)r->rsi;
     const uint64_t *ts = (const uint64_t *)r->rdx;
     if (!uset || r->r10 != 8 ||   // arg4 (sigsetsize) rides r10
-        !vmm_user_range_ok(current->pml4, (uint64_t)uset, 8, 0) ||
-        (uinfo && !vmm_user_range_ok(current->pml4, (uint64_t)uinfo,
+        !task_user_range_ok(current, (uint64_t)uset, 8, 0) ||
+        (uinfo && !task_user_range_ok(current, (uint64_t)uinfo,
                                      sizeof(*uinfo), 1)) ||
-        (ts && !vmm_user_range_ok(current->pml4, (uint64_t)ts, 16, 0))) {
+        (ts && !task_user_range_ok(current, (uint64_t)ts, 16, 0))) {
         r->rax = (uint64_t)-EINVAL;
         return (uint64_t)r;
     }
@@ -1457,7 +1501,7 @@ static uint64_t sys_clock_gettime(struct regs *r) {
         r->rax = (uint64_t)-EINVAL;
         return (uint64_t)r;
     }
-    if (!vmm_user_range_ok(current->pml4, (uint64_t)tp, 16, 1)) {
+    if (!task_user_range_ok(current, (uint64_t)tp, 16, 1)) {
         r->rax = (uint64_t)-EFAULT;
         return (uint64_t)r;
     }
@@ -1471,7 +1515,7 @@ static uint64_t sys_clock_gettime(struct regs *r) {
 static uint64_t sys_time(struct regs *r) {
     uint64_t *tp = (uint64_t *)r->rdi;
     uint64_t t = pit_ticks() / 100;
-    if (tp && !vmm_user_range_ok(current->pml4, (uint64_t)tp, 8, 1)) {
+    if (tp && !task_user_range_ok(current, (uint64_t)tp, 8, 1)) {
         r->rax = (uint64_t)-EFAULT;
         return (uint64_t)r;
     }

@@ -132,6 +132,13 @@ void task_mmap_teardown(struct task *t);   // writeback shared, drop regions
 void task_mmap_clone(struct task *dst, const struct task *src);
 // lazy fill of a file-backed mapping on #PF; 1 = handled
 int task_mmap_fault(struct regs *r, uint64_t cr2);
+// user range validation that also accepts lazily faultable file-backed
+// pages (strict walk + mmap region fallback); use instead of
+// vmm_user_range_ok for syscall argument pointers
+int task_user_range_ok(struct task *t, uint64_t uaddr, uint64_t len,
+                       int need_write);
+// fault in lazily-backed pages of a user range before a kernel copy
+void task_prefault_range(struct task *t, uint64_t uaddr, uint64_t len);
 struct task *task_find_free(void);
 void task_wake_kbd(void);
 void task_wake_pipe(struct pipe *p);   // unblock WAIT_PIPE tasks on p

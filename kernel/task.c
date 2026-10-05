@@ -214,6 +214,8 @@ void task_mmap_clone(struct task *dst, const struct task *src) {
     }
 }
 
+static int mmap_fill_page(struct mmap_region *m, uint64_t page);
+
 // lazy fill of a file-backed mapping; called from the #PF path after the
 // cow check says "not mine"
 int task_mmap_fault(struct regs *r, uint64_t cr2) {
@@ -226,9 +228,24 @@ int task_mmap_fault(struct regs *r, uint64_t cr2) {
             continue;
         if (!m->file)
             return 0;   // anon regions are mapped eagerly
-        void *p = pmm_alloc_zeroed();
-        if (!p)
-            return 0;
+        return mmap_fill_page(m, page);
+    }
+    return 0;
+}
+
+// fill one page of a file-backed region. static so the fault path and
+// deliberate prefaulting share it. NOT reentrant: the fill issues ext2
+// reads, and a nested fill (fault while a disk op is in flight) would
+// recurse into the driver mid-transfer — the guard turns that into a
+// clean SIGSEGV instead of a triple fault
+static int mmap_filling;
+static int mmap_fill_page(struct mmap_region *m, uint64_t page) {
+    if (mmap_filling)
+        return 0;
+    mmap_filling = 1;
+    void *p = pmm_alloc_zeroed();
+    int ok = 0;
+    if (p) {
         uint64_t foff = m->off + (page - m->start);
         long n = m->file->vn->ops->read(m->file->vn,
                                         phys2virt((uint64_t)p), foff,
@@ -241,9 +258,76 @@ int task_mmap_fault(struct regs *r, uint64_t cr2) {
         if (!(m->prot & 0x4))
             vflags |= VMM_NX;
         vmm_map(current->pml4, page, (uint64_t)p, vflags);
-        return 1;
+        ok = 1;
     }
-    return 0;
+    mmap_filling = 0;
+    return ok;
+}
+
+// deliberately fault in every lazily-backed page of a user range before
+// the kernel copies to/from it (syscalls with kernel-side buffer
+// access). must run BEFORE any disk op starts: the fill itself does
+// ext2 reads and must not nest inside one
+void task_prefault_range(struct task *t, uint64_t uaddr, uint64_t len) {
+    if (!t || !t->pml4 || !len)
+        return;
+    if (uaddr >= VMM_USER_LIMIT || len > VMM_USER_LIMIT - uaddr)
+        return;
+    uint64_t last = (uaddr + len - 1) & ~0xfffULL;
+    for (uint64_t va = uaddr & ~0xfffULL;; va += 0x1000) {
+        if (!(vmm_get_pte(t->pml4, va) & VMM_PRESENT)) {
+            for (struct mmap_region *m = t->mmaps; m; m = m->next)
+                if (va >= m->start && va < m->end) {
+                    if (m->file)
+                        mmap_fill_page(m, va);
+                    break;
+                }
+        }
+        if (va == last)
+            break;
+    }
+}
+
+// user-pointer validation with the task's lazy mappings in mind. the
+// strict page walk rejects not-yet-faulted pages, but a pointer into
+// file-backed mmap space (libc .bss, untouched .data) is perfectly
+// valid: the access faults it in via task_mmap_fault. so: strict walk
+// first; pages that fail it must be covered by a file-backed region
+// (anon regions are mapped eagerly, so non-present there is really
+// invalid). need_write demands W or COW on mapped pages, PROT_WRITE on
+// lazy ones
+int task_user_range_ok(struct task *t, uint64_t uaddr, uint64_t len,
+                       int need_write) {
+    if (!t || !t->pml4)
+        return 0;
+    if (vmm_user_range_ok(t->pml4, uaddr, len, need_write))
+        return 1;
+    if (!len)
+        return 1;
+    if (uaddr >= VMM_USER_LIMIT || len > VMM_USER_LIMIT - uaddr)
+        return 0;
+    uint64_t last = (uaddr + len - 1) & ~0xfffULL;
+    for (uint64_t va = uaddr & ~0xfffULL;; va += 0x1000) {
+        uint64_t pte = vmm_get_pte(t->pml4, va);
+        if (pte & VMM_PRESENT) {
+            // strict walk already passed everything present; a present
+            // page only fails the walk on the write check
+            if (need_write && !(pte & (VMM_WRITE | VMM_COW)))
+                return 0;
+        } else {
+            // not faulted yet: only a file-backed region can serve it
+            struct mmap_region *m = t->mmaps;
+            for (; m; m = m->next)
+                if (va >= m->start && va < m->end)
+                    break;
+            if (!m || !m->file)
+                return 0;
+            if (need_write && !(m->prot & 0x2))
+                return 0;
+        }
+        if (va == last)
+            return 1;
+    }
 }
 
 static void user_stack_setup(uint64_t pml4) {
@@ -731,10 +815,10 @@ struct task *task_clone_thread(struct regs *frame, uint64_t flags,
 
     // kernel writes into user memory: only through mapped user pages
     if (flags & CLONE_PARENT_SETTID &&
-        vmm_user_range_ok(current->pml4, (uint64_t)parent_tid, 4, 1))
+        task_user_range_ok(current, (uint64_t)parent_tid, 4, 1))
         *(int *)parent_tid = c->pid;
     if (flags & CLONE_CHILD_SETTID &&
-        vmm_user_range_ok(current->pml4, (uint64_t)child_tid, 4, 1))
+        task_user_range_ok(current, (uint64_t)child_tid, 4, 1))
         *(int *)child_tid = c->pid;
     // fpu state is part of the execution context (clone shares it)
     memcpy(c->fpu_area, current->fpu_area, sizeof(c->fpu_area));
@@ -782,7 +866,7 @@ static void task_thread_release(struct task *t, int self) {
     // was validated at set_tid_address/clone time, re-check before the
     // write in case user unmapped it since
     uint64_t ct = t->child_tid ? t->child_tid : t->clear_tid;
-    if (ct && vmm_user_range_ok(t->pml4, ct, 4, 1)) {
+    if (ct && task_user_range_ok(t, ct, 4, 1)) {
         *(uint32_t *)ct = 0;
         extern void futex_wake_addr(uint64_t uaddr, int n);
         futex_wake_addr(ct, -1);
