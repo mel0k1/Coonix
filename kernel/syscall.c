@@ -114,8 +114,12 @@ static void path_canon(char *p) {
 }
 
 // capture a NUL-terminated array of user strings into one kernel block
-// ("str\0str\0...\0"); returns 0 ok, -1 bad/oversized
+// ("str\0str\0...\0"); returns 0 ok, -1 oversized, -2 bad user pointer,
+// -3 out of memory
 #define EXEC_STRV_MAX 32
+// per-block byte budget: argv + envp + the auxv block must fit the
+// 64k user stack with room to spare
+#define EXEC_STRV_BYTES (16 << 10)
 static int capture_strv(uint64_t up, char **out, int *cnt) {
     *out = 0;
     *cnt = 0;
@@ -123,35 +127,48 @@ static int capture_strv(uint64_t up, char **out, int *cnt) {
         return 0;
     const uint64_t *uv = (const uint64_t *)up;
     const char *strs[EXEC_STRV_MAX];
+    uint64_t lens[EXEC_STRV_MAX];
     int n = 0;
+    uint64_t total = 0;
     while (n < EXEC_STRV_MAX) {
+        // the vector itself is user memory: check every entry we read
+        if (!task_user_range_ok(current, (uint64_t)&uv[n], 8, 0))
+            return -2;
         uint64_t p = uv[n];
         if (!p)
             break;
         const char *s = (const char *)p;
+        // strlen page by page: touching an unmapped page from the kernel
+        // would fault (SIGSEGV kill) instead of failing the syscall
         uint64_t len = 0;
-        while (len < 1024 && s[len])
+        while (len < 1024) {
+            if ((len & 0xfff) == 0 &&
+                !task_user_range_ok(current, (uint64_t)s + len, 1, 0))
+                return -2;
+            if (!s[len])
+                break;
             len++;
+        }
         if (len >= 1024)
             return -1;
         strs[n] = s;
+        lens[n] = len + 1;
+        total += len + 1;
+        if (total > EXEC_STRV_BYTES)
+            return -1;
         n++;
     }
     if (!n)
         return 0;
-    uint64_t total = 0;
-    for (int i = 0; i < n; i++)
-        total += strlen(strs[i]) + 1;
     // +1: double NUL at the end — consumers scan strings until an empty
     // one, so the block must end "str\0str\0\0"
     char *blk = kmalloc(total + 1);
     if (!blk)
-        return -1;
+        return -3;
     uint64_t off = 0;
     for (int i = 0; i < n; i++) {
-        uint64_t l = strlen(strs[i]) + 1;
-        memcpy(blk + off, strs[i], l);
-        off += l;
+        memcpy(blk + off, strs[i], lens[i]);
+        off += lens[i];
     }
     blk[total] = 0;
     *out = blk;
@@ -214,6 +231,7 @@ __attribute__((unused)) static long file_read(struct file *f, void *buf, uint64_
 #define O_CREAT 0x40
 #define O_TRUNC 0x200
 #define O_CLOEXEC 0x80000
+#define E2BIG    7
 
 // cap for one read/write: user_range_ok walks every 4k page, an
 // unchecked SIZE_MAX count would spin the walker forever
@@ -845,8 +863,17 @@ static uint64_t sys_execve(struct regs *r) {
 
     // capture argv/envp before the image swap; blocks freed below
     exec_args_t ea = { 0, 0, 0, 0 };
-    capture_strv(r->rsi, &ea.argv, &ea.argc);
-    capture_strv(r->rdx, &ea.envp, &ea.envc);
+    int rc = capture_strv(r->rsi, &ea.argv, &ea.argc);
+    if (!rc)
+        rc = capture_strv(r->rdx, &ea.envp, &ea.envc);
+    if (rc) {
+        if (ea.argv)
+            kfree(ea.argv);
+        r->rax = rc == -2 ? (uint64_t)-EFAULT
+               : rc == -1 ? (uint64_t)-E2BIG
+                          : (uint64_t)-ENOMEM;
+        return (uint64_t)r;
+    }
 
     uint64_t fr = task_execve(vn, path, &ea);
     if (!fr) {
