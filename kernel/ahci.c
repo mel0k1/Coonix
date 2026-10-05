@@ -128,10 +128,27 @@ static int issue(uint8_t cmd, uint64_t lba, uint16_t count, int write) {
     wr32(p, PxIS, 0xffffffffu);
     wr32(p, PxCI, 1);
 
-    int rc = spin(p, PxCI, 1, 0, 100000000);
-    uint32_t is = rd32(p, PxIS);
-    if (rc < 0 || (is & ((1u << 31) | (1u << 30) | (1u << 29))))
-        return -1;   // timeout or tfes/hbf
+    // wait for completion, but watch the error bits too: a failed command
+    // never clears PxCI, so a plain spin would burn the whole budget on a
+    // dead port for every sector
+    uint32_t is = 0;
+    int rc = -1;
+    uint32_t fatal = (1u << 31) | (1u << 30) | (1u << 29);   // tfes/hbds/hbf
+    for (uint64_t t = 0; t < 100000000; t++) {
+        is = rd32(p, PxIS);
+        if (is & fatal)
+            break;
+        if (!(rd32(p, PxCI) & 1)) {
+            rc = 0;
+            break;
+        }
+    }
+    if (rc < 0) {
+        // retire the stuck slot and the seen interrupt bits (w1c)
+        wr32(p, PxCI, 1);
+        wr32(p, PxIS, is | fatal);
+        return -1;
+    }
     return rc;
 }
 

@@ -145,6 +145,10 @@ static int transfer(uint64_t lba, uint16_t count, void *buf, int write) {
     if (lba + count > max_lba)   // max_lba holds the sector count now
         return -1;
 
+    // lba48 register setup must hit an idle bus: command writes while
+    // BSY is set get dropped or corrupt the transfer
+    if (status_wait(0) < 0)
+        return -1;
     outb(ATA_DRIVE, 0x40 | ((lba >> 24) & 0x0f));
     status_wait(0);   // not busy
 
@@ -168,6 +172,10 @@ static int transfer(uint64_t lba, uint16_t count, void *buf, int write) {
             insw(ATA_DATA, p, ATA_SECTOR / 2);
     }
     if (write) {
+        // let the data out finish before commanding a flush: writing a
+        // command register while BSY is set is a protocol violation
+        if (status_wait(0) < 0)
+            return -1;
         outb(ATA_STATUS, CMD_FLUSH_EXT);
         if (status_wait(0) < 0)
             return -1;
