@@ -48,7 +48,8 @@ int pci_find_class(uint8_t class, uint8_t subclass,
                     if (fn) *fn = f;
                     if (bar5) {
                         uint32_t v = pci_read32(b, d, f, 0x24);
-                        *bar5 = v & 0xfffffff0u;
+                        // bar bit0: 1 = io ports (mask 3), 0 = mmio (mask 15)
+                        *bar5 = v & (v & 1 ? 0xfffffffcu : 0xfffffff0u);
                     }
                     return 1;
                 }
