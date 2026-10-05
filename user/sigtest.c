@@ -156,9 +156,9 @@ int main(void) {
         _exit(0);
     }
     int st = 0;
-    waitpid(pid, &st, 0);
+    pid_t wrc = waitpid(pid, &st, 0);
     if (!WIFSIGNALED(st) || WTERMSIG(st) != SIGTERM) {
-        printf("sigtest: wait status %#x, want SIGTERM death\n", st);
+        printf("sigtest: rc=%d status %#x, want SIGTERM death\n", wrc, st);
         return 1;
     }
     printf("sigtest: child death by signal reported correctly\n");
