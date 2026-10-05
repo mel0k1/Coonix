@@ -4,10 +4,15 @@
 #include "console.h"
 #include "string.h"
 
+// fail closed on a 2m leaf (limine maps kernel/hhdm with big pages):
+// descending into it would write ptes into the middle of a data frame
 static uint64_t *next_level(uint64_t *table, uint64_t idx, uint64_t flags) {
     uint64_t e = table[idx];
-    if (e & VMM_PRESENT)
+    if (e & VMM_PRESENT) {
+        if (e & 0x080)
+            return 0;
         return phys2virt(e & 0x000ffffffffff000ULL);
+    }
     uint64_t phys = (uint64_t)pmm_alloc_zeroed(); // phys addr as pointer
     if (!phys)
         return 0;
@@ -57,6 +62,7 @@ void vmm_unmap(uint64_t pml4_phys, uint64_t vaddr) {
     uint64_t *pd = phys2virt(e & 0x000ffffffffff000ULL);
     e = pd[(vaddr >> 21) & 0x1ff];
     if (!(e & VMM_PRESENT)) return;
+    if (e & 0x080) return;   // 2m leaf: not ours to unmap
     uint64_t *pt = phys2virt(e & 0x000ffffffffff000ULL);
     pt[(vaddr >> 12) & 0x1ff] = 0;
     __asm__ volatile("invlpg (%0)" :: "r"(vaddr) : "memory");
@@ -72,6 +78,8 @@ uint64_t vmm_get_phys(uint64_t pml4_phys, uint64_t vaddr) {
     uint64_t *pd = phys2virt(e & 0x000ffffffffff000ULL);
     e = pd[(vaddr >> 21) & 0x1ff];
     if (!(e & VMM_PRESENT)) return 0;
+    if (e & 0x080)   // 2m leaf: the pd entry is the mapping
+        return (e & 0x000ffffffffff000ULL) + (vaddr & 0x1fffff);
     uint64_t *pt = phys2virt(e & 0x000ffffffffff000ULL);
     e = pt[(vaddr >> 12) & 0x1ff];
     if (!(e & VMM_PRESENT)) return 0;
@@ -88,6 +96,8 @@ uint64_t vmm_get_pte(uint64_t pml4_phys, uint64_t vaddr) {
     uint64_t *pd = phys2virt(e & 0x000ffffffffff000ULL);
     e = pd[(vaddr >> 21) & 0x1ff];
     if (!(e & VMM_PRESENT)) return 0;
+    if (e & 0x080)   // 2m leaf: report the pd entry itself
+        return e;
     uint64_t *pt = phys2virt(e & 0x000ffffffffff000ULL);
     return pt[(vaddr >> 12) & 0x1ff];
 }
@@ -144,6 +154,8 @@ void vmm_mprotect(uint64_t pml4, uint64_t vaddr, uint64_t pages, uint64_t flags)
         uint64_t e3 = pd[(va >> 21) & 0x1ff];
         if (!(e3 & VMM_PRESENT))
             continue;
+        if (e3 & 0x080)
+            continue;   // 2m leaf: skip, user pages are always 4k
         uint64_t *pt = phys2virt(e3 & 0x000ffffffffff000ULL);
         uint64_t *pte = &pt[(va >> 12) & 0x1ff];
         if (!(*pte & VMM_PRESENT))
@@ -201,6 +213,10 @@ void vmm_destroy_user(uint64_t pml4_phys) {
             for (int k = 0; k < 512; k++) {
                 if (!(pd[k] & VMM_PRESENT))
                     continue;
+                if (pd[k] & 0x080) {   // 2m leaf: free the frame itself
+                    pmm_free((void *)(pd[k] & 0x000ffffffffff000ULL));
+                    continue;
+                }
                 uint64_t *pt = phys2virt(pd[k] & 0x000ffffffffff000ULL);
                 for (int m = 0; m < 512; m++)
                     if (pt[m] & VMM_PRESENT)
