@@ -22,13 +22,14 @@ static long pfs_read(struct vnode *vn, void *buf, uint64_t off, uint64_t len);
 static int pfs_readdir(struct vnode *dir, uint64_t *ctx, uint64_t *ino,
                        int *type, char *name, int name_cap);
 static long pfs_readlink(struct vnode *vn, char *buf, uint64_t size);
+static void pfs_release(struct vnode *vn);
 
 // vfs_ops order: lookup read write create truncate readdir unlink mkdir
-//                rmdir readlink symlink truncate_to chmod link
+//                rmdir readlink symlink truncate_to chmod link release
 struct vfs_ops pfs_ops = {
     pfs_lookup, pfs_read, 0, 0, 0,
     pfs_readdir, 0, 0, 0,
-    pfs_readlink, 0, 0, 0, 0, 0
+    pfs_readlink, 0, 0, 0, 0, pfs_release
 };
 
 // --- node pool ---------------------------------------------------------
@@ -85,41 +86,48 @@ static struct vnode *pnode_get(int kind, int pid, int which) {
         if (pool[i].used && pool[i].vn.ino == ino)
             return &pool[i].vn;
 
-    for (int i = 0; i < POOL_N; i++) {
-        if (!pool[i].used) {
-            struct pnode *pn = &pool[i];
-            memset(pn, 0, sizeof(*pn));
-            pn->used = 1;
-            pn->kind = kind;
-            pn->pid = pid;
-            pn->which = which;
-            pn->vn.ops = &pfs_ops;
-            pn->vn.fs_data = pn;
-            pn->vn.ino = ino;
-            pn->vn.dev = 0x5052;       // "PR": pseudo-fs device id
-            switch (kind) {
-            case PN_ROOT:
-            case PN_PIDDIR:
-            case PN_FDDIR:
-                pn->vn.type = VNODE_DIR;
-                pn->vn.mode = 0x4000 | 0555;
-                pn->vn.size = 4096;
-                break;
-            case PN_LNK:
-            case PN_FDLNK:
-                pn->vn.type = VNODE_LNK;
-                pn->vn.mode = 0xA000 | 0777;
-                pn->vn.size = 0;       // filled per lookup
-                break;
-            default:
-                pn->vn.type = VNODE_FILE;
-                pn->vn.mode = 0x8000 | 0444;
-                pn->vn.size = 0;       // generated content, sized on read
-            }
-            return &pn->vn;
-        }
+    // free slot first, then recycle a slot no fd holds: stat-style walks
+    // never open anything, so without recycling the pool would exhaust
+    // and /proc would start failing after enough distinct lookups
+    struct pnode *pn = 0;
+    for (int i = 0; i < POOL_N && !pn; i++)
+        if (!pool[i].used)
+            pn = &pool[i];
+    for (int i = 0; i < POOL_N && !pn; i++)
+        if (pool[i].vn.refs == 0)
+            pn = &pool[i];
+    if (!pn)
+        return 0;
+
+    memset(pn, 0, sizeof(*pn));
+    pn->used = 1;
+    pn->kind = kind;
+    pn->pid = pid;
+    pn->which = which;
+    pn->vn.ops = &pfs_ops;
+    pn->vn.fs_data = pn;
+    pn->vn.ino = ino;
+    pn->vn.dev = 0x5052;       // "PR": pseudo-fs device id
+    switch (kind) {
+    case PN_ROOT:
+    case PN_PIDDIR:
+    case PN_FDDIR:
+        pn->vn.type = VNODE_DIR;
+        pn->vn.mode = 0x4000 | 0555;
+        pn->vn.size = 4096;
+        break;
+    case PN_LNK:
+    case PN_FDLNK:
+        pn->vn.type = VNODE_LNK;
+        pn->vn.mode = 0xA000 | 0777;
+        pn->vn.size = 0;       // filled per lookup
+        break;
+    default:
+        pn->vn.type = VNODE_FILE;
+        pn->vn.mode = 0x8000 | 0444;
+        pn->vn.size = 0;       // generated content, sized on read
     }
-    return 0;
+    return &pn->vn;
 }
 
 // task_table scan: the process (tgid leader) behind a pid, 0 if gone
@@ -632,6 +640,15 @@ static long pfs_readlink(struct vnode *vn, char *buf, uint64_t size) {
     long r = pfs_readlink_impl(vn, buf, size);
     PFS_LEAVE;
     return r;
+}
+
+// last struct file closed: the pool slot goes back into service
+static void pfs_release(struct vnode *vn) {
+    PFS_ENTER;
+    struct pnode *pn = (struct pnode *)vn->fs_data;
+    if (pn && vn->refs == 0)
+        pn->used = 0;
+    PFS_LEAVE;
 }
 
 struct vnode *procfs_mount(struct vnode *mp_parent) {
