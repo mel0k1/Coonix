@@ -277,8 +277,12 @@ static struct e2_node *node_get(uint32_t ino) {
     int type = n->inode.mode & E2_IFMT;
     n->vn.type = type == E2_IFDIR ? VNODE_DIR
                : type == E2_IFLNK ? VNODE_LNK : VNODE_FILE;
+    // fast symlink: target lives in i_block (<= 60 bytes); slow one uses
+    // real blocks, so its size is just the inode size
+    int fast_lnk = type == E2_IFLNK && n->inode.blocks512 == 0;
     n->vn.size = type == E2_IFLNK
-        ? (n->inode.size_lo > 60 ? 60 : n->inode.size_lo)   // fast symlink
+        ? (fast_lnk ? (n->inode.size_lo > 60 ? 60 : n->inode.size_lo)
+                    : n->inode.size_lo)
         : n->inode.size_lo;
     n->vn.mode = n->inode.mode;
     n->vn.ops = &e2_ops;
@@ -586,6 +590,12 @@ static long e2_read_impl(struct vnode *vn, void *buf, uint64_t off, uint64_t len
                     pos + d->rec_len > BLK_SIZE)
                     break;
                 if (d->ino) {
+                    // corrupt dirent: name must stay inside the block,
+                    // else the copy runs past it and floods the list
+                    if (pos + sizeof(*d) + d->name_len > BLK_SIZE)
+                        break;
+                    if (p + d->name_len + 1 > cap)
+                        break;   // listing buffer is capped, keep it so
                     memcpy(list + p, raw + pos + sizeof(*d), d->name_len);
                     p += d->name_len;
                     list[p++] = '\n';
@@ -1074,12 +1084,19 @@ static long e2_readlink_impl(struct vnode *vn, char *buf, uint64_t size) {
     if (n->dead || vn->type != VNODE_LNK)
         return -1;
     uint64_t len = n->inode.size_lo;
-    if (len > 60)
-        len = 60;
+    if (n->inode.blocks512 == 0) {
+        // fast: target lives in i_block
+        if (len > 60)
+            len = 60;
+        if (len > size)
+            len = size;
+        memcpy(buf, (const char *)n->inode.block, len);
+        return (long)len;
+    }
+    // slow: target sits in data blocks, read it like a file
     if (len > size)
         len = size;
-    memcpy(buf, (const char *)n->inode.block, len);
-    return (long)len;
+    return e2_read_impl(vn, buf, 0, len);
 }
 
 static int e2_truncate_to_impl(struct vnode *vn, uint64_t size) {
