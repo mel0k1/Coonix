@@ -66,7 +66,16 @@ void console_putc(char c) {
         return;
     }
     if (c == '\r') { cx = 0; return; }
-    if (c == '\t') { cx = (cx + 8) & ~7; return; }
+    if (c == '\t') {
+        cx = (cx + 8) & ~7;
+        // a tab near the edge can land past the last column: the next
+        // draw_char would write behind the framebuffer line
+        if (cx >= cols) {
+            cx = 0;
+            if (++cy >= rows) { cy = rows - 1; scroll(); }
+        }
+        return;
+    }
     if (c == '\b') { if (cx) cx--; return; }
     draw_char(cx * 8, cy * 8, c);
     if (++cx >= cols) {
