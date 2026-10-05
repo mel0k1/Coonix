@@ -6,10 +6,16 @@
 #include "serial.h"
 
 struct chunk {
-    size_t size;
+    size_t size;          // payload bytes, 16-aligned
     struct chunk *next;
     int used;
+    size_t magic;         // HEAP_MAGIC while allocated, 0 when free
 };
+
+#define HEAP_MAGIC 0x4b4d454d41474943ULL
+
+// header is 32 bytes: chunk vas and payloads stay 16-aligned no matter
+// how splits carve the block
 
 #define HEAP_CHUNK_PAGES 16   // grow heap by 64k at a time
 
@@ -51,6 +57,7 @@ static void heap_grow(size_t bytes) {
     struct chunk *c = (struct chunk *)tail_vaddr;
     c->size = npages * PAGE_SIZE - sizeof(struct chunk);
     c->used = 0;
+    c->magic = 0;
     c->next = 0;
     if (!head) {
         head = c;
@@ -76,11 +83,13 @@ static void *heap_scan(size_t size) {
                 struct chunk *rest = (struct chunk *)((uint64_t)c + sizeof(struct chunk) + size);
                 rest->size = c->size - size - sizeof(struct chunk);
                 rest->used = 0;
+                rest->magic = 0;
                 rest->next = c->next;
                 c->next = rest;
                 c->size = size;
             }
             c->used = 1;
+            c->magic = HEAP_MAGIC;
             return (void *)((uint64_t)c + sizeof(struct chunk));
         }
     }
@@ -117,6 +126,8 @@ void kfree(void *ptr) {
         return;
     HEAP_ENTER;
     struct chunk *c = (struct chunk *)((uint64_t)ptr - sizeof(struct chunk));
+    if (c->magic != HEAP_MAGIC)
+        panic("kfree: bad or double free");
     // poison freed payload: a use-after-free shows up as 0xdd patterns
     {
         uint64_t *p = (uint64_t *)ptr;
@@ -124,6 +135,7 @@ void kfree(void *ptr) {
             p[i] = 0xddddddddddddddddULL;
     }
     c->used = 0;
+    c->magic = 0;
     // simple coalesce forward
     struct chunk *n;
     while ((n = c->next) && !n->used && (uint64_t)n == (uint64_t)c + sizeof(struct chunk) + c->size) {
