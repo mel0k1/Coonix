@@ -35,11 +35,41 @@ static struct futex_q **bucket_of(uint64_t key) {
     return &buckets[(key >> 12) % FUT_HASH];
 }
 
+// drop a task's queue entry: signal wakes, syscall replay and task death
+// must not leave a stale node behind, or a later futex_wake burns a wake
+// slot on it (lost wakeup for a real waiter) and the node leaks
+static void futex_cancel(struct task *t) {
+    struct futex_q *q = (struct futex_q *)t->futex_ent;
+    if (!q)
+        return;
+    t->futex_ent = 0;
+    struct futex_q **pp = bucket_of(q->key);
+    while (*pp) {
+        if (*pp == q) {
+            *pp = q->next;
+            kfree(q);
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+void futex_cancel_wait(struct task *t) {
+    // flags save/restore: callers may already run with cli (exit paths)
+    uint64_t fl;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl));
+    futex_cancel(t);
+    __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory");
+}
+
 uint64_t futex_wait_key(uint64_t key, uint64_t deadline, uint64_t frame_rsp) {
     // interrupts off for the whole enqueue+block: the tick must not land
     // between the state change and the schedule pick, or the task ends up
     // schedulable with a kernel context instead of its syscall frame
     cli();
+    // a signal-woken waiter re-executes the syscall here with its old
+    // entry still queued: drop it before queueing a fresh one
+    futex_cancel(current);
     struct futex_q *q = kmalloc(sizeof(*q));
     if (!q) {
         // out of memory: fail the syscall in-place, stay runnable
@@ -54,6 +84,7 @@ uint64_t futex_wait_key(uint64_t key, uint64_t deadline, uint64_t frame_rsp) {
     struct futex_q **head = bucket_of(key);
     q->next = *head;          // LIFO wake is fine for round-robin tests
     *head = q;
+    current->futex_ent = q;
     // deadlines live in q->deadline (futex_tick): drop any leftover sleep
     // state so the tick never fires a stale WAIT_SLEEP wake into the
     // futex frame
@@ -91,6 +122,7 @@ static int wake_match(int n, uint64_t key, int bitset) {
         struct futex_q *q = *pp;
         if (q->key == key && (bitset == (int)FUT_BITSET_ANY || (q->bitset & bitset) != 0)) {
             *pp = q->next;
+            q->t->futex_ent = 0;
             // a task woken by a signal while still queued is T_READY:
             // leave its frame alone, its resume path reports the result
             if (q->t->state == T_BLOCKED) {
@@ -145,6 +177,7 @@ void futex_tick(void) {
             struct futex_q *q = *pp;
             if (q->deadline && now >= q->deadline) {
                 *pp = q->next;
+                q->t->futex_ent = 0;
                 if (q->t->state == T_BLOCKED) {
                     task_frame_syscall_result(q->t, -110);   // -ETIMEDOUT
                     q->t->state = T_READY;

@@ -4,6 +4,8 @@
 #pragma once
 #include <stdint.h>
 
+struct task;
+
 void futex_init(void);
 
 // op values we honor (after stripping FUTEX_PRIVATE_FLAG)
@@ -32,6 +34,8 @@ int futex_wake_key(uint64_t key, int n);
 int futex_requeue_key(uint64_t key1, uint64_t key2, int n);
 // expire deadlines (called from the timer tick)
 void futex_tick(void);
+// unlink a task's queue entry (signal wake, task death). no-op if none
+void futex_cancel_wait(struct task *t);
 // futex-wake by user address (clear_child_tid path)
 void futex_wake_addr(uint64_t uaddr, int n);
 // physical key for a user word, 0 if unmapped

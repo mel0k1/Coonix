@@ -4,6 +4,7 @@
 #include "serial.h"
 #include "syscall.h"
 #include "vmm.h"
+#include "futex.h"
 
 // minimal errno set for signals
 #define EPERM    1
@@ -137,7 +138,11 @@ int signal_send_task(struct task *t, int sig) {
     if (t->state != T_BLOCKED)
         return 0;
     if (t->wait_reason != WAIT_SIGNAL) {
-        // generic replay wake: read/pipe/kbd/wait4 re-run their syscall
+        // generic replay wake: read/pipe/kbd/wait4 re-run their syscall.
+        // futex waiters park with no wait_reason: their queue entry must
+        // leave the bucket, or a later futex_wake burns a slot on the
+        // stale node and a real waiter never wakes
+        futex_cancel_wait(t);
         t->state = T_READY;
         return 0;
     }

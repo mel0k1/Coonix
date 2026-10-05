@@ -48,6 +48,7 @@ struct task {
     int sig_death;        // exit_code was a killing signal
     int wait_reason;      // WAIT_*
     void *wait_pipe;      // WAIT_PIPE: which pipe we sit on
+    void *futex_ent;      // futex queue entry while blocked on a futex
     struct task *parent;
     uint64_t rsp;         // kernel rsp (top: struct regs)
     uint64_t kstack_top;  // virtual

@@ -16,6 +16,7 @@ void task_frame_syscall_result(struct task *t, long ret);
 #include "heap.h"
 #include "vfs.h"
 #include "signal.h"
+#include "futex.h"
 
 #define MAP_SHARED 0x01
 #define PTE_DIRTY  0x040
@@ -862,13 +863,15 @@ int task_count_group(int tgid, struct task *except) {
 // the kernel stack cannot be unmapped while we run on it, so it goes to
 // the reap queue for the idle task
 static void task_thread_release(struct task *t, int self) {
+    // a blocked-in-futex death must not leave its queue entry behind:
+    // the stale node steals wake slots and leaks
+    futex_cancel_wait(t);
     // joiners watch *child_tid: zero it and wake the futex; the pointer
     // was validated at set_tid_address/clone time, re-check before the
     // write in case user unmapped it since
     uint64_t ct = t->child_tid ? t->child_tid : t->clear_tid;
     if (ct && task_user_range_ok(t, ct, 4, 1)) {
         *(uint32_t *)ct = 0;
-        extern void futex_wake_addr(uint64_t uaddr, int n);
         futex_wake_addr(ct, -1);
     }
     task_close_fds(t, 0);
