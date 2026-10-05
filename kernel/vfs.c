@@ -86,6 +86,8 @@ static struct vnode *resolve_from(struct vnode *start, const char *path,
         while (path[i] && path[i] != '/') {
             if (len < (int)sizeof(comp) - 1)
                 comp[len++] = path[i];
+            else
+                return 0;   // too long: fail the lookup, never truncate
             i++;
         }
         comp[len] = 0;
@@ -255,6 +257,8 @@ static struct vnode *resolve_parent(const char *path, char *name, int nsize) {
         while (path[i] && path[i] != '/') {
             if (len < (int)sizeof(comp) - 1)
                 comp[len++] = path[i];
+            else
+                return 0;   // too long: fail the lookup, never truncate
             i++;
         }
         comp[len] = 0;
@@ -267,8 +271,9 @@ static struct vnode *resolve_parent(const char *path, char *name, int nsize) {
                 break;
             }
         if (last) {
-            strncpy(name, comp, nsize - 1);
-            name[nsize - 1] = 0;
+            if (len >= nsize)
+                return 0;   // caller buffer can't hold the name
+            strcpy(name, comp);
             return vn;
         }
         struct vnode *c = mount_check(vn, comp);
