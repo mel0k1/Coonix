@@ -454,18 +454,28 @@ struct task *task_spawn_user(const char *path, struct task *parent) {
         return 0;
 
     struct task *t = task_find_free();
-    if (!t)
+    if (!t) {
+        kfree(image);
         return 0;
+    }
     memset(t, 0, sizeof(*t));
     t->pid = pid_alloc();
     t->tgid = t->pid;         // fresh process: own group
-    if (!t->pid)
+    if (!t->pid) {
+        t->state = T_FREE;
+        kfree(image);
         return 0;
+    }
     t->pgid = t->pid;
     t->parent = parent;
     t->start_tick = pit_ticks();
 
     uint64_t pml4 = vmm_create_pml4();
+    if (!pml4) {
+        t->state = T_FREE;
+        kfree(image);
+        return 0;
+    }
     t->pml4 = pml4;
     map_kstack(t);
     kgs_init(t);
@@ -475,13 +485,18 @@ struct task *task_spawn_user(const char *path, struct task *parent) {
     uint64_t eflags;
     __asm__ volatile("pushfq; popq %0" : "=r"(eflags));
     cli();
+    uint64_t prev_cr3 = vmm_kernel_pml4();
     struct elf_info ei;
     uint64_t entry = elf_load_user_info(t->pml4, image, size, &ei);
     kfree(image);
     __asm__ volatile("pushq %0; popfq" :: "r"(eflags) : "memory");
 
     if (!entry) {
+        // elf loader may have left us on the new pml4: go back, then clean up
+        if (vmm_kernel_pml4() != prev_cr3)
+            vmm_switch(prev_cr3);
         vmm_destroy_user(pml4);
+        free_kstack(t);
         t->state = T_FREE;
         return 0;
     }
@@ -549,6 +564,11 @@ uint64_t task_execve(struct vnode *vn, const char *name,
 
     uint64_t old_cr3 = vmm_kernel_pml4();
     uint64_t pml4 = vmm_create_pml4();
+    if (!pml4) {
+        kfree(image);
+        __asm__ volatile("pushq %0; popfq" :: "r"(eflags) : "memory");
+        return 0;
+    }
     struct elf_info ei;
     uint64_t entry = elf_load_user_info(pml4, image, size, &ei);
     kfree(image);
