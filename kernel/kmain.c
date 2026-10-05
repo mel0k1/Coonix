@@ -173,6 +173,7 @@ void kmain(void) {
     print_num(pmm_total_mem() >> 20);
     console_puts(" MB free\n");
 
+    idt_setup_ist();   // df/nmi/mc get private stacks from here on
     heap_init();
     // smoke test the heap
     void *a = kmalloc(1234);

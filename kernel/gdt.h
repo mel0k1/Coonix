@@ -13,3 +13,6 @@ void gdt_init(void);
 
 // called from task switch, sets TSS.rsp0
 void tss_set_rsp0(uint64_t rsp);
+
+// ist slot (0-based) for exception stacks
+void tss_set_ist(int idx, uint64_t va);

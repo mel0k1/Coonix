@@ -1,12 +1,17 @@
 #include "idt.h"
 #include "kernel.h"
 #include "gdt.h"
+#include "pmm.h"
 #include "console.h"
 #include "serial.h"
 #include "string.h"
 #include "task.h"
 #include "vmm.h"
 #include "signal.h"
+
+// private exception stacks, mapped once pmm is up (idt_init runs before)
+#define IST_VA_BASE 0xffffa00000000000ULL
+#define IST_PAGES 8
 
 struct idt_entry {
     uint16_t offset_low;
@@ -34,11 +39,11 @@ static const char *exc_names[32] = {
     "security exception", "reserved"
 };
 
-static void set_gate(int n, void *handler, uint8_t type_attr) {
+static void set_gate(int n, void *handler, uint8_t type_attr, uint8_t ist) {
     uint64_t addr = (uint64_t)handler;
     idt[n].offset_low = addr & 0xffff;
     idt[n].selector = SEL_KCODE;
-    idt[n].ist = 0;
+    idt[n].ist = ist;
     idt[n].type_attr = type_attr;
     idt[n].offset_mid = (addr >> 16) & 0xffff;
     idt[n].offset_high = (addr >> 32) & 0xffffffff;
@@ -47,9 +52,9 @@ static void set_gate(int n, void *handler, uint8_t type_attr) {
 
 void idt_init(void) {
     for (int i = 0; i < 256; i++)
-        set_gate(i, isr_stub_table[i], 0x8e);
+        set_gate(i, isr_stub_table[i], 0x8e, 0);
     // syscall gate: DPL3 so user code can int 0x80
-    set_gate(128, isr_stub_table[128], 0xee);
+    set_gate(128, isr_stub_table[128], 0xee, 0);
 
     struct {
         uint16_t limit;
@@ -68,6 +73,27 @@ void idt_init(void) {
     outb(0xa1, 0x01); io_wait();
     outb(0x21, 0x00);
     outb(0xa1, 0x00);
+}
+
+// df/nmi/mc must not run on the interrupted stack: it may be the thing
+// that faulted (df) or a half-switched scheduler frame (nmi). private
+// ist stacks give the panic path a guaranteed-good rsp. runs after pmm
+void idt_setup_ist(void) {
+    static const struct { int vec, slot; } map[3] = {
+        { 8, 1 }, { 2, 2 }, { 18, 3 }   // df, nmi, mc
+    };
+    for (int i = 0; i < 3; i++) {
+        uint64_t va = IST_VA_BASE + i * IST_PAGES * PAGE_SIZE;
+        for (int p = 0; p < IST_PAGES; p++) {
+            void *pg = pmm_alloc();
+            if (!pg)
+                panic("idt: no mem for ist");
+            vmm_map(vmm_kernel_pml4(), va + p * PAGE_SIZE, (uint64_t)pg,
+                    VMM_PRESENT | VMM_WRITE | VMM_NX);
+        }
+        tss_set_ist(map[i].slot - 1, va + IST_PAGES * PAGE_SIZE);
+        set_gate(map[i].vec, isr_stub_table[map[i].vec], 0x8e, map[i].slot);
+    }
 }
 
 // irq numbering: 0 = PIT (vector 32), 1 = kbd (vector 33), ...

@@ -12,5 +12,6 @@ struct regs {
 typedef void (*irq_handler_t)(struct regs *r);
 
 void idt_init(void);
+void idt_setup_ist(void);   // df/nmi/mc private stacks, after pmm_init
 void irq_install(int irq, irq_handler_t h);
 void irq_uninstall(int irq);

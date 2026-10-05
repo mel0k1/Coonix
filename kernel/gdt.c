@@ -25,6 +25,11 @@ void tss_set_rsp0(uint64_t rsp) {
     tss.rsp0 = rsp;
 }
 
+// ist[idx] (0-based) = va; cpu switches to it when a gate names the slot
+void tss_set_ist(int idx, uint64_t va) {
+    tss.ist[idx] = va;
+}
+
 static void set_entry(int i, uint32_t base, uint32_t limit, uint8_t access, uint8_t gran) {
     uint64_t e = 0;
     e |= (uint64_t)(limit & 0xffff);
