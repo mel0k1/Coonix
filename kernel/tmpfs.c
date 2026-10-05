@@ -187,8 +187,12 @@ static int tmpfs_rmdir(struct vnode *dir, const char *name) {
             if (dead->type != VNODE_DIR || dead->child)
                 return -1;
             *pp = dead->sibling;
-            kfree(dead);
-            nnodes--;
+            // detach, keep alive while open fds still point at it
+            // (same contract as unlink: a blind kfree here is a UAF)
+            dead->sibling = 0;
+            dead->parent = 0;
+            dead->unlinked = 1;
+            tmpfs_release(&dead->vn);
             return 0;
         }
         pp = &(*pp)->sibling;

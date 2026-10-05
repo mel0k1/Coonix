@@ -46,6 +46,7 @@ static struct vnode *e2_symlink_impl(struct vnode *dir, const char *name,
 static int e2_truncate_to_impl(struct vnode *vn, uint64_t size);
 static int e2_chmod_impl(struct vnode *vn, uint32_t mode);
 static int e2_link_impl(struct vnode *dir, struct vnode *vn, const char *name);
+static void e2_release(struct vnode *vn);
 
 // cli-guarded public ops (wrappers live at the bottom)
 static struct vnode *e2_lookup(struct vnode *dir, const char *name);
@@ -68,7 +69,7 @@ static int e2_link(struct vnode *dir, struct vnode *vn, const char *name);
 struct vfs_ops e2_ops = {
     e2_lookup, e2_read, e2_write, e2_create, e2_truncate,
     e2_readdir, e2_unlink, e2_mkdir, e2_rmdir, e2_readlink, e2_symlink,
-    e2_truncate_to, e2_chmod, e2_link, 0
+    e2_truncate_to, e2_chmod, e2_link, e2_release
 };
 
 
@@ -223,6 +224,7 @@ void ext2_sync(void) {
 
 struct e2_node {
     uint32_t ino;
+    int dead;              // unlinked with fds still open: zombie slot
     struct e2_inode inode;
     struct vnode vn;       // fs_data points back here
 };
@@ -238,7 +240,7 @@ static struct e2_node *node_get(uint32_t ino) {
     // load from disk
     struct e2_node *n = 0;
     for (int i = 0; i < NODE_CACHE; i++)
-        if (!nodes[i].ino) {
+        if (!nodes[i].ino && !nodes[i].dead) {
             n = &nodes[i];
             break;
         }
@@ -383,14 +385,25 @@ static void inode_rollback(uint32_t ino) {
     }
 }
 
-// free an inode: bitmap + cached node slot. the slot is wiped wholesale;
-// a vnode still held by an open fd keeps its ops pointer as a dangling
-// copy (we never re-check fs_data) — unlink-while-open is out of contract
-static void inode_free(uint32_t ino) {
-    inode_rollback(ino);
+// unlink/rmdir: drop the on-disk inode now; the cached slot survives as
+// a dead node while open fds hold the vnode (ops stay valid, data reads
+// return 0, writes fail). e2_release wipes the slot at the last close
+static void blk_free_chain(struct e2_inode *in);
+static void inode_detach(struct e2_node *n) {
+    blk_free_chain(&n->inode);
+    inode_rollback(n->ino);
+    memset(&n->inode, 0, sizeof(n->inode));
+    n->ino = 0;              // node_get must not hand the slot out again
+    if (n->vn.refs > 0) {
+        n->dead = 1;
+        return;
+    }
     for (int k = 0; k < NODE_CACHE; k++)
-        if (nodes[k].ino == ino)
+        if (&nodes[k] == n) {
             memset(&nodes[k], 0, sizeof(nodes[k]));
+            return;
+        }
+    kfree(n);   // uncached side alloc from node_get
 }
 
 // -- block mapping: index -> device block, with allocation ------------------
@@ -551,6 +564,8 @@ static void blk_free_chain(struct e2_inode *in) {
 
 static long e2_read_impl(struct vnode *vn, void *buf, uint64_t off, uint64_t len) {
     struct e2_node *n = vn->fs_data;
+    if (n->dead)
+        return 0;   // unlinked under an open fd: data is gone
 
     if (n->vn.type == VNODE_DIR) {
         // same contract as tmpfs: read() on a dir yields "name\n" listing
@@ -621,6 +636,8 @@ static long e2_read_impl(struct vnode *vn, void *buf, uint64_t off, uint64_t len
 
 static long e2_write_impl(struct vnode *vn, const void *buf, uint64_t off, uint64_t len) {
     struct e2_node *n = vn->fs_data;
+    if (n->dead)
+        return -1;   // no dirent backs this node anymore
     if (vn->type != VNODE_FILE)
         return -1;
 
@@ -768,7 +785,7 @@ static struct vnode *e2_create_impl(struct vnode *dir, const char *name) {
 
 static int e2_truncate_impl(struct vnode *vn) {
     struct e2_node *n = vn->fs_data;
-    if (vn->type != VNODE_FILE)
+    if (n->dead || vn->type != VNODE_FILE)
         return -1;
     blk_free_chain(&n->inode);
     n->inode.size_lo = 0;
@@ -904,8 +921,7 @@ static int e2_unlink_impl(struct vnode *dir, const char *name) {
         n->inode.links--;
         inode_sync(n);
     } else {
-        blk_free_chain(&n->inode);
-        inode_free(n->ino);
+        inode_detach(n);
     }
     ext2_sync();
     return 0;
@@ -1007,8 +1023,7 @@ static int e2_rmdir_impl(struct vnode *dir, const char *name) {
     }
     if (dirent_remove(d, name) < 0)
         return -1;
-    blk_free_chain(&n->inode);
-    inode_free(n->ino);
+    inode_detach(n);
     if (d->inode.links)
         d->inode.links--;
     inode_sync(d);
@@ -1056,7 +1071,7 @@ static struct vnode *e2_symlink_impl(struct vnode *dir, const char *name,
 
 static long e2_readlink_impl(struct vnode *vn, char *buf, uint64_t size) {
     struct e2_node *n = vn->fs_data;
-    if (vn->type != VNODE_LNK)
+    if (n->dead || vn->type != VNODE_LNK)
         return -1;
     uint64_t len = n->inode.size_lo;
     if (len > 60)
@@ -1069,7 +1084,7 @@ static long e2_readlink_impl(struct vnode *vn, char *buf, uint64_t size) {
 
 static int e2_truncate_to_impl(struct vnode *vn, uint64_t size) {
     struct e2_node *n = vn->fs_data;
-    if (vn->type != VNODE_FILE)
+    if (n->dead || vn->type != VNODE_FILE)
         return -1;
     if (size > 0xffffffffULL)
         return -1;   // inode size field is 32-bit here
@@ -1099,6 +1114,8 @@ static int e2_truncate_to_impl(struct vnode *vn, uint64_t size) {
 
 static int e2_chmod_impl(struct vnode *vn, uint32_t mode) {
     struct e2_node *n = vn->fs_data;
+    if (n->dead)
+        return -1;   // nowhere to sync a dead node's inode to
     n->inode.mode = (uint16_t)((n->inode.mode & E2_IFMT) | (mode & 07777));
     vn->mode = n->inode.mode;
     inode_sync(n);
@@ -1210,6 +1227,25 @@ static int e2_link(struct vnode *dir, struct vnode *vn, const char *name) {
     int r = e2_link_impl(dir, vn, name);
     E2_LEAVE;
     return r;
+}
+
+// last struct file closed: a dead (unlinked) node's slot is reclaimable
+static void e2_release_impl(struct vnode *vn) {
+    struct e2_node *n = vn->fs_data;
+    if (!n || !n->dead)
+        return;
+    for (int k = 0; k < NODE_CACHE; k++)
+        if (&nodes[k] == n) {
+            memset(&nodes[k], 0, sizeof(nodes[k]));
+            return;
+        }
+    kfree(n);   // uncached side alloc
+}
+
+static void e2_release(struct vnode *vn) {
+    E2_ENTER;
+    e2_release_impl(vn);
+    E2_LEAVE;
 }
 
 // -- mount -----------------------------------------------------------------
