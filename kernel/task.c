@@ -877,6 +877,9 @@ static void task_thread_release(struct task *t, int self) {
     task_close_fds(t, 0);
     task_mmap_teardown(t);        // own list copy: file refs back
     fpu_forget(t);
+    kfree(t->cmdline);            // threads carry no cmdline: kfree(0) ok
+    t->cmdline = 0;
+    t->cmdline_len = 0;
     if (self) {
         // keep the stack mapped, slot reuse frees it (see map_kstack)
         t->kgs = 0;
@@ -894,6 +897,17 @@ static uint64_t exit_common(int code, int sig_death, int force_group) {
     cli();
     int i_am_leader = current->pid == current->tgid;
     int others = task_count_group(current->tgid, current);
+    // capture the leader slot before any release: pids are unique among
+    // live tasks, so a non-free pid==tgid slot is really ours. a freed
+    // slot must never be re-marked — a recycled pid may already belong
+    // to a stranger
+    struct task *leader = 0;
+    if (!i_am_leader)
+        for (int i = 0; i < TASK_MAX; i++)
+            if (task_table[i].state != T_FREE &&
+                task_table[i].pid == current->tgid &&
+                task_table[i].tgid == current->tgid)
+                leader = &task_table[i];
     if (!force_group && !i_am_leader && others > 0) {
         // pthread_exit from a worker: only this thread goes away
         task_thread_release(current, 1);
@@ -919,6 +933,8 @@ static uint64_t exit_common(int code, int sig_death, int force_group) {
             struct task *t = &task_table[i];
             if (t == current || t->state == T_FREE || t->tgid != current->tgid)
                 continue;
+            if (t == leader && t->state == T_ZOMBIE)
+                continue;   // leader died first: keep its slot + exit code
             task_thread_release(t, 0);   // not running: safe to free now
         }
     }
@@ -942,20 +958,41 @@ static uint64_t exit_common(int code, int sig_death, int force_group) {
     }
     // leader slot stays for the parent's wait4 (zombie); an orphan group
     // has nobody to wait4 it: vanish instead
-    struct task *leader = 0;
-    for (int i = 0; i < TASK_MAX; i++)
-        if (task_table[i].tgid == current->tgid && task_table[i].pid == task_table[i].tgid)
-            leader = &task_table[i];
-    if (leader && leader->parent) {
-        leader->exit_code = code;
-        leader->sig_death = sig_death;
-        leader->state = T_ZOMBIE;
-        if (leader->parent->state == T_BLOCKED &&
-            leader->parent->wait_reason == WAIT_CHILD)
-            leader->parent->state = T_READY;
+    if (leader) {
+        if (leader->state == T_ZOMBIE) {
+            // the leader exited first: its exit code and zombie state are
+            // already what the parent must see, touch nothing
+            ;
+        } else if (leader->parent) {
+            // a live leader killed by this group exit: its slot becomes
+            // the zombie carrying our status
+            leader->exit_code = code;
+            leader->sig_death = sig_death;
+            leader->state = T_ZOMBIE;
+            if (leader->parent->state == T_BLOCKED &&
+                leader->parent->wait_reason == WAIT_CHILD)
+                leader->parent->state = T_READY;
+        }
     }
-    if (!leader || !leader->parent || current != leader) {
-        // stack stays mapped for slot reuse; we still run on it
+    if (i_am_leader) {
+        if (current->parent) {
+            current->exit_code = code;
+            current->sig_death = sig_death;
+            current->state = T_ZOMBIE;
+            if (current->parent->state == T_BLOCKED &&
+                current->parent->wait_reason == WAIT_CHILD)
+                current->parent->state = T_READY;
+        } else {
+            // stack stays mapped for slot reuse; we still run on it
+            current->kgs = 0;
+            current->state = T_FREE;
+        }
+    } else {
+        // worker finishing a group exit: the leader slot carries the
+        // status, this slot just goes away (kstack mapped until reuse)
+        kfree(current->cmdline);
+        current->cmdline = 0;
+        current->cmdline_len = 0;
         current->kgs = 0;
         current->state = T_FREE;
     }

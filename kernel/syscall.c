@@ -1185,10 +1185,15 @@ static uint64_t sys_wait4(struct regs *r) {
         struct task *t = &task_table[i];
         if (t->state == T_ZOMBIE && t->parent == current &&
             (want <= 0 || t->pid == want)) {
-            if (status)
+            if (status) {
                 *status = t->sig_death ? t->exit_code
                                        : (t->exit_code & 0xff) << 8;
+            }
             r->rax = t->pid;
+            kfree(t->cmdline);   // zombie held it for /proc; gone now
+            t->cmdline = 0;
+            t->cmdline_len = 0;
+            t->parent = 0;
             t->state = T_FREE;
             return (uint64_t)r;        // iretq restores IF
         }
