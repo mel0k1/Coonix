@@ -28,6 +28,15 @@ static uint64_t bitmap_pages;
 static uint16_t *refs;          // sharers per page (cow fork)
 static uint64_t base, pages_total, pages_used;
 
+// bitmap/refs index for a page pointer; anything outside the pool or
+// unaligned is a kernel bug - better loud than an oob refs write
+static uint64_t page_idx(const void *page) {
+    uint64_t a = (uint64_t)page;
+    if (a < base || a >= base + pages_total * PAGE_SIZE || (a & 0xfff))
+        panic("pmm: bad page ptr");
+    return (a - base) >> 12;
+}
+
 static inline int bit_test(uint64_t page) {
     return bitmap[page / 8] & (1 << (page % 8));
 }
@@ -150,7 +159,7 @@ void *pmm_alloc_zeroed(void) {
 
 void pmm_free(void *page) {
     PMM_ENTER;
-    uint64_t p = ((uint64_t)page - base) >> 12;
+    uint64_t p = page_idx(page);
     if (refs[p] > 1) {
         refs[p]--;         // still shared (cow), keep allocated
         PMM_LEAVE;
@@ -166,7 +175,7 @@ void pmm_free(void *page) {
 
 void pmm_ref(void *page) {
     PMM_ENTER;
-    uint64_t p = ((uint64_t)page - base) >> 12;
+    uint64_t p = page_idx(page);
     if (refs[p] < 0xffff)
         refs[p]++;
     PMM_LEAVE;
@@ -174,7 +183,7 @@ void pmm_ref(void *page) {
 
 int pmm_refcount(void *page) {
     PMM_ENTER;
-    uint64_t p = ((uint64_t)page - base) >> 12;
+    uint64_t p = page_idx(page);
     int rc = refs[p];
     PMM_LEAVE;
     return rc;
