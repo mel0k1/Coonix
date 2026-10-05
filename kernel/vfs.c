@@ -299,13 +299,18 @@ static struct vnode *resolve_parent(const char *path, char *name, int nsize) {
 
 struct vnode *vfs_create(const char *path) {
     char name[64];
+    // check-then-create must not be preemptable apart: a tick between
+    // lookup and create lets a second task insert the same name (fs-level
+    // ops only guard themselves)
+    uint64_t fl;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl));
     struct vnode *dir = resolve_parent(path, name, sizeof(name));
-    if (!dir || dir->type != VNODE_DIR || !dir->ops->create)
-        return 0;
-    // refuse to clobber
-    if (dir->ops->lookup(dir, name))
-        return 0;
-    return dir->ops->create(dir, name);
+    struct vnode *out = 0;
+    if (dir && dir->type == VNODE_DIR && dir->ops->create &&
+        !dir->ops->lookup(dir, name))
+        out = dir->ops->create(dir, name);   // refuse to clobber
+    __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory");
+    return out;
 }
 
 int vfs_truncate(struct vnode *vn) {
