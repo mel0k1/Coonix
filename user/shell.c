@@ -46,7 +46,7 @@ static void ls(const char *path) {
 }
 
 int main(void) {
-    char buf[128];
+    char buf[256];   // matches kernel LINE_MAX: one read() gets a full line
     int len;
 
     sigaction(SIGINT, on_sigint, 0);
