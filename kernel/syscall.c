@@ -298,9 +298,25 @@ static uint64_t sys_write(struct regs *r) {
     if (n >= 0 && f->pipe)
         task_wake_pipe(f->pipe);
     if (f->pipe && n == 0 && len) {
-        // full ring: park until a reader drains, then replay the write.
-        // returning 0 here would read as EOF and truncate pipelines
+        // full ring: re-try under cli, then park until a reader drains.
+        // returning 0 would read as EOF and truncate pipelines; parking
+        // without the re-check could sleep through a drain that already
+        // happened between the write attempt and the block
         cli();
+        n = file_write(f, buf, len);
+        if (n != 0) {
+            sti();
+            if (n > 0)
+                task_wake_pipe(f->pipe);
+            r->rax = (uint64_t)n;
+            return (uint64_t)r;
+        }
+        if (!f->pipe->readers) {
+            sti();
+            signal_send_task(current, SIGPIPE);
+            r->rax = -EPIPE;
+            return (uint64_t)r;
+        }
         replay_fixup(r);
         current->wait_reason = WAIT_PIPE;
         current->wait_pipe = f->pipe;
@@ -329,19 +345,23 @@ static uint64_t sys_read(struct regs *r) {
     // same as sys_write: prefault before the kernel copies through here
     task_prefault_range(current, (uint64_t)buf, rlen);
     if (f->pipe) {
-        // pipe: return what fits; block only when empty and writers live
-        uint64_t n = pipe_read_nb(f->pipe, (uint8_t *)buf,
-                                  r->rdx ? r->rdx : 1);
+        // pipe: return what fits; block only when empty and writers live.
+        // the examine+block runs inside one cli window: a writer that
+        // fills, drains or closes between the read attempt and the park
+        // would otherwise lose its wakeup (or the EOF) forever
+        cli();
+        uint64_t n = pipe_read_nb(f->pipe, (uint8_t *)buf, rlen);
         if (n) {
+            sti();
             task_wake_pipe(f->pipe);   // freed space may wake a writer
             r->rax = n;
             return (uint64_t)r;
         }
         if (!f->pipe->writers) {
+            sti();
             r->rax = 0;   // EOF
             return (uint64_t)r;
         }
-        cli();
         replay_fixup(r);
         current->wait_reason = WAIT_PIPE;
         current->wait_pipe = f->pipe;
@@ -868,7 +888,7 @@ static uint64_t sys_writev(struct regs *r) {
         // reuse the write path by hand: fd may be the console or a pipe
         struct file *f = fd_get(fd);
         if (!f) {
-            r->rax = -EBADF;
+            r->rax = total ? total : (uint64_t)-EBADF;
             return (uint64_t)r;
         }
         uint64_t len = iv[i].len;
@@ -881,17 +901,47 @@ static uint64_t sys_writev(struct regs *r) {
         }
         if (len)
             task_prefault_range(current, (uint64_t)iv[i].base, len);
+        if (f->pipe && !f->pipe->readers) {
+            signal_send_task(current, SIGPIPE);
+            r->rax = total ? total : (uint64_t)-EPIPE;
+            return (uint64_t)r;
+        }
         long n = file_write(f, iv[i].base, len);
         if (n < 0) {
             r->rax = -EIO;
             return (uint64_t)r;
         }
         total += (uint64_t)n;
-    }
-    if (total) {
-        struct file *f = fd_get(fd);
-        if (f && f->pipe)
+        if (f->pipe) {
             task_wake_pipe(f->pipe);
+            if (n == 0 && len) {
+                // full ring: park and replay the whole writev, like
+                // sys_write. returning 0 would read as EOF and truncate
+                // pipelines (glibc stdio writes through writev)
+                cli();
+                n = file_write(f, iv[i].base, len);
+                if (n != 0) {
+                    sti();
+                    if (n > 0) {
+                        total += (uint64_t)n;
+                        task_wake_pipe(f->pipe);
+                    }
+                    r->rax = total;
+                    return (uint64_t)r;
+                }
+                if (!f->pipe->readers) {
+                    sti();
+                    signal_send_task(current, SIGPIPE);
+                    r->rax = total ? total : (uint64_t)-EPIPE;
+                    return (uint64_t)r;
+                }
+                replay_fixup(r);
+                current->wait_reason = WAIT_PIPE;
+                current->wait_pipe = f->pipe;
+                current->state = T_BLOCKED;
+                return task_schedule((uint64_t)r);
+            }
+        }
     }
     r->rax = total;
     return (uint64_t)r;
