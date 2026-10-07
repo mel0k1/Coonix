@@ -3,11 +3,30 @@
 #include "kernel.h"
 #include "string.h"
 #include "serial.h"
+#include "sync.h"
 
 static uint32_t *fb;
 static uint64_t pitch, width, height;
 static uint32_t cx, cy, cols, rows;
 static uint32_t fg = CONSOLE_FG;
+
+// output lock: task-context writers (line-at-a-time) take it via
+// console_lock/console_unlock; irq handlers may not wait on it — they
+// print through console_puts, which trylocks and falls back to an
+// unlocked write when the interrupted context holds it (no deadlock)
+static spinlock_t out_lock = SPINLOCK_INIT;
+static uint64_t out_flags;
+
+void console_lock(void) {
+    // task context only: single cpu, callers are never nested, irq
+    // handlers use the trylock path instead
+    spin_lock_irqsave(&out_lock, &out_flags);
+}
+
+void console_unlock(void) {
+    uint64_t fl = out_flags;
+    spin_unlock_irqrestore(&out_lock, fl);
+}
 
 void console_init(void) {
     volatile struct limine_framebuffer_response *resp = fb_request.response;
@@ -85,8 +104,18 @@ void console_putc(char c) {
 }
 
 void console_puts(const char *s) {
+    // trylock: an irq (kbd echo, fault print) racing a task-context
+    // holder must print anyway — waiting would deadlock on one cpu
+    uint64_t fl = 0;
+    int own = spin_trylock(&out_lock);
+    if (own)
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) :: "memory");
     while (*s)
         console_putc(*s++);
+    if (own) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory", "cc");
+        spin_unlock(&out_lock);
+    }
 }
 
 void console_set_fg(uint32_t color) {

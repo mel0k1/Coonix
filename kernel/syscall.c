@@ -179,9 +179,12 @@ static int capture_strv(uint64_t up, char **out, int *cnt) {
 // unified read/write across console / pipe / file; bytes moved or -1
 static long file_write(struct file *f, const void *buf, uint64_t len) {
     if (f->is_console) {
+        // one write() = one uninterleaved chunk on the console
         const char *b = buf;
+        console_lock();
         for (uint64_t i = 0; i < len; i++)
             console_putc(b[i]);
+        console_unlock();
         return (long)len;
     }
     if (f->pipe)

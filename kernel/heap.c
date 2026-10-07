@@ -4,6 +4,7 @@
 #include "kernel.h"
 #include "string.h"
 #include "serial.h"
+#include "sync.h"
 
 struct chunk {
     size_t size;          // payload bytes, 16-aligned
@@ -22,10 +23,11 @@ struct chunk {
 // the free-list must be atomic vs the tick: syscalls enter through a trap
 // gate (IF stays 1), so a preempted task can sit between the first-fit
 // probe and used=1 while the next task kmallocs — both would claim the
-// same chunk (or tear the list apart in kfree coalesce). pushfq/popfq
-// keeps nested callers correct (heap_grow->pmm_alloc, fork under cli)
-#define HEAP_ENTER uint64_t __hfl; __asm__ volatile("pushfq; popq %0; cli" : "=r"(__hfl))
-#define HEAP_LEAVE __asm__ volatile("pushq %0; popfq" :: "r"(__hfl) : "memory")
+// same chunk (or tear the list apart in kfree coalesce). irqsave keeps
+// nested callers correct (heap_grow->pmm_alloc, fork under cli)
+static spinlock_t heap_lock = SPINLOCK_INIT;
+#define HEAP_ENTER uint64_t __hfl; spin_lock_irqsave(&heap_lock, &__hfl)
+#define HEAP_LEAVE spin_unlock_irqrestore(&heap_lock, __hfl)
 
 static struct chunk *head;
 static uint64_t heap_pml4;

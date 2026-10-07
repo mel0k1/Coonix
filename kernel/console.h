@@ -11,3 +11,7 @@ void console_clear(void);
 void console_putc(char c);
 void console_puts(const char *s);
 void console_set_fg(uint32_t color);
+// line-atomic output for task context (sys_write); irq paths print via
+// console_puts (trylock + fallback), never console_lock
+void console_lock(void);
+void console_unlock(void);
