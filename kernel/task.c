@@ -695,6 +695,7 @@ struct task *task_fork(struct regs *frame) {
     c->tgid = c->pid;
     c->pgid = current->pgid;      // same console group
     c->parent = current;
+    c->nice = current->nice;      // priority is inherited across fork
     c->start_tick = pit_ticks();
     c->state = T_READY;
 
@@ -1089,6 +1090,7 @@ uint64_t task_schedule(uint64_t old_rsp) {
         return old_rsp; // scheduler not initialized yet
     if (old_rsp) {
         current->rsp = old_rsp;
+        current->last_ran = pit_ticks();   // aging reference point
         // cpu accounting: the frame we just saved tells the mode the task
         // ran in since its last schedule (ring 3 = user, else kernel)
         if (current->pid != 0) {
@@ -1100,13 +1102,27 @@ uint64_t task_schedule(uint64_t old_rsp) {
         }
     }
 
-    // pick next ready task
+    // pick next ready task: lowest effective priority wins (nice 0 maps
+    // to 20). aging: +1 boost per 50 ticks not scheduled, max +25, so
+    // even a nice +19 task reclaims cpu eventually. equal effective
+    // priorities keep the round-robin scan order
     struct task *next = 0;
+    int next_eff = 0;
+    uint64_t now = pit_ticks();
     for (int i = 1; i <= TASK_MAX; i++) {
         int idx = current ? (int)(current - task_table + i) % TASK_MAX : i - 1;
-        if (task_table[idx].state == T_READY) {
-            next = &task_table[idx];
-            break;
+        struct task *t = &task_table[idx];
+        if (t->state != T_READY)
+            continue;
+        uint64_t ref = t->last_ran ? t->last_ran : t->start_tick;
+        uint64_t idle = now > ref ? now - ref : 0;
+        uint64_t boost = idle / 50;
+        if (boost > 25)
+            boost = 25;
+        int eff = t->nice + 20 - (int)boost;
+        if (!next || eff < next_eff) {
+            next = t;
+            next_eff = eff;
         }
     }
     if (!next) {

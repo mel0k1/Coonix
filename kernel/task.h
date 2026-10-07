@@ -59,6 +59,8 @@ struct task {
     uint64_t utime, stime;
     uint64_t cutime, cstime;
     uint64_t start_tick;  // spawn tick: /proc stat starttime, times()
+    int nice;             // -20..19 (0 default); scheduler favors low nice
+    uint64_t last_ran;    // tick the task was last scheduled out (aging)
     struct file *fds[FILE_MAX];
     uint8_t fd_flags[FILE_MAX];     // FD_CLOEXEC per fd
     char cwd[192];        // current directory (absolute, kernel-side)

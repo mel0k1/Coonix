@@ -269,3 +269,29 @@ static inline long lseek(int fd, long off, int whence) {
 #define F_SETFL 4
 #define F_DUPFD 0
 #define FD_CLOEXEC 1
+
+// --- scheduler priorities ---
+
+#define PRIO_PROCESS 0
+
+// linux convention: getpriority returns 20 - nice
+static inline long nice(long inc) {
+    return _sys(154, inc, 0, 0);
+}
+
+static inline long getpriority(int which, long who) {
+    return _sys(140, which, who, 0);
+}
+
+static inline long setpriority(int which, long who, long prio) {
+    return _sys(141, which, who, prio);
+}
+
+struct timespec_k {
+    long tv_sec;
+    long tv_nsec;
+};
+
+static inline long clock_gettime(int clk, struct timespec_k *ts) {
+    return _sys(228, clk, (long)ts, 0);
+}

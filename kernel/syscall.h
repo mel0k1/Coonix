@@ -48,6 +48,9 @@
 #define SYS_time    201
 #define SYS_sysinfo 99
 #define SYS_sched_getaffinity 203
+#define SYS_getpriority 140
+#define SYS_setpriority 141
+#define SYS_nice 154
 #define SYS_set_tid_address 218
 #define SYS_clock_gettime 228
 #define SYS_clock_nanosleep 230

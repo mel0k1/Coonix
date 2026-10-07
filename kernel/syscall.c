@@ -2086,6 +2086,74 @@ struct sysinfo_k {
 
 _Static_assert(sizeof(struct sysinfo_k) == 112, "sysinfo layout");
 
+// --- scheduler priorities: nice(154), getpriority(140), setpriority(141)
+
+static int nice_clamp(int v) {
+    if (v < -20)
+        v = -20;
+    if (v > 19)
+        v = 19;
+    return v;
+}
+
+static uint64_t sys_nice(struct regs *r) {
+    long inc = (long)r->rdi;
+    current->nice = nice_clamp(current->nice + (int)inc);
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_getpriority(struct regs *r) {
+    int which = (int)r->rdi;
+    long who = (long)r->rsi;
+    if (which != 0) {   // PRIO_PROCESS only
+        r->rax = -EINVAL;
+        return (uint64_t)r;
+    }
+    if (!who)
+        who = current->tgid;   // posix: who=0 means the caller
+    int best = 100;
+    for (int i = 0; i < TASK_MAX; i++) {
+        struct task *t = &task_table[i];
+        if (t->state == T_FREE)
+            continue;
+        if (t->tgid != who && t->pid != who)
+            continue;
+        if (t->nice < best)
+            best = t->nice;
+    }
+    if (best == 100) {
+        r->rax = -ESRCH;
+        return (uint64_t)r;
+    }
+    // linux convention: 20 - nice, so higher is more favored
+    r->rax = (uint64_t)(long)(20 - best);
+    return (uint64_t)r;
+}
+
+static uint64_t sys_setpriority(struct regs *r) {
+    int which = (int)r->rdi;
+    long who = (long)r->rsi;
+    int prio = (int)r->rdx;
+    if (which != 0) {
+        r->rax = -EINVAL;
+        return (uint64_t)r;
+    }
+    int hits = 0;
+    int nice = nice_clamp(prio);
+    for (int i = 0; i < TASK_MAX; i++) {
+        struct task *t = &task_table[i];
+        if (t->state == T_FREE)
+            continue;
+        if (who && t->tgid != who && t->pid != who)
+            continue;
+        t->nice = nice;
+        hits++;
+    }
+    r->rax = hits ? 0 : (uint64_t)-ESRCH;
+    return (uint64_t)r;
+}
+
 static uint64_t sys_sysinfo(struct regs *r) {
     struct sysinfo_k *si = (struct sysinfo_k *)r->rdi;
     if (!si) {
@@ -2546,6 +2614,9 @@ uint64_t syscall_dispatch(struct regs *r) {
     case SYS_clock_gettime: fr = sys_clock_gettime(r); break;
     case SYS_time:    fr = sys_time(r); break;
     case SYS_sched_getaffinity: fr = sys_sched_getaffinity(r); break;
+    case SYS_nice:        fr = sys_nice(r); break;
+    case SYS_getpriority: fr = sys_getpriority(r); break;
+    case SYS_setpriority: fr = sys_setpriority(r); break;
     case SYS_prlimit64: fr = sys_prlimit64(r); break;
     case SYS_getrandom: fr = sys_getrandom(r); break;
     default:
