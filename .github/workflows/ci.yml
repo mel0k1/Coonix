@@ -32,6 +32,9 @@ jobs:
       - name: demand paging test
         run: python3 scripts/qdpage.py
 
+      - name: network stack test
+        run: python3 scripts/qnet.py
+
       - name: upload serial log
         if: always()
         uses: actions/upload-artifact@v4

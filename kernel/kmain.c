@@ -20,6 +20,8 @@
 #include "ata.h"
 #include "ahci.h"
 #include "virtio_blk.h"
+#include "net.h"
+#include "virtio_net.h"
 #include "ext2.h"
 #include "blkdev.h"
 #include "procfs.h"
@@ -215,6 +217,10 @@ void kmain(void) {
         initramfs_load();
         console_puts("vfs: tmpfs root + initramfs (disk boot failed)\n");
     }
+
+    net_init();
+    virtio_net_init();
+    console_puts("net: stack ready, ip 10.0.2.15 gw 10.0.2.2\n");
 
     // /proc over the root, whatever it is (procfs root has no deps)
     if (vfs_mount_at("/proc", procfs_mount(vfs_get_root())) == 0)

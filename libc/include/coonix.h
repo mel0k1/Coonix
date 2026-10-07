@@ -295,3 +295,53 @@ struct timespec_k {
 static inline long clock_gettime(int clk, struct timespec_k *ts) {
     return _sys(228, clk, (long)ts, 0);
 }
+
+
+// --- sockets (AF_INET, SOCK_DGRAM; raw ping via proto=1) ---
+
+#define AF_INET      2
+#define SOCK_DGRAM   2
+#define IPPROTO_ICMP 1
+#define IPPROTO_UDP  17
+
+struct sockaddr_in {
+    unsigned short sin_family;
+    unsigned short sin_port;      // network byte order
+    unsigned int   sin_addr;      // network byte order
+    unsigned char  sin_zero[8];
+};
+
+static inline long socket(long domain, long type, long proto) {
+    return _sys(41, domain, type, proto);
+}
+
+static inline long sendto(int fd, const void *buf, unsigned long len,
+                          const struct sockaddr_in *to) {
+    register long _d __asm__("r10") = (long)to;
+    long ret;
+    __asm__ volatile("int $0x80"
+                     : "=a"(ret)
+                     : "a"((long)44), "D"((long)fd), "S"((long)buf),
+                       "d"((long)len), "r"(_d)
+                     : "memory");
+    return ret;
+}
+
+static inline long recvfrom(int fd, void *buf, unsigned long len,
+                            struct sockaddr_in *from) {
+    register long _d __asm__("r10") = (long)from;
+    long ret;
+    __asm__ volatile("int $0x80"
+                     : "=a"(ret)
+                     : "a"((long)45), "D"((long)fd), "S"((long)buf),
+                       "d"((long)len), "r"(_d)
+                     : "memory");
+    return ret;
+}
+
+struct timespec_k_dup { long tv_sec; long tv_nsec; };
+
+static inline long nanosleep(long sec, long nsec) {
+    struct timespec_k_dup ts = { sec, nsec };
+    return _sys(35, (long)&ts, 0, 0);
+}

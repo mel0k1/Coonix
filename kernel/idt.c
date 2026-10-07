@@ -312,8 +312,10 @@ uint64_t isr_handler(struct regs *r) {
         if (r->int_no == 32) {
             extern void futex_tick(void);
             extern void task_tick_wake(void);
+            extern void net_poll(void);
             futex_tick();
             task_tick_wake();
+            net_poll();
             uint64_t fr;
             int act = signal_deliver(r, &fr);
             if (act == 2)

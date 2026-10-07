@@ -10,6 +10,7 @@
 #include "vfs.h"
 #include "pit.h"
 #include "signal.h"
+#include "net.h"
 #include "futex.h"
 #include "serial.h"
 #include "pipe.h"
@@ -205,6 +206,8 @@ __attribute__((unused)) static long file_read(struct file *f, void *buf, uint64_
 #define EPERM   1
 #define ENOENT  2
 #define ESRCH   3
+#define EAFNOSUPPORT 97
+#define ESOCKTNOSUPPORT 94
 #define EINTR   4
 #define EBADF   9
 #define EAGAIN  11
@@ -464,6 +467,7 @@ static uint64_t sys_close(struct regs *r) {
     }
     current->fds[fd] = 0;
     vfs_close(f);
+    net_close(fd);
     r->rax = 0;
     return (uint64_t)r;
 }
@@ -2465,6 +2469,77 @@ static uint64_t sys_utimensat(struct regs *r) {
     return (uint64_t)r;
 }
 
+// --- minimal sockets: udp datagrams + icmp ping over the net stack ---
+
+struct sockaddr_in_k {
+    uint16_t family;
+    uint16_t port;      // big endian on the wire; kept as-is here
+    uint32_t addr;      // big endian
+    uint8_t zero[8];
+};
+
+static uint64_t sys_socket(struct regs *r) {
+    long domain = (long)r->rdi, type = (long)r->rsi, proto = (long)r->rdx;
+    if (domain != 2) {          // AF_INET only
+        r->rax = (uint64_t)-EAFNOSUPPORT;
+        return (uint64_t)r;
+    }
+    if (type != 2) {            // SOCK_DGRAM only
+        r->rax = (uint64_t)-ESOCKTNOSUPPORT;
+        return (uint64_t)r;
+    }
+    long fd = net_socket((int)proto);
+    r->rax = (uint64_t)fd;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_sendto(struct regs *r) {
+    int fd = (int)r->rdi;
+    const void *buf = (const void *)r->rsi;
+    uint16_t len = (uint16_t)r->rdx;
+    struct sockaddr_in_k *to = (struct sockaddr_in_k *)r->r10;
+    if (!buf || !to || !task_user_range_ok(current, (uint64_t)buf, len, 0) ||
+        !task_user_range_ok(current, (uint64_t)to, sizeof(*to), 0)) {
+        r->rax = (uint64_t)-EFAULT;
+        return (uint64_t)r;
+    }
+    if (to->family != 2) {
+        r->rax = (uint64_t)-EAFNOSUPPORT;
+        return (uint64_t)r;
+    }
+    uint32_t ip = __builtin_bswap32(to->addr);
+    uint16_t port = __builtin_bswap16(to->port);
+    static uint8_t kbuf[1500];
+    memcpy(kbuf, buf, len);
+    long ret = net_sendto(fd, kbuf, len, ip, port);
+    r->rax = (uint64_t)ret;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_recvfrom(struct regs *r) {
+    int fd = (int)r->rdi;
+    void *buf = (void *)r->rsi;
+    uint16_t len = (uint16_t)r->rdx;
+    struct sockaddr_in_k *from = (struct sockaddr_in_k *)r->r10;
+    if (!buf || !task_user_range_ok(current, (uint64_t)buf, len, 1)) {
+        r->rax = (uint64_t)-EFAULT;
+        return (uint64_t)r;
+    }
+    uint32_t sip = 0;
+    uint16_t sport = 0;
+    static uint8_t kbuf[1500];
+    long n = net_recvfrom(fd, kbuf, len, &sip, &sport);
+    if (n > 0 && from) {
+        from->family = 2;
+        from->port = __builtin_bswap16(sport);
+        from->addr = __builtin_bswap32(sip);
+    }
+    if (n > 0)
+        memcpy(buf, kbuf, (uint64_t)n);
+    r->rax = (uint64_t)n;    // 0 = nothing queued (non-blocking)
+    return (uint64_t)r;
+}
+
 uint64_t syscall_dispatch(struct regs *r) {
     // entry guard: a syscall arriving while the scheduler thinks the idle
     // task is current means a context escaped from the scheduler — catch
@@ -2626,6 +2701,9 @@ uint64_t syscall_dispatch(struct regs *r) {
     case SYS_setpriority: fr = sys_setpriority(r); break;
     case SYS_prlimit64: fr = sys_prlimit64(r); break;
     case SYS_getrandom: fr = sys_getrandom(r); break;
+    case 41 /* socket */:    fr = sys_socket(r); break;
+    case 44 /* sendto */:    fr = sys_sendto(r); break;
+    case 45 /* recvfrom */:  fr = sys_recvfrom(r); break;
     default:
         r->rax = (uint64_t)-ENOSYS;
         fr = (uint64_t)r;
