@@ -7,6 +7,7 @@ void pmm_init(void);
 void pmm_reserve_range(uint64_t phys, uint64_t len);
 void *pmm_alloc(void);           // 1 page, dirty
 void *pmm_alloc_zeroed(void);    // 1 page, zeroed via hhdm
+void *pmm_alloc_contig(unsigned n);  // n physically contiguous pages
 void pmm_free(void *page);       // drops one reference, frees at zero
 
 void pmm_ref(void *page);        // +1 sharer (copy-on-write fork)

@@ -26,6 +26,12 @@ jobs:
       - name: boot test in qemu (TCG)
         run: python3 scripts/ci_test.py
 
+      - name: scheduler priority test
+        run: python3 scripts/qnice.py
+
+      - name: demand paging test
+        run: python3 scripts/qdpage.py
+
       - name: upload serial log
         if: always()
         uses: actions/upload-artifact@v4

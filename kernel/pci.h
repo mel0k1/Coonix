@@ -14,3 +14,10 @@ void pci_write32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off, uint32_t v);
 // fills bar5 with BAR5 (mem base) if non-null; returns 1 if found
 int pci_find_class(uint8_t class, uint8_t subclass,
                    uint8_t *bus, uint8_t *dev, uint8_t *fn, uint32_t *bar5);
+
+// scan for vendor+device id (virtio legacy/modern ids); fills bar0
+// with the RAW bar value (bit 0 = io space) and the interrupt line if
+// non-null; returns 1 if found
+int pci_find_vendor_device(uint16_t vendor, uint16_t device,
+                           uint8_t *bus, uint8_t *dev, uint8_t *fn,
+                           uint32_t *bar0, uint8_t *irq_line);

@@ -56,3 +56,28 @@ int pci_find_class(uint8_t class, uint8_t subclass,
             }
     return 0;
 }
+
+int pci_find_vendor_device(uint16_t vendor, uint16_t device,
+                           uint8_t *bus, uint8_t *dev, uint8_t *fn,
+                           uint32_t *bar0, uint8_t *irq_line) {
+    for (uint16_t b = 0; b < 16; b++)
+        for (uint8_t d = 0; d < 32; d++)
+            for (uint8_t f = 0; f < 8; f++) {
+                uint32_t id = pci_read32(b, d, f, 0x00);
+                if (id == 0xffffffff)
+                    continue;
+                // id register: [15:0] vendor, [31:16] device
+                if ((uint16_t)id != vendor || id >> 16 != device)
+                    continue;
+                if (bus) *bus = b;
+                if (dev) *dev = d;
+                if (fn) *fn = f;
+                if (bar0)
+                    *bar0 = pci_read32(b, d, f, 0x10);   // raw: caller
+                                                         // checks bit 0
+                if (irq_line)
+                    *irq_line = (uint8_t)pci_read32(b, d, f, 0x3c);
+                return 1;
+            }
+    return 0;
+}

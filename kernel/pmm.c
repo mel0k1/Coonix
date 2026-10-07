@@ -150,6 +150,32 @@ void *pmm_alloc(void) {
     return 0;
 }
 
+// n physically contiguous pages (virtio vrings need a 2-page chunk);
+// returns the first page's phys address, 0 if none found
+void *pmm_alloc_contig(unsigned n) {
+    if (!n)
+        return 0;
+    PMM_ENTER;
+    for (uint64_t p = 0; p + n <= pages_total; p++) {
+        uint64_t q = 0;
+        while (q < n && !bit_test(p + q))
+            q++;
+        if (q < n) {
+            p += q;   // skip the run we just inspected
+            continue;
+        }
+        for (uint64_t k = 0; k < n; k++) {
+            bit_set(p + k);
+            refs[p + k] = 1;
+        }
+        pages_used += n;
+        PMM_LEAVE;
+        return (void *)(base + p * PAGE_SIZE);
+    }
+    PMM_LEAVE;
+    return 0;
+}
+
 void *pmm_alloc_zeroed(void) {
     void *page = pmm_alloc();
     if (page)

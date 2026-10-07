@@ -19,6 +19,7 @@
 #include "initramfs.h"
 #include "ata.h"
 #include "ahci.h"
+#include "virtio_blk.h"
 #include "ext2.h"
 #include "blkdev.h"
 #include "procfs.h"
@@ -183,25 +184,28 @@ void kmain(void) {
     console_puts("heap ok\n");
 
     vfs_init();
-    // ahci first (q35 has no legacy ide), then ata pio (pc machine)
-    int ahci_ok = ahci_init();
-    if (ahci_ok == 0 && root_disk.ready) {
+    // virtio first (fast dma when the disk rides on it), then ahci
+    // (q35 has no legacy ide), then ata pio (pc machine)
+    if (virtio_blk_init() == 0 && root_disk.ready) {
+        console_puts("disk: ");
+        console_puts(root_disk.name);
+        console_puts(", ");
+        print_num(root_disk.sectors >> 11);
+        console_puts(" MB, virtio dma\n");
+    } else if (ahci_init() == 0 && root_disk.ready) {
         console_puts("disk: ");
         console_puts(root_disk.name);
         console_puts(", ");
         print_num(root_disk.sectors >> 11);
         console_puts(" MB, ahci dma\n");
+    } else if (ata_init() && root_disk.ready) {
+        console_puts("disk: ");
+        console_puts(root_disk.name);
+        console_puts(", ");
+        print_num(root_disk.sectors >> 11);
+        console_puts(" MB, pio lba48\n");
     } else {
-        uint64_t sectors = ata_init();
-        if (sectors && root_disk.ready) {
-            console_puts("disk: ");
-            console_puts(root_disk.name);
-            console_puts(", ");
-            print_num(root_disk.sectors >> 11);
-            console_puts(" MB, pio lba48\n");
-        } else {
-            console_puts("disk: none found\n");
-        }
+        console_puts("disk: none found\n");
     }
 
     if (root_disk.ready && ext2_mount_root() == 0) {
