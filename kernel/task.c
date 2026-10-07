@@ -227,18 +227,17 @@ int task_mmap_fault(struct regs *r, uint64_t cr2) {
     for (struct mmap_region *m = current->mmaps; m; m = m->next) {
         if (page < m->start || page >= m->end)
             continue;
-        if (!m->file)
-            return 0;   // anon regions are mapped eagerly
-        return mmap_fill_page(m, page);
+        return mmap_fill_page(m, page);   // file-backed AND anon (lazy)
     }
     return 0;
 }
 
-// fill one page of a file-backed region. static so the fault path and
-// deliberate prefaulting share it. NOT reentrant: the fill issues ext2
-// reads, and a nested fill (fault while a disk op is in flight) would
-// recurse into the driver mid-transfer — the guard turns that into a
-// clean SIGSEGV instead of a triple fault
+// fill one page of a lazily-backed region (file-backed: read the file;
+// anonymous: just a zero frame). static so the fault path and deliberate
+// prefaulting share it. NOT reentrant: the fill issues ext2 reads, and a
+// nested fill (fault while a disk op is in flight) would recurse into
+// the driver mid-transfer — the guard turns that into a clean SIGSEGV
+// instead of a triple fault
 static int mmap_filling;
 static int mmap_fill_page(struct mmap_region *m, uint64_t page) {
     if (mmap_filling)
@@ -247,12 +246,14 @@ static int mmap_fill_page(struct mmap_region *m, uint64_t page) {
     void *p = pmm_alloc_zeroed();
     int ok = 0;
     if (p) {
-        uint64_t foff = m->off + (page - m->start);
-        long n = m->file->vn->ops->read(m->file->vn,
-                                        phys2virt((uint64_t)p), foff,
-                                        PAGE_SIZE);
-        if (n < 0)
-            n = 0;   // beyond eof: page stays zero
+        if (m->file) {
+            uint64_t foff = m->off + (page - m->start);
+            long n = m->file->vn->ops->read(m->file->vn,
+                                            phys2virt((uint64_t)p), foff,
+                                            PAGE_SIZE);
+            if (n < 0)
+                n = 0;   // beyond eof: page stays zero
+        }
         uint64_t vflags = VMM_PRESENT | VMM_USER;
         if (m->prot & 0x2)
             vflags |= VMM_WRITE;
@@ -279,8 +280,7 @@ void task_prefault_range(struct task *t, uint64_t uaddr, uint64_t len) {
         if (!(vmm_get_pte(t->pml4, va) & VMM_PRESENT)) {
             for (struct mmap_region *m = t->mmaps; m; m = m->next)
                 if (va >= m->start && va < m->end) {
-                    if (m->file)
-                        mmap_fill_page(m, va);
+                    mmap_fill_page(m, va);   // anon and file-backed
                     break;
                 }
         }
@@ -316,12 +316,13 @@ int task_user_range_ok(struct task *t, uint64_t uaddr, uint64_t len,
             if (need_write && !(pte & (VMM_WRITE | VMM_COW)))
                 return 0;
         } else {
-            // not faulted yet: only a file-backed region can serve it
+            // not faulted yet: any mmap region can serve it (anon fills
+            // a zero frame, file-backed reads its page)
             struct mmap_region *m = t->mmaps;
             for (; m; m = m->next)
                 if (va >= m->start && va < m->end)
                     break;
-            if (!m || !m->file)
+            if (!m)
                 return 0;
             if (need_write && !(m->prot & 0x2))
                 return 0;

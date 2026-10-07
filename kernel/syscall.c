@@ -694,9 +694,13 @@ static uint64_t sys_mmap(struct regs *r) {
             }
     }
 
-    // anonymous: map eagerly, zeroed. file-backed: record only, pages
-    // appear on #PF (task_mmap_fault)
-    if (!file) {
+    // anonymous private: demand-paged — record only, zero frames appear
+    // on #PF (task_mmap_fault). anonymous shared: eager, so forked
+    // sharers see the same frames from the first touch. file-backed:
+    // record only, pages appear on #PF
+    if (!file && !(flags & MAP_SHARED)) {
+        ;   // fully lazy: nothing to map or roll back here
+    } else if (!file) {
         uint64_t vflags = VMM_PRESENT | VMM_USER;
         if (prot & PROT_WRITE)
             vflags |= VMM_WRITE;
@@ -2324,6 +2328,9 @@ static uint64_t sys_mremap(struct regs *r) {
         vmm_map(current->pml4, va, (uint64_t)pg, vflags);
     }
     uint64_t copy = old_len < new_len ? old_len : new_len;
+    // the old range may be demand-paged: fill its pages before the
+    // kernel-side copy touches them
+    task_prefault_range(current, addr, copy);
     memcpy((void *)start, (const void *)addr, copy);
     struct mmap_region *nm = kmalloc(sizeof(*nm));
     if (!nm) {
