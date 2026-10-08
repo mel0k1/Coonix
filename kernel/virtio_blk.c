@@ -11,8 +11,8 @@
 // legacy virtio-blk: bar0 io interface, one queue, one in-flight
 // request, 8-sector bounce chunks (same shape as the ahci driver)
 
-#define VBLK_T_IN  1   // device->guest read
-#define VBLK_T_OUT 0   // guest->device write
+#define VBLK_T_IN  0   // device->guest read (device writes the data)
+#define VBLK_T_OUT 1   // guest->device write
 #define VBLK_S_OK  0
 
 // request header the device dma-reads, status byte it dma-writes; both
@@ -222,10 +222,6 @@ int virtio_blk_init(void) {
     if (!qsize || qsize > 1024)
         return -1;
 
-    // TEMP: burn the low 16MB so the ring lands at a high address
-    void *burn;
-    while ((burn = pmm_alloc()) != 0 && (uint64_t)burn < 0x1000000)
-        ;
     void *ring = pmm_alloc_contig(VRING_PAGES(qsize));
     if (!ring)
         return -1;
