@@ -60,12 +60,14 @@ struct vnode {
 
 // open file description, shared across fork
 struct file {
-    struct vnode *vn;      // 0 = console or pipe
+    struct vnode *vn;      // 0 = console, pipe or socket
     struct pipe *pipe;     // 0 unless a pipe endpoint
     int pipe_writer;       // pipe endpoints: 1 = write end
     uint64_t off;
     int refs;
     int is_console;
+    int is_socket;         // sock = net stack socket slot
+    int sock;
     char path[56];         // absolute path (procfs fd readlink targets)
 };
 

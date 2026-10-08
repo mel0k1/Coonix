@@ -3,6 +3,7 @@
 #include "heap.h"
 #include "string.h"
 #include "console.h"
+#include "net.h"
 
 static struct vnode *resolve_parent(const char *path, char *name, int nsize);
 
@@ -206,6 +207,11 @@ void vfs_close(struct file *f) {
         return;
     if (f->is_console)
         return; // static console slots are never freed
+    if (f->is_socket) {
+        net_close(f->sock);   // stream teardown runs from the tick
+        kfree(f);
+        return;
+    }
     if (f->pipe)
         pipe_release_end(f->pipe, f->pipe_writer);
     if (f->vn) {

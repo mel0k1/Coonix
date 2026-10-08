@@ -190,6 +190,9 @@ static long file_write(struct file *f, const void *buf, uint64_t len) {
     }
     if (f->pipe)
         return (long)pipe_write_nb(f->pipe, buf, len);
+    if (f->is_socket)
+        return net_sendto(f->sock, buf,
+                          len > 0xffff ? 0xffff : (uint16_t)len, 0, 0);
     return vfs_write(f, buf, len);
 }
 
@@ -199,6 +202,9 @@ __attribute__((unused)) static long file_read(struct file *f, void *buf, uint64_
         return tty_read(buf, len ? (int)len : 1);
     if (f->pipe)
         return (long)pipe_read_nb(f->pipe, buf, len);
+    if (f->is_socket)
+        return net_recvfrom(f->sock, buf,
+                            len > 0xffff ? 0xffff : (uint16_t)len, 0, 0);
     return vfs_read(f, buf, len);
 }
 
@@ -233,6 +239,17 @@ __attribute__((unused)) static long file_read(struct file *f, void *buf, uint64_
 #define ECHILD  10
 #define ERANGE  34
 #define ENOTEMPTY 39
+#define EMSGSIZE 90
+#define EPROTONOSUPPORT 93
+#define EDESTADDRREQ 89
+#define ENOTSOCK 88
+#define EADDRINUSE 98
+#define ECONNRESET 104
+#define EISCONN 106
+#define ENOTCONN 107
+#define ECONNREFUSED 111
+#define EALREADY 114
+#define EINPROGRESS 115
 
 #define O_CREAT 0x40
 #define O_TRUNC 0x200
@@ -466,8 +483,7 @@ static uint64_t sys_close(struct regs *r) {
         return (uint64_t)r;
     }
     current->fds[fd] = 0;
-    vfs_close(f);
-    net_close(fd);
+    vfs_close(f);        // socket stubs release their net slot here
     r->rax = 0;
     return (uint64_t)r;
 }
@@ -2469,7 +2485,9 @@ static uint64_t sys_utimensat(struct regs *r) {
     return (uint64_t)r;
 }
 
-// --- minimal sockets: udp datagrams + icmp ping over the net stack ---
+// --- minimal sockets: udp, icmp ping and tcp streams over the net stack ---
+// sockets live in the process fd table as struct file stubs so their
+// numbers never collide with open files and close() just works
 
 struct sockaddr_in_k {
     uint16_t family;
@@ -2478,41 +2496,127 @@ struct sockaddr_in_k {
     uint8_t zero[8];
 };
 
+static struct file *sock_file_alloc(int slot) {
+    struct file *f = kmalloc(sizeof(*f));
+    if (!f)
+        return 0;
+    memset(f, 0, sizeof(*f));
+    f->refs = 1;
+    f->is_socket = 1;
+    f->sock = slot;
+    return f;
+}
+
+// resolve an fd to a net stack socket slot
+static int sock_slot(int fd, struct file **out) {
+    struct file *f = fd_get(fd);
+    if (!f || !f->is_socket)
+        return -1;
+    if (out)
+        *out = f;
+    return f->sock;
+}
+
 static uint64_t sys_socket(struct regs *r) {
     long domain = (long)r->rdi, type = (long)r->rsi, proto = (long)r->rdx;
     if (domain != 2) {          // AF_INET only
         r->rax = (uint64_t)-EAFNOSUPPORT;
         return (uint64_t)r;
     }
-    if (type != 2) {            // SOCK_DGRAM only
+    int nproto;
+    if (type == 2)              // SOCK_DGRAM: udp or raw icmp
+        nproto = (int)proto;
+    else if (type == 1)         // SOCK_STREAM: tcp
+        nproto = (proto == 0 || proto == 6) ? NET_PROTO_TCP : -1;
+    else {
         r->rax = (uint64_t)-ESOCKTNOSUPPORT;
         return (uint64_t)r;
     }
-    long fd = net_socket((int)proto);
+    if (nproto != NET_PROTO_UDP && nproto != NET_PROTO_ICMP &&
+        nproto != NET_PROTO_TCP) {
+        r->rax = (uint64_t)-EPROTONOSUPPORT;
+        return (uint64_t)r;
+    }
+    long slot = net_socket(nproto);
+    if (slot < 0) {
+        r->rax = (uint64_t)-ENOMEM;
+        return (uint64_t)r;
+    }
+    struct file *f = sock_file_alloc((int)slot);
+    if (!f) {
+        net_close((int)slot);
+        r->rax = (uint64_t)-ENOMEM;
+        return (uint64_t)r;
+    }
+    int fd = task_fd_alloc(f);
+    if (fd < 0) {
+        vfs_close(f);
+        r->rax = (uint64_t)-EMFILE;
+        return (uint64_t)r;
+    }
     r->rax = (uint64_t)fd;
     return (uint64_t)r;
 }
 
+static int sock_args(struct regs *r, int *fd, const void **buf,
+                     uint32_t *len, struct sockaddr_in_k **sa) {
+    *fd = (int)r->rdi;
+    *buf = (const void *)r->rsi;
+    *len = (uint32_t)r->rdx;
+    *sa = (struct sockaddr_in_k *)r->r10;
+    if (!*buf || !*len)
+        return -1;
+    if (!task_user_range_ok(current, (uint64_t)*buf, *len, 0))
+        return -1;
+    if (*sa && !task_user_range_ok(current, (uint64_t)*sa,
+                                   sizeof(struct sockaddr_in_k), 0))
+        return -1;
+    return 0;
+}
+
 static uint64_t sys_sendto(struct regs *r) {
-    int fd = (int)r->rdi;
-    const void *buf = (const void *)r->rsi;
-    uint16_t len = (uint16_t)r->rdx;
-    struct sockaddr_in_k *to = (struct sockaddr_in_k *)r->r10;
-    if (!buf || !to || !task_user_range_ok(current, (uint64_t)buf, len, 0) ||
-        !task_user_range_ok(current, (uint64_t)to, sizeof(*to), 0)) {
+    int fd;
+    const void *buf;
+    uint32_t len;
+    struct sockaddr_in_k *to;
+    if (sock_args(r, &fd, &buf, &len, &to) < 0) {
         r->rax = (uint64_t)-EFAULT;
         return (uint64_t)r;
     }
-    if (to->family != 2) {
+    int sfd = sock_slot(fd, 0);
+    if (sfd < 0) {
+        r->rax = (uint64_t)-ENOTSOCK;
+        return (uint64_t)r;
+    }
+    if (to && to->family != 2) {
         r->rax = (uint64_t)-EAFNOSUPPORT;
         return (uint64_t)r;
     }
-    uint32_t ip = __builtin_bswap32(to->addr);
-    uint16_t port = __builtin_bswap16(to->port);
+    uint32_t ip = to ? __builtin_bswap32(to->addr) : 0;
+    uint16_t port = to ? __builtin_bswap16(to->port) : 0;
+    if (len > 0xffff)
+        len = 0xffff;
     static uint8_t kbuf[1500];
-    memcpy(kbuf, buf, len);
-    long ret = net_sendto(fd, kbuf, len, ip, port);
-    r->rax = (uint64_t)ret;
+    // streams take the buffer in chunks; datagrams go in one shot
+    long sent = 0;
+    while (sent < (long)len) {
+        uint32_t n = len - (uint32_t)sent;
+        if (n > sizeof(kbuf))
+            n = sizeof(kbuf);
+        memcpy(kbuf, (const uint8_t *)buf + sent, n);
+        long rc = net_sendto(sfd, kbuf, (uint16_t)n, ip, port);
+        if (rc < 0) {
+            if (!sent)
+                sent = len > sizeof(kbuf) ? -EMSGSIZE : rc;
+            break;
+        }
+        if (rc == 0)
+            break;               // stream buffer full / nothing queued
+        sent += rc;
+    }
+    if (!sent && !to)
+        sent = -EDESTADDRREQ;
+    r->rax = (uint64_t)sent;
     return (uint64_t)r;
 }
 
@@ -2521,22 +2625,148 @@ static uint64_t sys_recvfrom(struct regs *r) {
     void *buf = (void *)r->rsi;
     uint16_t len = (uint16_t)r->rdx;
     struct sockaddr_in_k *from = (struct sockaddr_in_k *)r->r10;
-    if (!buf || !task_user_range_ok(current, (uint64_t)buf, len, 1)) {
+    if (!buf || !len ||
+        !task_user_range_ok(current, (uint64_t)buf, len, 1)) {
         r->rax = (uint64_t)-EFAULT;
+        return (uint64_t)r;
+    }
+    int sfd = sock_slot(fd, 0);
+    if (sfd < 0) {
+        r->rax = (uint64_t)-ENOTSOCK;
         return (uint64_t)r;
     }
     uint32_t sip = 0;
     uint16_t sport = 0;
     static uint8_t kbuf[1500];
-    long n = net_recvfrom(fd, kbuf, len, &sip, &sport);
+    uint16_t clen = len > sizeof(kbuf) ? (uint16_t)sizeof(kbuf) : len;
+    long n = net_recvfrom(sfd, kbuf, clen, &sip, &sport);
     if (n > 0 && from) {
+        if (!task_user_range_ok(current, (uint64_t)from,
+                                sizeof(*from), 1)) {
+            r->rax = (uint64_t)-EFAULT;
+            return (uint64_t)r;
+        }
         from->family = 2;
         from->port = __builtin_bswap16(sport);
         from->addr = __builtin_bswap32(sip);
     }
     if (n > 0)
         memcpy(buf, kbuf, (uint64_t)n);
-    r->rax = (uint64_t)n;    // 0 = nothing queued (non-blocking)
+    r->rax = (uint64_t)n;    // 0 = eof/nothing queued (non-blocking)
+    return (uint64_t)r;
+}
+
+static uint64_t sys_bind(struct regs *r) {
+    int fd = (int)r->rdi;
+    struct sockaddr_in_k *sa = (struct sockaddr_in_k *)r->rsi;
+    if (!sa || !task_user_range_ok(current, (uint64_t)sa, sizeof(*sa), 0)) {
+        r->rax = (uint64_t)-EFAULT;
+        return (uint64_t)r;
+    }
+    int sfd = sock_slot(fd, 0);
+    if (sfd < 0) {
+        r->rax = (uint64_t)-ENOTSOCK;
+        return (uint64_t)r;
+    }
+    if (sa->family != 2) {
+        r->rax = (uint64_t)-EAFNOSUPPORT;
+        return (uint64_t)r;
+    }
+    uint32_t ip = __builtin_bswap32(sa->addr);
+    if (ip && ip != net_local_ip && ip != 0x7f000001) {
+        r->rax = (uint64_t)-EINVAL;
+        return (uint64_t)r;
+    }
+    uint16_t port = __builtin_bswap16(sa->port);
+    r->rax = (uint64_t)(net_bind(sfd, port) < 0 ? -EINVAL : 0);
+    return (uint64_t)r;
+}
+
+static uint64_t sys_listen(struct regs *r) {
+    int fd = (int)r->rdi;
+    int backlog = (int)r->rsi;
+    int sfd = sock_slot(fd, 0);
+    if (sfd < 0) {
+        r->rax = (uint64_t)-ENOTSOCK;
+        return (uint64_t)r;
+    }
+    if (backlog < 0)
+        backlog = 0;
+    r->rax = (uint64_t)(net_listen(sfd, backlog) < 0 ? -EINVAL : 0);
+    return (uint64_t)r;
+}
+
+static uint64_t sys_connect(struct regs *r) {
+    int fd = (int)r->rdi;
+    struct sockaddr_in_k *sa = (struct sockaddr_in_k *)r->rsi;
+    if (!sa || !task_user_range_ok(current, (uint64_t)sa, sizeof(*sa), 0)) {
+        r->rax = (uint64_t)-EFAULT;
+        return (uint64_t)r;
+    }
+    int sfd = sock_slot(fd, 0);
+    if (sfd < 0) {
+        r->rax = (uint64_t)-ENOTSOCK;
+        return (uint64_t)r;
+    }
+    if (sa->family != 2) {
+        r->rax = (uint64_t)-EAFNOSUPPORT;
+        return (uint64_t)r;
+    }
+    uint32_t ip = __builtin_bswap32(sa->addr);
+    uint16_t port = __builtin_bswap16(sa->port);
+    long rc = net_connect(sfd, ip, port);
+    long out;
+    switch (rc) {
+    case 0:  out = 0; break;
+    case -9: out = -EBADF; break;
+    case -104: out = -ECONNRESET; break;
+    case -106: out = -EISCONN; break;
+    case -110: out = -ETIMEDOUT; break;
+    case -114: out = -EALREADY; break;
+    case -115: out = -EINPROGRESS; break;
+    default: out = -EINVAL; break;
+    }
+    r->rax = (uint64_t)out;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_accept(struct regs *r) {
+    int fd = (int)r->rdi;
+    struct sockaddr_in_k *addr = (struct sockaddr_in_k *)r->rsi;
+    uint32_t *alen = (uint32_t *)r->rdx;
+    int lsock = sock_slot(fd, 0);
+    if (lsock < 0) {
+        r->rax = (uint64_t)-ENOTSOCK;
+        return (uint64_t)r;
+    }
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    long slot = net_accept(lsock, &ip, &port);
+    if (slot < 0) {
+        r->rax = (uint64_t)-EAGAIN;
+        return (uint64_t)r;
+    }
+    struct file *f = sock_file_alloc((int)slot);
+    if (!f) {
+        net_close((int)slot);
+        r->rax = (uint64_t)-ENOMEM;
+        return (uint64_t)r;
+    }
+    int nfd = task_fd_alloc(f);
+    if (nfd < 0) {
+        vfs_close(f);
+        r->rax = (uint64_t)-EMFILE;
+        return (uint64_t)r;
+    }
+    if (addr && task_user_range_ok(current, (uint64_t)addr,
+                                   sizeof(*addr), 1)) {
+        addr->family = 2;
+        addr->port = __builtin_bswap16(port);
+        addr->addr = __builtin_bswap32(ip);
+        if (alen && task_user_range_ok(current, (uint64_t)alen, 4, 1))
+            *alen = sizeof(*addr);
+    }
+    r->rax = (uint64_t)nfd;
     return (uint64_t)r;
 }
 
@@ -2702,8 +2932,12 @@ uint64_t syscall_dispatch(struct regs *r) {
     case SYS_prlimit64: fr = sys_prlimit64(r); break;
     case SYS_getrandom: fr = sys_getrandom(r); break;
     case 41 /* socket */:    fr = sys_socket(r); break;
+    case 42 /* connect */:   fr = sys_connect(r); break;
+    case 43 /* accept */:    fr = sys_accept(r); break;
     case 44 /* sendto */:    fr = sys_sendto(r); break;
     case 45 /* recvfrom */:  fr = sys_recvfrom(r); break;
+    case 49 /* bind */:      fr = sys_bind(r); break;
+    case 50 /* listen */:    fr = sys_listen(r); break;
     default:
         r->rax = (uint64_t)-ENOSYS;
         fr = (uint64_t)r;
