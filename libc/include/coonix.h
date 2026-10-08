@@ -435,6 +435,26 @@ static inline long getsockopt(int fd, int level, int opt, void *val,
     return _sys6(55, fd, level, opt, (long)val, (long)len);
 }
 
+// --- dns: kernel resolver (coonix syscall numbers) ---
+
+static inline long nanosleep(long sec, long nsec);
+
+static inline long setdnsserver(unsigned int be_ip) {
+    return _sys(4712, (long)be_ip, 0, 0);
+}
+
+// resolves name -> *out (big endian ip). blocks by retrying with
+// 20ms sleeps; returns 0 ok, < 0 = not found
+static inline long gethostbyname(const char *name, unsigned int *out) {
+    for (int i = 0; i < 150; i++) {
+        long rc = _sys(4711, (long)name, (long)out, 0);
+        if (rc != -EAGAIN)
+            return rc;
+        nanosleep(0, 20 * 1000000);
+    }
+    return -1;
+}
+
 struct timespec_k_dup { long tv_sec; long tv_nsec; };
 
 static inline long nanosleep(long sec, long nsec) {

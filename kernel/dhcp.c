@@ -13,6 +13,7 @@
 
 #define DHCPO_SUBNET   1
 #define DHCPO_ROUTER   3
+#define DHCPO_DNS      6
 #define DHCPO_REQIP    50
 #define DHCPO_MSGTYPE  53
 #define DHCPO_SERVERID 54
@@ -206,16 +207,21 @@ void dhcp_poll(void) {
             net_local_ip = __builtin_bswap32(d->yiaddr);
             const uint8_t *sn = opt_find(opts, olen, DHCPO_SUBNET);
             const uint8_t *gw = opt_find(opts, olen, DHCPO_ROUTER);
+            const uint8_t *dn = opt_find(opts, olen, DHCPO_DNS);
             if (sn)
                 net_netmask = get_ip(sn);
             if (gw)
                 net_gw_ip = get_ip(gw);
+            if (dn)
+                net_dns_ip = get_ip(dn);
             state = DS_BOUND;
             print_ip("[dhcp] lease ", net_local_ip, "\n");
             if (sn)
                 print_ip("[dhcp] mask ", net_netmask, "\n");
             if (gw)
                 print_ip("[dhcp] gw ", net_gw_ip, "\n");
+            if (dn)
+                print_ip("[dhcp] dns ", net_dns_ip, "\n");
         } else if (mt[2] == DHCP_NAK) {
             tries = DHCP_TRIES;  // force the timeout path below
         }

@@ -12,6 +12,7 @@
 #include "signal.h"
 #include "net.h"
 #include "tcp.h"
+#include "dns.h"
 #include "futex.h"
 #include "serial.h"
 #include "pipe.h"
@@ -2883,6 +2884,56 @@ static uint64_t sys_getsockopt(struct regs *r) {
     return (uint64_t)r;
 }
 
+// --- dns: coonix syscall numbers 4711/4712 ---
+
+// gethostbyname(name, out): one resolver step; -EAGAIN means "call
+// again after a wait" (the libc wrapper loops). 0 = *out filled (host
+// order), -ENOENT = name error
+static uint64_t sys_gethostbyname(struct regs *r) {
+    const char *un = (const char *)r->rdi;
+    uint32_t *uout = (uint32_t *)r->rsi;
+    char name[256];
+    if (!un || !task_user_range_ok(current, (uint64_t)un, 1, 0) ||
+        !uout || !task_user_range_ok(current, (uint64_t)uout, 4, 1)) {
+        r->rax = (uint64_t)-EFAULT;
+        return (uint64_t)r;
+    }
+    // bounded copy, user_path style: a truly bad pointer faults and
+    // kills the task, never the kernel
+    int i = 0;
+    for (; i < (int)sizeof(name) - 1; i++) {
+        name[i] = un[i];
+        if (!name[i])
+            break;
+    }
+    name[sizeof(name) - 1] = 0;
+    if (i >= (int)sizeof(name) - 1) {
+        r->rax = (uint64_t)-ENOENT;
+        return (uint64_t)r;
+    }
+    uint32_t ip = 0;
+    int rc = dns_resolve(name, 0, &ip);
+    if (rc == 0) {
+        *uout = __builtin_bswap32(ip);   // hand it out big endian
+        r->rax = 0;
+    } else if (rc == 1) {
+        r->rax = (uint64_t)-EAGAIN;
+    } else {
+        r->rax = (uint64_t)-ENOENT;
+    }
+    return (uint64_t)r;
+}
+
+// setdnsserver(be_ip): point the resolver at a new server, returns the
+// previous one (big endian both ways, like inet_addr)
+static uint64_t sys_setdns(struct regs *r) {
+    uint32_t be = (uint32_t)r->rdi;
+    uint32_t old = __builtin_bswap32(net_dns_ip);
+    net_dns_ip = __builtin_bswap32(be);
+    r->rax = old;
+    return (uint64_t)r;
+}
+
 static uint64_t sys_bind(struct regs *r) {
     int fd = (int)r->rdi;
     struct sockaddr_in_k *sa = (struct sockaddr_in_k *)r->rsi;
@@ -3166,6 +3217,8 @@ uint64_t syscall_dispatch(struct regs *r) {
     case 46 /* sendmsg */:   fr = sys_sendmsg(r); break;
     case 47 /* recvmsg */:   fr = sys_recvmsg(r); break;
     case 55 /* getsockopt */: fr = sys_getsockopt(r); break;
+    case 4711 /* gethostbyname */: fr = sys_gethostbyname(r); break;
+    case 4712 /* setdnsserver */:  fr = sys_setdns(r); break;
     case 49 /* bind */:      fr = sys_bind(r); break;
     case 50 /* listen */:    fr = sys_listen(r); break;
     default:

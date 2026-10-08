@@ -21,6 +21,7 @@
 #include "ahci.h"
 #include "virtio_blk.h"
 #include "net.h"
+#include "dns.h"
 #include "dhcp.h"
 #include "virtio_net.h"
 #include "ext2.h"
@@ -220,6 +221,7 @@ void kmain(void) {
     }
 
     net_init();
+    dns_init();
     virtio_net_init();
     console_puts("net: stack ready, ip 10.0.2.15 gw 10.0.2.2\n");
     dhcp_start();              // replaces the static ip when a lease lands

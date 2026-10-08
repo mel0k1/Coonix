@@ -25,6 +25,7 @@ extern struct net_mac net_hwaddr;
 extern uint32_t net_local_ip;    // host order
 extern uint32_t net_gw_ip;       // host order
 extern uint32_t net_netmask;     // host order
+extern uint32_t net_dns_ip;      // host order (dhcp option 6 / slirp default)
 
 void net_init(void);
 // nic driver hooks (virtio_net.c registers these)

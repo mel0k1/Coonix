@@ -60,6 +60,7 @@ struct net_mac net_hwaddr = {{0x52, 0x54, 0x00, 0x12, 0x34, 0x56}};
 uint32_t net_local_ip = 0x0a00020f;   // 10.0.2.15 (qemu slirp default)
 uint32_t net_gw_ip = 0x0a000202;      // 10.0.2.2
 uint32_t net_netmask = 0xffffff00;
+uint32_t net_dns_ip = 0x0a000203;     // 10.0.2.3 (qemu slirp dns)
 struct net_nic net_nic;
 
 // -- arp -----------------------------------------------------------------
