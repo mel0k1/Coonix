@@ -105,6 +105,18 @@ int main(void) {
     check("tcp payload", got == TOTAL &&
           !memcmp(sbuf, rbuf, (unsigned long)TOTAL));
 
+    // --- congestion: slow start must have grown the window ---
+    struct tcp_info_k ti;
+    unsigned int ilen = sizeof(ti);
+    check("tcp info", getsockopt((int)cfd, SOL_TCP, TCP_INFO, &ti,
+                                 &ilen) == 0);
+    check("tcp state est", ti.state == 4);   // TS_ESTABLISHED
+    check("cwnd grew", ti.cwnd > 6000);      // IW was 2*MSS = 2400
+    int soerr = -1;
+    ilen = sizeof(soerr);
+    check("so_error 0", getsockopt((int)cfd, SOL_SOCKET, SO_ERROR,
+                                   &soerr, &ilen) == 0 && soerr == 0);
+
     // --- eof: server closes, client sees recv == 0 after draining ---
     close((int)afd);
     int eof = 0;

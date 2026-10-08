@@ -413,6 +413,28 @@ static inline long recvmsg(int fd, struct msghdr *m, int flags) {
     return _sys(47, fd, (long)m, 0);
 }
 
+// --- getsockopt: SO_ERROR/SO_TYPE + coonix TCP_INFO subset ---
+
+#define SOL_SOCKET  1
+#define SO_TYPE     3
+#define SO_ERROR    4
+#define SOL_TCP     6
+#define TCP_INFO    11
+
+struct tcp_info_k {
+    unsigned char state;          // kernel tcp state enum
+    unsigned char pad[3];
+    unsigned int cwnd;            // congestion window, bytes
+    unsigned int ssthresh;
+    unsigned short mss;
+    unsigned short rto;           // ticks
+};
+
+static inline long getsockopt(int fd, int level, int opt, void *val,
+                              unsigned int *len) {
+    return _sys6(55, fd, level, opt, (long)val, (long)len);
+}
+
 struct timespec_k_dup { long tv_sec; long tv_nsec; };
 
 static inline long nanosleep(long sec, long nsec) {

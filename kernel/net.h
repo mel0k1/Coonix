@@ -51,6 +51,9 @@ uint16_t net_pseudo_cksum(uint32_t src, uint32_t dst, uint8_t proto,
 uint16_t net_next_port(void);
 // protocol of a socket slot (NET_PROTO_*), -1 = bad fd
 int net_proto(int fd);
+// limited getsockopt (SOL_SOCKET SO_ERROR/SO_TYPE, IPPROTO_TCP TCP_INFO);
+// val is a kernel buffer, 0 ok / -1 unsupported
+long net_getsockopt(int fd, int level, int opt, void *val, uint32_t vlen);
 
 // ingress: one ip packet (ethernet header stripped by the nic driver);
 // also serves the loopback short-circuit

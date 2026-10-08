@@ -38,6 +38,16 @@ enum {
     TS_TIME_WAIT,
 };
 
+// getsockopt(TCP_INFO) subset (coonix flavor, not linux's big struct)
+struct tcp_info_k {
+    uint8_t state;               // enum above
+    uint8_t pad[3];
+    uint32_t cwnd;               // congestion window, bytes
+    uint32_t ssthresh;           // slow-start threshold, bytes
+    uint16_t mss;
+    uint16_t rto;                // retransmit timeout, ticks
+};
+
 void tcp_init(void);
 void *tcp_alloc(void);                 // fresh socket, 0 = table full
 void tcp_destroy(void *p);             // close + release resources
@@ -51,6 +61,10 @@ long tcp_send(void *p, const void *buf, uint16_t len);
 // returns bytes copied, 0 = eof, -EAGAIN = no data, < 0 = errno
 long tcp_recv(void *p, void *buf, uint16_t len);
 int tcp_peer(void *p, uint32_t *ip, uint16_t *port);
+// pending error, read-and-clear (0 = none)
+int tcp_so_error(void *p);
+// snapshot for getsockopt(TCP_INFO), 0 ok
+int tcp_info(void *p, struct tcp_info_k *out);
 
 // ingress: one tcp segment (ip header stripped), host-order addrs
 void tcp_input(const uint8_t *seg, uint16_t len,

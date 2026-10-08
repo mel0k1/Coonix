@@ -11,6 +11,7 @@
 #include "pit.h"
 #include "signal.h"
 #include "net.h"
+#include "tcp.h"
 #include "futex.h"
 #include "serial.h"
 #include "pipe.h"
@@ -2846,6 +2847,42 @@ static uint64_t sys_recvmsg(struct regs *r) {
     return (uint64_t)r;
 }
 
+// --- getsockopt: SO_ERROR / SO_TYPE / TCP_INFO subset ---
+
+#define ENOPROTOOPT 92
+
+static uint64_t sys_getsockopt(struct regs *r) {
+    int fd = (int)r->rdi;
+    int level = (int)r->rsi;
+    int opt = (int)r->rdx;
+    void *uval = (void *)r->r10;
+    uint32_t *ulen = (uint32_t *)r->r8;
+    int sfd = sock_slot(fd, 0);
+    if (sfd < 0) {
+        r->rax = (uint64_t)-ENOTSOCK;
+        return (uint64_t)r;
+    }
+    uint8_t buf[16];
+    uint32_t size = 4;
+    if (level == 6 && opt == 11)     // IPPROTO_TCP / TCP_INFO
+        size = (uint32_t)sizeof(struct tcp_info_k);
+    if (size > sizeof(buf))
+        size = sizeof(buf);
+    if (!uval || !task_user_range_ok(current, (uint64_t)uval, size, 1) ||
+        !ulen || !task_user_range_ok(current, (uint64_t)ulen, 4, 1)) {
+        r->rax = (uint64_t)-EFAULT;
+        return (uint64_t)r;
+    }
+    if (net_getsockopt(sfd, level, opt, buf, size) < 0) {
+        r->rax = (uint64_t)-ENOPROTOOPT;
+        return (uint64_t)r;
+    }
+    memcpy(uval, buf, size);
+    *ulen = size;
+    r->rax = 0;
+    return (uint64_t)r;
+}
+
 static uint64_t sys_bind(struct regs *r) {
     int fd = (int)r->rdi;
     struct sockaddr_in_k *sa = (struct sockaddr_in_k *)r->rsi;
@@ -3128,6 +3165,7 @@ uint64_t syscall_dispatch(struct regs *r) {
     case 45 /* recvfrom */:  fr = sys_recvfrom(r); break;
     case 46 /* sendmsg */:   fr = sys_sendmsg(r); break;
     case 47 /* recvmsg */:   fr = sys_recvmsg(r); break;
+    case 55 /* getsockopt */: fr = sys_getsockopt(r); break;
     case 49 /* bind */:      fr = sys_bind(r); break;
     case 50 /* listen */:    fr = sys_listen(r); break;
     default:

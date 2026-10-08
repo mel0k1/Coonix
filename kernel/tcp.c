@@ -12,6 +12,8 @@
 #define TCP_SNDBUF   4096
 #define TCP_RCVBUF   8192
 #define TCP_MSS      1200
+#define TCP_IW       (2 * TCP_MSS)   // initial congestion window
+#define TCP_LW       65535           // initial slow-start threshold
 #define TCP_BACKLOG  4
 #define TCP_RTO      30          // ticks
 #define TCP_MAXRET   5
@@ -24,6 +26,9 @@ struct tcpsk {
     uint32_t iss, snd_una, snd_nxt, rcv_nxt;
     uint16_t snd_wnd, adv_wnd;
     uint16_t snd_len, rcv_len;
+    uint32_t cwnd, ssthresh;     // reno congestion control (bytes)
+    int dupacks;                 // dup-ack counter for fast retransmit
+    int so_error;                // pending error, cleared on read
     uint8_t sndbuf[TCP_SNDBUF];
     uint8_t rcvbuf[TCP_RCVBUF];
     uint8_t fin_req, fin_sent, fin_acked, fin_rx, got_syn;
@@ -113,6 +118,33 @@ static void send_ack(struct tcpsk *sk) {
     tx_seg(sk, sk->snd_nxt, sk->got_syn ? TCPF_ACK : 0, 0, 0);
 }
 
+// reno bookkeeping on rto: halve ssthresh, collapse cwnd (rfc 5681)
+static void cwnd_collapse(struct tcpsk *sk) {
+    sk->ssthresh = sk->cwnd / 2;
+    if (sk->ssthresh < 2 * TCP_MSS)
+        sk->ssthresh = 2 * TCP_MSS;
+    sk->cwnd = TCP_MSS;
+    sk->dupacks = 0;
+}
+
+// resend the oldest unacked data (or the fin) from snd_una
+static void retrans_una(struct tcpsk *sk) {
+    if (sk->fin_sent && !sk->fin_acked && sk->snd_len == 0 &&
+        sk->snd_nxt == sk->snd_una + 1) {
+        tx_seg(sk, sk->snd_una, (uint8_t)(TCPF_ACK | TCPF_FIN), 0, 0);
+        return;
+    }
+    uint16_t n = (uint16_t)(sk->snd_nxt - sk->snd_una);
+    if (n > TCP_MSS)
+        n = TCP_MSS;
+    if (n > sk->snd_len)
+        n = sk->snd_len;
+    if (n)
+        tx_seg(sk, sk->snd_una, TCPF_ACK | TCPF_PSH, sk->sndbuf, n);
+    else if (sk->fin_sent && !sk->fin_acked)
+        tx_seg(sk, sk->snd_una, (uint8_t)(TCPF_ACK | TCPF_FIN), 0, 0);
+}
+
 // (re)transmit scheduler: rto backoff, new data within the peer window,
 // then the pending fin
 static void tcp_output(struct tcpsk *sk) {
@@ -123,6 +155,7 @@ static void tcp_output(struct tcpsk *sk) {
     if (sk->state == TS_SYN_SENT || sk->state == TS_SYN_RX) {
         if (now - sk->tx_tick >= TCP_RTO) {
             if (++sk->retries > TCP_MAXRET) {
+                sk->so_error = TCP_ETIMEDOUT;
                 sk->state = TS_CLOSED;
                 return;
             }
@@ -138,33 +171,24 @@ static void tcp_output(struct tcpsk *sk) {
     // retransmit the oldest unacked segment (go-back-n)
     if (sk->snd_una != sk->snd_nxt && now - sk->tx_tick >= TCP_RTO) {
         if (++sk->retries > TCP_MAXRET) {
+            sk->so_error = TCP_ETIMEDOUT;
             sk->state = TS_CLOSED;
             return;
         }
-        if (sk->fin_sent && !sk->fin_acked && sk->snd_len == 0 &&
-            sk->snd_nxt == sk->snd_una + 1) {
-            // only the fin is unacked
-            tx_seg(sk, sk->snd_una, (uint8_t)(TCPF_ACK | TCPF_FIN), 0, 0);
-        } else {
-            uint16_t n = (uint16_t)(sk->snd_nxt - sk->snd_una);
-            if (n > TCP_MSS)
-                n = TCP_MSS;
-            if (n > sk->snd_len)
-                n = sk->snd_len;
-            if (n)
-                tx_seg(sk, sk->snd_una, TCPF_ACK | TCPF_PSH, sk->sndbuf, n);
-            else if (sk->fin_sent && !sk->fin_acked)
-                tx_seg(sk, sk->snd_una, (uint8_t)(TCPF_ACK | TCPF_FIN), 0, 0);
-        }
+        cwnd_collapse(sk);
+        retrans_una(sk);
         sk->tx_tick = now;
     }
 
-    // fresh data, bounded by the advertised peer window
+    // fresh data, bounded by the peer window and the congestion window
+    uint32_t limit = sk->snd_wnd;
+    if (limit > sk->cwnd)
+        limit = sk->cwnd;
     while (SEQ_LT(sk->snd_nxt, sk->snd_una + sk->snd_len) &&
-           sk->snd_nxt - sk->snd_una < sk->snd_wnd) {
+           sk->snd_nxt - sk->snd_una < limit) {
         uint32_t off = sk->snd_nxt - sk->snd_una;
         uint32_t inflight = sk->snd_nxt - sk->snd_una;
-        uint32_t room = sk->snd_wnd - inflight;
+        uint32_t room = limit - inflight;
         uint32_t n = sk->snd_len - off;
         if (n > TCP_MSS)
             n = TCP_MSS;
@@ -297,6 +321,7 @@ void tcp_input(const uint8_t *seg, uint16_t len,
         return;
     }
     if (flags & TCPF_RST) {
+        sk->so_error = TCP_ECONNRESET;
         reset_sk(sk);
         return;
     }
@@ -359,6 +384,7 @@ void tcp_input(const uint8_t *seg, uint16_t len,
     }
 
     if (flags & TCPF_ACK) {
+        int wnd_changed = sk->snd_wnd != wnd;
         if (SEQ_LT(sk->snd_una, ackn) && SEQ_LEQ(ackn, sk->snd_nxt)) {
             uint32_t adv = ackn - sk->snd_una;
             if (adv > sk->snd_len)
@@ -370,6 +396,18 @@ void tcp_input(const uint8_t *seg, uint16_t len,
             sk->snd_una = ackn;
             sk->retries = 0;
             sk->tx_tick = pit_ticks();
+            // reno (rfc 5681): fast recovery exits deflated, otherwise
+            // slow start doubles into ssthresh, then aimd creep
+            if (sk->dupacks >= 3) {
+                sk->cwnd = sk->ssthresh;
+                sk->dupacks = 0;
+            } else if (sk->cwnd < sk->ssthresh) {
+                sk->cwnd += TCP_MSS;
+            } else if (sk->cwnd) {
+                sk->cwnd += TCP_MSS * TCP_MSS / sk->cwnd;
+            }
+            if (sk->cwnd > TCP_LW)
+                sk->cwnd = TCP_LW;
             if (sk->fin_sent && ackn == sk->snd_nxt)
                 sk->fin_acked = 1;
             if (sk->state == TS_SYN_RX)
@@ -383,6 +421,23 @@ void tcp_input(const uint8_t *seg, uint16_t len,
             } else if (sk->state == TS_LAST_ACK && sk->fin_acked)
                 sk->state = TS_CLOSED;
             need_ack = 0;            // acked by the ack itself
+        } else if (!plen && ackn == sk->snd_una &&
+                   SEQ_LT(sk->snd_una, sk->snd_nxt) && !wnd_changed &&
+                   data_state(sk->state)) {
+            // duplicate ack: nothing new acked, no payload, window flat
+            if (sk->dupacks < 3)
+                sk->dupacks++;
+            if (sk->dupacks == 3) {
+                // fast retransmit, then inflate during fast recovery
+                sk->ssthresh = sk->cwnd / 2;
+                if (sk->ssthresh < 2 * TCP_MSS)
+                    sk->ssthresh = 2 * TCP_MSS;
+                sk->cwnd = sk->ssthresh + 3 * TCP_MSS;
+                retrans_una(sk);
+            } else if (sk->dupacks > 3 &&
+                       sk->cwnd <= TCP_LW - TCP_MSS) {
+                sk->cwnd += TCP_MSS;
+            }
         }
         sk->snd_wnd = wnd;
     }
@@ -419,6 +474,8 @@ void *tcp_alloc(void) {
     sk->state = TS_CLOSED;
     sk->lport = net_next_port();
     sk->snd_wnd = TCP_SNDBUF;        // optimistic until the peer answers
+    sk->cwnd = TCP_IW;
+    sk->ssthresh = TCP_LW;
     return sk;
 }
 
@@ -567,6 +624,28 @@ int tcp_peer(void *p, uint32_t *ip, uint16_t *port) {
         *ip = sk->peer_ip;
     if (port)
         *port = sk->rport;
+    return 0;
+}
+
+int tcp_so_error(void *p) {
+    struct tcpsk *sk = p;
+    if (!sk || !sk->used)
+        return TCP_EBADFD;
+    int e = sk->so_error;
+    sk->so_error = 0;
+    return e;
+}
+
+int tcp_info(void *p, struct tcp_info_k *out) {
+    struct tcpsk *sk = p;
+    if (!sk || !sk->used || !out)
+        return -1;
+    out->state = (uint8_t)sk->state;
+    out->pad[0] = out->pad[1] = out->pad[2] = 0;
+    out->cwnd = sk->cwnd;
+    out->ssthresh = sk->ssthresh;
+    out->mss = TCP_MSS;
+    out->rto = TCP_RTO;
     return 0;
 }
 

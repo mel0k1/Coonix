@@ -457,6 +457,40 @@ int net_proto(int fd) {
     return p;
 }
 
+// limited getsockopt: SOL_SOCKET(SO_ERROR/SO_TYPE) + TCP_INFO snapshot
+long net_getsockopt(int fd, int level, int opt, void *val, uint32_t vlen) {
+    net_lock_enter();
+    long rc = -1;
+    if (fd < 0 || fd >= NSOCKS || !socks[fd].used) {
+        net_lock_leave();
+        return -1;
+    }
+    struct netsock *sk = &socks[fd];
+    if (level == 1) {                // SOL_SOCKET
+        if (opt == 4 && val && vlen >= 4) {   // SO_ERROR, read-clear
+            int e = 0;
+            if (sk->proto == NET_PROTO_TCP && sk->tcp)
+                e = tcp_so_error(sk->tcp);
+            *(int *)val = e;
+            rc = 0;
+        } else if (opt == 3 && val && vlen >= 4) {   // SO_TYPE
+            int t = 2;               // SOCK_DGRAM
+            if (sk->proto == NET_PROTO_TCP)
+                t = 1;               // SOCK_STREAM
+            else if (sk->proto == NET_PROTO_ICMP)
+                t = 3;               // SOCK_RAW
+            *(int *)val = t;
+            rc = 0;
+        }
+    } else if (level == 6 && opt == 11) {   // IPPROTO_TCP / TCP_INFO
+        if (sk->proto == NET_PROTO_TCP && sk->tcp && val &&
+            vlen >= sizeof(struct tcp_info_k))
+            rc = tcp_info(sk->tcp, (struct tcp_info_k *)val);
+    }
+    net_lock_leave();
+    return rc;
+}
+
 int net_socket(int proto) {
     net_lock_enter();
     if (proto != NET_PROTO_UDP && proto != NET_PROTO_ICMP &&
