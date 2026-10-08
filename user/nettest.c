@@ -34,10 +34,13 @@ int main(void) {
     check("udp socket", fd >= 0);
 
     // --- udp loopback ---
-    // kernel auto-binds port 40000 + fd; loopback delivers dport matches
+    // bind a known port; loopback delivers dport matches
+    struct sockaddr_in self;
+    mkaddr(&self, ipaddr(0, 0, 0, 0), 40123);
+    check("udp bind", bind((int)fd, &self, sizeof(self)) == 0);
     const char *msg = "enot rules the wire";
     struct sockaddr_in dst;
-    mkaddr(&dst, ipaddr(127, 0, 0, 1), 40000 + fd);
+    mkaddr(&dst, ipaddr(127, 0, 0, 1), 40123);
     check("udp sendto lo", sendto((int)fd, msg, strlen(msg), &dst) ==
                              (long)strlen(msg));
     char buf[128];

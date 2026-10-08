@@ -297,12 +297,26 @@ static inline long clock_gettime(int clk, struct timespec_k *ts) {
 }
 
 
-// --- sockets (AF_INET, SOCK_DGRAM; raw ping via proto=1) ---
+// --- sockets (AF_INET: udp/icmp datagrams + tcp streams) ---
 
 #define AF_INET      2
+#define SOCK_STREAM  1
 #define SOCK_DGRAM   2
 #define IPPROTO_ICMP 1
+#define IPPROTO_TCP  6
 #define IPPROTO_UDP  17
+
+// errno flavors the kernel returns for sockets
+#define EAGAIN       11
+#define EPIPE        32
+#define EMSGSIZE     90
+#define ECONNRESET   104
+#define EISCONN      106
+#define ENOTCONN     107
+#define ETIMEDOUT    110
+#define ECONNREFUSED 111
+#define EALREADY     114
+#define EINPROGRESS  115
 
 struct sockaddr_in {
     unsigned short sin_family;
@@ -337,6 +351,37 @@ static inline long recvfrom(int fd, void *buf, unsigned long len,
                        "d"((long)len), "r"(_d)
                      : "memory");
     return ret;
+}
+
+// --- tcp stream extensions ---
+
+static inline long connect(int fd, const struct sockaddr_in *sa,
+                           unsigned long alen) {
+    (void)alen;
+    return _sys(42, fd, (long)sa, 0);
+}
+
+static inline long bind(int fd, const struct sockaddr_in *sa,
+                        unsigned long alen) {
+    (void)alen;
+    return _sys(49, fd, (long)sa, 0);
+}
+
+static inline long listen(int fd, int backlog) {
+    return _sys(50, fd, backlog, 0);
+}
+
+static inline long accept(int fd, struct sockaddr_in *sa,
+                          unsigned int *alen) {
+    return _sys(43, fd, (long)sa, (long)alen);
+}
+
+static inline long send(int fd, const void *buf, unsigned long len) {
+    return sendto(fd, buf, len, 0);
+}
+
+static inline long recv(int fd, void *buf, unsigned long len) {
+    return recvfrom(fd, buf, len, 0);
 }
 
 struct timespec_k_dup { long tv_sec; long tv_nsec; };
