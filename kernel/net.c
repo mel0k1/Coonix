@@ -118,7 +118,7 @@ static uint16_t cksum(const void *buf, uint16_t len) {
         len -= 2;
     }
     if (len)
-        sum += p[0];
+        sum += p[0] << 8;    // odd tail rides the high byte
     while (sum >> 16)
         sum = (sum & 0xffff) + (sum >> 16);
     return (uint16_t)~sum;
@@ -147,7 +147,7 @@ uint16_t net_pseudo_cksum(uint32_t src, uint32_t dst, uint8_t proto,
         n -= 2;
     }
     if (n)
-        sum += p[0];
+        sum += p[0] << 8;        // odd tail rides the high byte
     while (sum >> 16)
         sum = (sum & 0xffff) + (sum >> 16);
     return (uint16_t)~sum;
