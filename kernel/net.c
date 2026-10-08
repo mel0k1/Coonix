@@ -241,6 +241,7 @@ void net_stack_output(const void *buf, uint16_t len, uint32_t dst_ip) {
             lo_len[t] = (uint16_t)len;
             lo_count++;
         }
+        net_lock_leave();
         return;
     }
     if (!net_nic.send) {
@@ -266,8 +267,10 @@ void net_stack_output(const void *buf, uint16_t len, uint32_t dst_ip) {
     uint16_t et = 0x0800;            // ipv4
     p[0] = (uint8_t)(et >> 8);
     p[1] = (uint8_t)et;
-    if ((uint32_t)NET_ETH_LEN + len > sizeof(frame))
+    if ((uint32_t)NET_ETH_LEN + len > sizeof(frame)) {
+        net_lock_leave();
         return;
+    }
     memcpy(p + 2, buf, len);
     net_nic.send(frame, (uint16_t)(NET_ETH_LEN + len));
     net_lock_leave();
@@ -602,6 +605,7 @@ int net_sendto(int fd, const void *buf, uint16_t len,
         memcpy(pkt + NET_UDP_LEN, buf, len);
         plen = (uint16_t)(len + NET_UDP_LEN);
         ip_output(pkt, plen, NET_PROTO_UDP, ip);
+        net_lock_leave();
         return len;
     }
     // icmp ping: echo request, id = port, seq increments
@@ -624,14 +628,17 @@ int net_sendto(int fd, const void *buf, uint16_t len,
     sk->seq++;
     plen = icmplen;
     ip_output(pkt, plen, NET_PROTO_ICMP, ip);
+    net_lock_leave();
     return len;
 }
 
 long net_recvfrom(int fd, void *buf, uint16_t len,
                   uint32_t *src_ip, uint16_t *src_port) {
     net_lock_enter();
-    if (fd < 0 || fd >= NSOCKS || !socks[fd].used)
+    if (fd < 0 || fd >= NSOCKS || !socks[fd].used) {
+        net_lock_leave();
         return -1;
+    }
     struct netsock *sk = &socks[fd];
     if (sk->proto == NET_PROTO_TCP) {
         long rc = sk->tcp ? tcp_recv(sk->tcp, buf, len) : -1;
