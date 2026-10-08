@@ -8,7 +8,7 @@
 #include "string.h"
 #include "console.h"
 
-// legacy virtio-net: two queues (rx=0, tx=1), 12-byte net header in
+// legacy virtio-net: two queues (rx=0, tx=1), 10-byte net header in
 // front of every frame, polling driven (no irq bookkeeping)
 
 struct vnet_hdr {
@@ -124,29 +124,17 @@ static int vnet_send(const void *buf, uint16_t len) {
     volatile struct vring_used *used =
         (volatile struct vring_used *)(vn.tx + VRING_USED_OFF(vn.qsize));
 
-    // staging page: [vnet header | frame | status byte]
+    // staging page: [vnet header | frame] as one contiguous descriptor
     struct vnet_hdr *hdr = (struct vnet_hdr *)vn.txbuf;
-    uint8_t *frame = vn.txbuf + 0x100;
-    uint8_t *status = vn.txbuf + 0x100 + len;
+    uint8_t *frame = vn.txbuf + sizeof(struct vnet_hdr);
     memset(hdr, 0, sizeof(*hdr));
     memcpy(frame, buf, len);
-    *status = 0x77;
 
     uint16_t s0 = (uint16_t)(vn.tx_avail % vn.qsize);
-    uint16_t s1 = (uint16_t)((s0 + 1) % vn.qsize);
-    uint16_t s2 = (uint16_t)((s0 + 2) % vn.qsize);
     desc[s0].addr = vn.txbuf_phys;
-    desc[s0].len = sizeof(struct vnet_hdr);
-    desc[s0].flags = VRING_DESC_NEXT;
-    desc[s0].next = s1;
-    desc[s1].addr = vn.txbuf_phys + 0x100;
-    desc[s1].len = len;
-    desc[s1].flags = VRING_DESC_NEXT;
-    desc[s1].next = s2;
-    desc[s2].addr = vn.txbuf_phys + 0x100 + len;
-    desc[s2].len = 1;
-    desc[s2].flags = VRING_DESC_WRITE;
-    desc[s2].next = 0;
+    desc[s0].len = (uint32_t)(sizeof(struct vnet_hdr) + len);
+    desc[s0].flags = 0;
+    desc[s0].next = 0;
 
     avail->ring[vn.tx_avail % vn.qsize] = s0;
     vn.tx_avail++;
@@ -154,6 +142,8 @@ static int vnet_send(const void *buf, uint16_t len) {
     __asm__ volatile("mfence" ::: "memory");
     vwr16(VIRTIO_QUEUE_NOTIFY, TXQ);
 
+    // completion is the used ring advance only; virtio-net writes no
+    // per-packet status byte
     uint64_t budget = 400000000;
     while (budget--) {
         if (used->idx != vn.tx_seen)
@@ -163,7 +153,7 @@ static int vnet_send(const void *buf, uint16_t len) {
     if (used->idx == vn.tx_seen)
         return -1;
     vn.tx_seen = used->idx;
-    return (*status == 0) ? 0 : -1;
+    return 0;
 }
 
 void virtio_net_poll(void) {
@@ -177,10 +167,11 @@ void virtio_net_poll(void) {
         vn.rx_seen++;
         uint16_t slot = (uint16_t)(e->id & (vn.qsize - 1));
         uint8_t *buf = vn.rxbuf[slot];
-        if (e->len > 12 && e->len <= BUFSZ) {
-            // device wrote: 12-byte net header + the ethernet frame
-            uint8_t *frame = buf + 12;
-            uint16_t flen = (uint16_t)(e->len - 12);
+        // device writes: 10-byte net header + the ethernet frame
+        uint16_t hlen = (uint16_t)sizeof(struct vnet_hdr);
+        if (e->len >= hlen + 14 && e->len <= BUFSZ) {
+            uint8_t *frame = buf + hlen;
+            uint16_t flen = (uint16_t)(e->len - hlen);
             if (flen >= 14 && frame[12] == 0x08 && frame[13] == 0x06)
                 net_arp_input(frame + 14, (uint16_t)(flen - 14));
             else if (flen >= 14 + NET_IP_LEN)
@@ -265,6 +256,14 @@ int virtio_net_init(void) {
     vwr8(VIRTIO_STATUS, vrd8(VIRTIO_STATUS) | VIRTIOS_DRIVER_OK);
 
     rx_refill();
+    {
+        extern void serial_puts(const char *);
+        extern void serial_puthex(uint64_t);
+        serial_puts("[vnet rx="); serial_puthex(vn.rx_phys);
+        serial_puts(" tx="); serial_puthex(vn.tx_phys);
+        serial_puts(" qsize="); serial_puthex(vn.qsize);
+        serial_puts("]\n");
+    }
 
     net_nic.send = vnet_send;
     console_puts("net: virtio-net ");
