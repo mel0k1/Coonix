@@ -278,7 +278,7 @@ static void nd_request(const uint8_t *target) {
         return;
     // solicited-node multicast ff02::1:ffXX:XXXX
     static const uint8_t mc[16] =
-        {0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0};
+        {0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, 0, 0, 0};
     uint8_t dst[16];
     memcpy(dst, mc, 16);
     dst[13] = target[13];

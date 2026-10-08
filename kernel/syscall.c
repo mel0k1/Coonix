@@ -2545,6 +2545,8 @@ static uint64_t sys_socket(struct regs *r) {
         r->rax = (uint64_t)-ESOCKTNOSUPPORT;
         return (uint64_t)r;
     }
+    if (nproto == 58)            // IPPROTO_ICMPV6 rides the icmp slot
+        nproto = NET_PROTO_ICMP;
     if (nproto != NET_PROTO_UDP && nproto != NET_PROTO_ICMP &&
         nproto != NET_PROTO_TCP) {
         r->rax = (uint64_t)-EPROTONOSUPPORT;

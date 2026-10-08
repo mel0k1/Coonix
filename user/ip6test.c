@@ -69,12 +69,15 @@ static void udp6_child(void) {
     mkaddr6(&a, any6, UPORT);
     if (bind6((int)s, &a, sizeof(a)) < 0)
         exit(1);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 1; i++) {   // parent sends exactly one
         char b[300];
         struct sockaddr_in6 from;
-        long n = recvfrom6((int)s, b, sizeof(b), &from);
-        if (n <= 0)
-            break;
+        long n;
+        do {                     // non-blocking: poll until one lands
+            n = recvfrom6((int)s, b, sizeof(b), &from);
+            if (n <= 0)
+                nanosleep(0, 5 * 1000000);
+        } while (n <= 0);
         sendto6((int)s, b, (unsigned long)n, &from);
     }
     exit(0);

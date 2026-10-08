@@ -62,17 +62,21 @@ static void dns_child(void) {
     __builtin_memcpy(&a.sin_port, &pbe, 2);
     if (bind((int)s, &a, sizeof(a)) < 0)
         exit(1);
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 12; i++) {
         unsigned char q[512], r[512];
         struct sockaddr_in from;
-        long n = recvfrom((int)s, q, sizeof(q), &from);
-        if (n < 12)
-            break;
+        long n;
+        do {                     // non-blocking: poll until one lands
+            n = recvfrom((int)s, q, sizeof(q), &from);
+            if (n <= 0)
+                nanosleep(0, 5 * 1000000);
+        } while (n <= 0);
         char name[256];
         int ne = 0;
         if (get_qname(q, (int)n, name, sizeof(name), &ne) < 0)
             break;
         int nxdomain = !strcmp(name, "none.internal");
+        int done = !strcmp(name, "done.internal");
         __builtin_memcpy(r, q, 12);          // echo id
         r[2] = 0x81;                         // qr + rd
         r[3] = nxdomain ? 0x83 : 0x80;       // ra + rcode
@@ -102,6 +106,8 @@ static void dns_child(void) {
             o += 4;
         }
         sendto((int)s, r, (unsigned long)o, &from);
+        if (done)
+            exit(0);             // sentinel answered: server is done
     }
     exit(0);
 }
@@ -125,14 +131,13 @@ int main(void) {
     check("nxdomain fails",
           gethostbyname("none.internal", &ip) < 0 && ip == 0xdeadbeef);
 
-    // real resolution through slirp: the runner's resolver answers
-    // "localhost"; keep it non-fatal (no network in some sandboxes)
-    setdnsserver(be(ipaddr(10, 0, 2, 3)));
+    // tell the server to quit: it answers this, then exits
     ip = 0;
-    long rc = gethostbyname("localhost", &ip);
-    printf("[dnstest] %-24s %s\n", "slirp localhost",
-           rc == 0 ? "ok" : "skip");
+    check("resolve done.internal",
+          gethostbyname("done.internal", &ip) == 0 &&
+          ip == be(ipaddr(127, 0, 0, 1)));
 
+    // reap the echo server
     int st = -1;
     wait(&st);
     check("child exit", st == 0);

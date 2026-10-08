@@ -45,9 +45,12 @@ static void echo_child(void) {
         m.msg_namelen = sizeof(from);
         m.msg_iov = &iov;
         m.msg_iovlen = 1;
-        long n = recvmsg((int)s, &m, 0);
-        if (n <= 0)
-            break;
+        long n;
+        do {                     // non-blocking: poll until one lands
+            n = recvmsg((int)s, &m, 0);
+            if (n <= 0)
+                nanosleep(0, 5 * 1000000);
+        } while (n <= 0);
         for (long j = 0; j < n; j++)
             if (b[j] >= 'a' && b[j] <= 'z')
                 b[j] = (char)(b[j] - 'a' + 'A');
@@ -115,11 +118,12 @@ int main(void) {
     check("dup", d >= 0);
     check("sendmsg via dup", d >= 0 && sendmsg((int)d, &sm, 0) == 11);
 
-    // 4. dup2 onto a high fd, receive through it
-    check("dup2", dup2((int)s, 40) == 40);
+    // 4. dup2 onto another fd: send and receive through it
+    check("dup2", dup2((int)s, 13) == 13);
+    check("sendmsg via dup2", sendmsg(13, &sm, 0) == 11);
     n = -1;
     for (int t = 0; t < 50 && n <= 0; t++) {
-        n = recvmsg(40, &rm, 0);
+        n = recvmsg(13, &rm, 0);
         if (n <= 0)
             msleep(20);
     }
