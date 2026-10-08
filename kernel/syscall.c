@@ -2498,6 +2498,17 @@ struct sockaddr_in_k {
     uint8_t zero[8];
 };
 
+struct sockaddr_in6_k {
+    uint16_t family;    // 10 = AF_INET6
+    uint16_t port;      // big endian
+    uint32_t flow;
+    uint8_t addr[16];   // big endian
+    uint32_t scope;
+};
+
+#define AF_INET_K  2
+#define AF_INET6_K 10
+
 static struct file *sock_file_alloc(int slot) {
     struct file *f = kmalloc(sizeof(*f));
     if (!f)
@@ -2521,12 +2532,12 @@ static int sock_slot(int fd, struct file **out) {
 
 static uint64_t sys_socket(struct regs *r) {
     long domain = (long)r->rdi, type = (long)r->rsi, proto = (long)r->rdx;
-    if (domain != 2) {          // AF_INET only
+    if (domain != AF_INET_K && domain != AF_INET6_K) {
         r->rax = (uint64_t)-EAFNOSUPPORT;
         return (uint64_t)r;
     }
     int nproto;
-    if (type == 2)              // SOCK_DGRAM: udp or raw icmp
+    if (type == 2)              // SOCK_DGRAM: udp or raw icmp(v6)
         nproto = (int)proto;
     else if (type == 1)         // SOCK_STREAM: tcp
         nproto = (proto == 0 || proto == 6) ? NET_PROTO_TCP : -1;
@@ -2590,11 +2601,21 @@ static uint64_t sys_sendto(struct regs *r) {
         r->rax = (uint64_t)-ENOTSOCK;
         return (uint64_t)r;
     }
-    if (to && to->family != 2) {
+    int is6 = 0;
+    uint8_t dst6[16];
+    if (to && to->family == AF_INET6_K) {
+        struct sockaddr_in6_k *to6 = (struct sockaddr_in6_k *)to;
+        if (!task_user_range_ok(current, (uint64_t)to6, sizeof(*to6), 0)) {
+            r->rax = (uint64_t)-EFAULT;
+            return (uint64_t)r;
+        }
+        is6 = 1;
+        memcpy(dst6, to6->addr, 16);
+    } else if (to && to->family != AF_INET_K) {
         r->rax = (uint64_t)-EAFNOSUPPORT;
         return (uint64_t)r;
     }
-    uint32_t ip = to ? __builtin_bswap32(to->addr) : 0;
+    uint32_t ip = to && !is6 ? __builtin_bswap32(to->addr) : 0;
     uint16_t port = to ? __builtin_bswap16(to->port) : 0;
     if (len > 0xffff)
         len = 0xffff;
@@ -2606,7 +2627,8 @@ static uint64_t sys_sendto(struct regs *r) {
         if (n > sizeof(kbuf))
             n = sizeof(kbuf);
         memcpy(kbuf, (const uint8_t *)buf + sent, n);
-        long rc = net_sendto(sfd, kbuf, (uint16_t)n, ip, port);
+        long rc = is6 ? net_sendto6(sfd, kbuf, (uint16_t)n, dst6, port)
+                      : net_sendto(sfd, kbuf, (uint16_t)n, ip, port);
         if (rc < 0) {
             if (!sent)
                 sent = len > sizeof(kbuf) ? -EMSGSIZE : rc;
@@ -2637,20 +2659,44 @@ static uint64_t sys_recvfrom(struct regs *r) {
         r->rax = (uint64_t)-ENOTSOCK;
         return (uint64_t)r;
     }
-    uint32_t sip = 0;
-    uint16_t sport = 0;
+    int af = net_sock_af(sfd);
+    if (af < 0) {
+        r->rax = (uint64_t)-ENOTSOCK;
+        return (uint64_t)r;
+    }
     static uint8_t kbuf[1500];
     uint16_t clen = len > sizeof(kbuf) ? (uint16_t)sizeof(kbuf) : len;
-    long n = net_recvfrom(sfd, kbuf, clen, &sip, &sport);
-    if (n > 0 && from) {
-        if (!task_user_range_ok(current, (uint64_t)from,
-                                sizeof(*from), 1)) {
-            r->rax = (uint64_t)-EFAULT;
-            return (uint64_t)r;
+    uint16_t sport = 0;
+    long n;
+    if (af == NET_AF_INET6) {
+        uint8_t s6[16];
+        n = net_recvfrom6(sfd, kbuf, clen, s6, &sport);
+        if (n > 0 && from) {
+            struct sockaddr_in6_k *from6 = (struct sockaddr_in6_k *)from;
+            if (!task_user_range_ok(current, (uint64_t)from6,
+                                    sizeof(*from6), 1)) {
+                r->rax = (uint64_t)-EFAULT;
+                return (uint64_t)r;
+            }
+            from6->family = AF_INET6_K;
+            from6->port = __builtin_bswap16(sport);
+            from6->flow = 0;
+            memcpy(from6->addr, s6, 16);
+            from6->scope = 0;
         }
-        from->family = 2;
-        from->port = __builtin_bswap16(sport);
-        from->addr = __builtin_bswap32(sip);
+    } else {
+        uint32_t sip = 0;
+        n = net_recvfrom(sfd, kbuf, clen, &sip, &sport);
+        if (n > 0 && from) {
+            if (!task_user_range_ok(current, (uint64_t)from,
+                                    sizeof(*from), 1)) {
+                r->rax = (uint64_t)-EFAULT;
+                return (uint64_t)r;
+            }
+            from->family = AF_INET_K;
+            from->port = __builtin_bswap16(sport);
+            from->addr = __builtin_bswap32(sip);
+        }
     }
     if (n > 0)
         memcpy(buf, kbuf, (uint64_t)n);
@@ -2700,10 +2746,17 @@ static int msg_copyin(struct msghdr_k *um, struct msghdr_k *km,
         task_prefault_range(current, (uint64_t)iov[i].iov_base,
                             iov[i].iov_len);
     }
-    if (km->msg_name &&
-        !task_user_range_ok(current, (uint64_t)km->msg_name,
-                            sizeof(struct sockaddr_in_k), wr))
-        return -1;
+    if (km->msg_name) {
+        if (!task_user_range_ok(current, (uint64_t)km->msg_name,
+                                sizeof(struct sockaddr_in_k), wr))
+            return -1;
+        // v6 name is bigger; re-check if the family says so
+        if (((struct sockaddr_in_k *)km->msg_name)->family ==
+                AF_INET6_K &&
+            !task_user_range_ok(current, (uint64_t)km->msg_name,
+                                sizeof(struct sockaddr_in6_k), wr))
+            return -1;
+    }
     return 0;
 }
 
@@ -2734,16 +2787,23 @@ static uint64_t sys_sendmsg(struct regs *r) {
         r->rax = (uint64_t)-ENOTSOCK;
         return (uint64_t)r;
     }
+    int is6 = 0;
+    uint8_t dst6[16];
     uint32_t ip = 0;
     uint16_t port = 0;
     if (m.msg_name) {
         struct sockaddr_in_k *sa = m.msg_name;
-        if (sa->family != 2) {
+        if (sa->family == AF_INET6_K) {
+            is6 = 1;
+            memcpy(dst6, ((struct sockaddr_in6_k *)sa)->addr, 16);
+            port = __builtin_bswap16(((struct sockaddr_in6_k *)sa)->port);
+        } else if (sa->family == AF_INET_K) {
+            ip = __builtin_bswap32(sa->addr);
+            port = __builtin_bswap16(sa->port);
+        } else {
             r->rax = (uint64_t)-EAFNOSUPPORT;
             return (uint64_t)r;
         }
-        ip = __builtin_bswap32(sa->addr);
-        port = __builtin_bswap16(sa->port);
     }
     uint64_t total = 0;
     for (uint64_t i = 0; i < m.msg_iovlen; i++)
@@ -2767,7 +2827,9 @@ static uint64_t sys_sendmsg(struct regs *r) {
             memcpy(kbuf + off, iov[i].iov_base, iov[i].iov_len);
             off += iov[i].iov_len;
         }
-        long rc = net_sendto(sfd, kbuf, (uint16_t)total, ip, port);
+        long rc = is6 ? net_sendto6(sfd, kbuf, (uint16_t)total, dst6,
+                                    port)
+                      : net_sendto(sfd, kbuf, (uint16_t)total, ip, port);
         if (rc == -1)                // datagram refused by the stack
             rc = -EMSGSIZE;
         r->rax = (uint64_t)rc;
@@ -2787,7 +2849,8 @@ static uint64_t sys_sendmsg(struct regs *r) {
         if (n > sizeof(kbuf))
             n = sizeof(kbuf);
         memcpy(kbuf, (const uint8_t *)iov[off_i].iov_base + off_b, n);
-        long rc = net_sendto(sfd, kbuf, (uint16_t)n, ip, port);
+        long rc = is6 ? net_sendto6(sfd, kbuf, (uint16_t)n, dst6, port)
+                      : net_sendto(sfd, kbuf, (uint16_t)n, ip, port);
         if (rc < 0) {
             if (!sent)
                 sent = rc;
@@ -2817,11 +2880,15 @@ static uint64_t sys_recvmsg(struct regs *r) {
         return (uint64_t)r;
     }
     static uint8_t kbuf[1500];
+    int af = net_sock_af(sfd);
     uint32_t sip = 0;
     uint16_t sport = 0;
+    uint8_t s6[16];
     long total = 0;
     // one datagram per call: bounce then scatter (excess discarded)
-    long n = net_recvfrom(sfd, kbuf, sizeof(kbuf), &sip, &sport);
+    long n = af == NET_AF_INET6
+                 ? net_recvfrom6(sfd, kbuf, sizeof(kbuf), s6, &sport)
+                 : net_recvfrom(sfd, kbuf, sizeof(kbuf), &sip, &sport);
     if (n > 0) {
         uint64_t left = (uint64_t)n;
         for (uint64_t i = 0; i < m.msg_iovlen && left; i++) {
@@ -2835,11 +2902,27 @@ static uint64_t sys_recvmsg(struct regs *r) {
         m.msg_flags = 0;
         total = n;               // 0 = nothing queued, < 0 = errno
     }
-    if (m.msg_name && sock_put_addr(m.msg_name, sip, sport) < 0) {
-        r->rax = (uint64_t)-EFAULT;
-        return (uint64_t)r;
+    if (m.msg_name && af == NET_AF_INET6) {
+        struct sockaddr_in6_k *to = m.msg_name;
+        if (!task_user_range_ok(current, (uint64_t)to, sizeof(*to), 1)) {
+            r->rax = (uint64_t)-EFAULT;
+            return (uint64_t)r;
+        }
+        to->family = AF_INET6_K;
+        to->port = __builtin_bswap16(sport);
+        to->flow = 0;
+        memcpy(to->addr, s6, 16);
+        to->scope = 0;
+        m.msg_namelen = (uint32_t)sizeof(*to);
+    } else if (m.msg_name) {
+        if (sock_put_addr(m.msg_name, sip, sport) < 0) {
+            r->rax = (uint64_t)-EFAULT;
+            return (uint64_t)r;
+        }
+        m.msg_namelen = (uint32_t)sizeof(struct sockaddr_in_k);
     }
-    m.msg_namelen = m.msg_name ? (uint32_t)sizeof(struct sockaddr_in_k) : 0;
+    if (!m.msg_name)
+        m.msg_namelen = 0;
     if (task_user_range_ok(current, (uint64_t)um, sizeof(*um), 1)) {
         um->msg_namelen = m.msg_namelen;
         um->msg_flags = m.msg_flags;
@@ -2946,7 +3029,17 @@ static uint64_t sys_bind(struct regs *r) {
         r->rax = (uint64_t)-ENOTSOCK;
         return (uint64_t)r;
     }
-    if (sa->family != 2) {
+    if (sa->family == AF_INET6_K) {
+        struct sockaddr_in6_k *sa6 = (struct sockaddr_in6_k *)sa;
+        if (!task_user_range_ok(current, (uint64_t)sa6, sizeof(*sa6), 0)) {
+            r->rax = (uint64_t)-EFAULT;
+            return (uint64_t)r;
+        }
+        uint16_t port6 = __builtin_bswap16(sa6->port);
+        r->rax = (uint64_t)(net_bind6(sfd, port6) < 0 ? -EINVAL : 0);
+        return (uint64_t)r;
+    }
+    if (sa->family != AF_INET_K) {
         r->rax = (uint64_t)-EAFNOSUPPORT;
         return (uint64_t)r;
     }
@@ -2986,7 +3079,29 @@ static uint64_t sys_connect(struct regs *r) {
         r->rax = (uint64_t)-ENOTSOCK;
         return (uint64_t)r;
     }
-    if (sa->family != 2) {
+    if (sa->family == AF_INET6_K) {
+        struct sockaddr_in6_k *sa6 = (struct sockaddr_in6_k *)sa;
+        if (!task_user_range_ok(current, (uint64_t)sa6, sizeof(*sa6), 0)) {
+            r->rax = (uint64_t)-EFAULT;
+            return (uint64_t)r;
+        }
+        long rc6 = net_connect6(sfd, sa6->addr,
+                                __builtin_bswap16(sa6->port));
+        long out6;
+        switch (rc6) {
+        case 0:  out6 = 0; break;
+        case -9: out6 = -EBADF; break;
+        case -104: out6 = -ECONNRESET; break;
+        case -106: out6 = -EISCONN; break;
+        case -110: out6 = -ETIMEDOUT; break;
+        case -114: out6 = -EALREADY; break;
+        case -115: out6 = -EINPROGRESS; break;
+        default: out6 = -EINVAL; break;
+        }
+        r->rax = (uint64_t)out6;
+        return (uint64_t)r;
+    }
+    if (sa->family != AF_INET_K) {
         r->rax = (uint64_t)-EAFNOSUPPORT;
         return (uint64_t)r;
     }
@@ -3017,12 +3132,23 @@ static uint64_t sys_accept(struct regs *r) {
         r->rax = (uint64_t)-ENOTSOCK;
         return (uint64_t)r;
     }
+    int laf = net_sock_af(lsock);
     uint32_t ip = 0;
     uint16_t port = 0;
-    long slot = net_accept(lsock, &ip, &port);
-    if (slot < 0) {
-        r->rax = (uint64_t)-EAGAIN;
-        return (uint64_t)r;
+    uint8_t ip6[16];
+    long slot;
+    if (laf == NET_AF_INET6) {
+        slot = net_accept6(lsock, ip6, &port);
+        if (slot < 0) {
+            r->rax = (uint64_t)-EAGAIN;
+            return (uint64_t)r;
+        }
+    } else {
+        slot = net_accept(lsock, &ip, &port);
+        if (slot < 0) {
+            r->rax = (uint64_t)-EAGAIN;
+            return (uint64_t)r;
+        }
     }
     struct file *f = sock_file_alloc((int)slot);
     if (!f) {
@@ -3036,9 +3162,21 @@ static uint64_t sys_accept(struct regs *r) {
         r->rax = (uint64_t)-EMFILE;
         return (uint64_t)r;
     }
-    if (addr && task_user_range_ok(current, (uint64_t)addr,
-                                   sizeof(*addr), 1)) {
-        addr->family = 2;
+    if (addr && laf == NET_AF_INET6) {
+        struct sockaddr_in6_k *addr6 = (struct sockaddr_in6_k *)addr;
+        if (task_user_range_ok(current, (uint64_t)addr6,
+                               sizeof(*addr6), 1)) {
+            addr6->family = AF_INET6_K;
+            addr6->port = __builtin_bswap16(port);
+            addr6->flow = 0;
+            memcpy(addr6->addr, ip6, 16);
+            addr6->scope = 0;
+            if (alen && task_user_range_ok(current, (uint64_t)alen, 4, 1))
+                *alen = sizeof(*addr6);
+        }
+    } else if (addr && task_user_range_ok(current, (uint64_t)addr,
+                                          sizeof(*addr), 1)) {
+        addr->family = AF_INET_K;
         addr->port = __builtin_bswap16(port);
         addr->addr = __builtin_bswap32(ip);
         if (alen && task_user_range_ok(current, (uint64_t)alen, 4, 1))

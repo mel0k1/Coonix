@@ -21,7 +21,9 @@
 
 struct tcpsk {
     int used, owned, state;
-    uint32_t peer_ip;
+    uint8_t af;                  // NET_AF_INET4/6
+    uint32_t peer_ip;            // v4 peer (host order)
+    uint8_t peer6[16];           // v6 peer (big endian)
     uint16_t lport, rport;
     uint32_t iss, snd_una, snd_nxt, rcv_nxt;
     uint16_t snd_wnd, adv_wnd;
@@ -88,8 +90,12 @@ static void tx_seg(struct tcpsk *sk, uint32_t seq, uint8_t flags,
     pkt[18] = pkt[19] = 0;           // urgent
     if (len)
         memcpy(pkt + NET_TCP_LEN, payload, len);
-    net_ip_output(pkt, (uint16_t)(NET_TCP_LEN + len), NET_PROTO_TCP,
-                  sk->peer_ip);
+    if (sk->af == NET_AF_INET6)
+        net_ip6_output(pkt, (uint16_t)(NET_TCP_LEN + len), NET_NH_TCP,
+                       sk->peer6);
+    else
+        net_ip_output(pkt, (uint16_t)(NET_TCP_LEN + len), NET_PROTO_TCP,
+                      sk->peer_ip);
 }
 
 // rst with no socket context
@@ -112,6 +118,28 @@ static void tx_rst(uint16_t lport, uint16_t rport, uint32_t seq,
     pkt[13] = TCPF_RST | TCPF_ACK;
     pkt[14] = pkt[15] = pkt[16] = pkt[17] = pkt[18] = pkt[19] = 0;
     net_ip_output(pkt, NET_TCP_LEN, NET_PROTO_TCP, dst);
+}
+
+// rst with no socket context, ipv6 peer
+static void tx_rst6(uint16_t lport, uint16_t rport, uint32_t seq,
+                    uint32_t ack, const uint8_t *dst6) {
+    uint8_t pkt[NET_TCP_LEN];
+    pkt[0] = (uint8_t)(lport >> 8);
+    pkt[1] = (uint8_t)lport;
+    pkt[2] = (uint8_t)(rport >> 8);
+    pkt[3] = (uint8_t)rport;
+    pkt[4] = (uint8_t)(seq >> 24);
+    pkt[5] = (uint8_t)(seq >> 16);
+    pkt[6] = (uint8_t)(seq >> 8);
+    pkt[7] = (uint8_t)seq;
+    pkt[8] = (uint8_t)(ack >> 24);
+    pkt[9] = (uint8_t)(ack >> 16);
+    pkt[10] = (uint8_t)(ack >> 8);
+    pkt[11] = (uint8_t)ack;
+    pkt[12] = 0x50;
+    pkt[13] = TCPF_RST | TCPF_ACK;
+    pkt[14] = pkt[15] = pkt[16] = pkt[17] = pkt[18] = pkt[19] = 0;
+    net_ip6_output(pkt, NET_TCP_LEN, NET_NH_TCP, dst6);
 }
 
 static void send_ack(struct tcpsk *sk) {
@@ -253,13 +281,21 @@ static void dequeue_child(struct tcpsk *parent, struct tcpsk *child) {
     }
 }
 
-void tcp_input(const uint8_t *seg, uint16_t len,
-               uint32_t src, uint32_t dst) {
+// one engine for both families: src6 set = ipv6 (checksum over the
+// v6 pseudo header), src6 = 0 = ipv4
+static void tcp_input_af(const uint8_t *seg, uint16_t len,
+                         uint32_t src, uint32_t dst,
+                         const uint8_t *src6, const uint8_t *dst6) {
     (void)dst;
+    int af = src6 ? NET_AF_INET6 : NET_AF_INET4;
     if (len < NET_TCP_LEN)
         return;
-    if (net_pseudo_cksum(src, dst, NET_PROTO_TCP, seg, len) != 0)
+    if (af == NET_AF_INET6) {
+        if (net_pseudo6_cksum(src6, dst6, NET_NH_TCP, seg, len) != 0)
+            return;
+    } else if (net_pseudo_cksum(src, dst, NET_PROTO_TCP, seg, len) != 0) {
         return;                      // bad checksum
+    }
     uint16_t sport = (uint16_t)((seg[0] << 8) | seg[1]);
     uint16_t dport = (uint16_t)((seg[2] << 8) | seg[3]);
     uint32_t seq = ((uint32_t)seg[4] << 24) | ((uint32_t)seg[5] << 16) |
@@ -279,7 +315,9 @@ void tcp_input(const uint8_t *seg, uint16_t len,
     for (int i = 0; i < TCP_MAX && !sk; i++) {
         struct tcpsk *t = &tcp_tab[i];
         if (t->used && t->state != TS_LISTEN && t->lport == dport &&
-            t->rport == sport && t->peer_ip == src)
+            t->rport == sport &&
+            (af == NET_AF_INET6 ? net_ip6_eq(t->peer6, src6)
+                                : t->peer_ip == src))
             sk = t;
     }
     if (!sk && (flags & TCPF_SYN) && !(flags & TCPF_ACK)) {
@@ -293,7 +331,11 @@ void tcp_input(const uint8_t *seg, uint16_t len,
             struct tcpsk *ch = tcp_alloc();
             if (!ch)
                 return;
-            ch->peer_ip = src;
+            ch->af = (uint8_t)af;
+            if (af == NET_AF_INET6)
+                memcpy(ch->peer6, src6, 16);
+            else
+                ch->peer_ip = src;
             ch->rport = sport;
             ch->lport = dport;
             ch->parent = sk;
@@ -315,9 +357,14 @@ void tcp_input(const uint8_t *seg, uint16_t len,
     }
     if (!sk) {
         // no socket: rst unless the peer is rsting already
-        if (!(flags & TCPF_RST))
-            tx_rst(dport, sport,
-                   (flags & TCPF_ACK) ? ackn : 0, seq + plen + 1, dst);
+        if (!(flags & TCPF_RST)) {
+            if (af == NET_AF_INET6)
+                tx_rst6(dport, sport, (flags & TCPF_ACK) ? ackn : 0,
+                        seq + plen + 1, dst6);
+            else
+                tx_rst(dport, sport,
+                       (flags & TCPF_ACK) ? ackn : 0, seq + plen + 1, dst);
+        }
         return;
     }
     if (flags & TCPF_RST) {
@@ -531,7 +578,8 @@ int tcp_listen(void *p, int backlog) {
     return 0;
 }
 
-int tcp_connect(void *p, uint32_t ip, uint16_t port) {
+static int tcp_connect_af(void *p, uint32_t ip, const uint8_t *ip6,
+                          uint16_t port, int af) {
     struct tcpsk *sk = p;
     if (!sk || !sk->used)
         return TCP_EBADFD;
@@ -541,9 +589,13 @@ int tcp_connect(void *p, uint32_t ip, uint16_t port) {
         return 0;                    // handshake done since last call
     if (sk->state == TS_SYN_SENT)
         return TCP_EALREADY;
-    if (sk->state == TS_CLOSED && sk->peer_ip)
+    if (sk->state == TS_CLOSED && (sk->peer_ip || sk->af))
         return TCP_ETIMEDOUT;        // previous attempt failed
-    sk->peer_ip = ip;
+    sk->af = (uint8_t)af;
+    if (af == NET_AF_INET6)
+        memcpy(sk->peer6, ip6, 16);
+    else
+        sk->peer_ip = ip;
     sk->rport = port;
     sk->iss = next_isn();
     sk->snd_una = sk->iss;
@@ -554,6 +606,14 @@ int tcp_connect(void *p, uint32_t ip, uint16_t port) {
     sk->retries = 0;
     sk->state = TS_SYN_SENT;
     return TCP_EINPROGRESS;
+}
+
+int tcp_connect(void *p, uint32_t ip, uint16_t port) {
+    return tcp_connect_af(p, ip, 0, port, NET_AF_INET4);
+}
+
+int tcp_connect6(void *p, const uint8_t *ip6, uint16_t port) {
+    return tcp_connect_af(p, 0, ip6, port, NET_AF_INET6);
 }
 
 void *tcp_accept(void *p, uint32_t *ip, uint16_t *port) {
@@ -627,6 +687,17 @@ int tcp_peer(void *p, uint32_t *ip, uint16_t *port) {
     return 0;
 }
 
+int tcp_peer6(void *p, uint8_t *ip6, uint16_t *port) {
+    struct tcpsk *sk = p;
+    if (!sk || !sk->used)
+        return -1;
+    if (ip6)
+        memcpy(ip6, sk->peer6, 16);
+    if (port)
+        *port = sk->rport;
+    return 0;
+}
+
 int tcp_so_error(void *p) {
     struct tcpsk *sk = p;
     if (!sk || !sk->used)
@@ -647,6 +718,16 @@ int tcp_info(void *p, struct tcp_info_k *out) {
     out->mss = TCP_MSS;
     out->rto = TCP_RTO;
     return 0;
+}
+
+void tcp_input(const uint8_t *seg, uint16_t len,
+               uint32_t src, uint32_t dst) {
+    tcp_input_af(seg, len, src, dst, 0, 0);
+}
+
+void tcp_input6(const uint8_t *seg, uint16_t len,
+                const uint8_t *src6, const uint8_t *dst6) {
+    tcp_input_af(seg, len, 0, 0, src6, dst6);
 }
 
 void tcp_poll(void) {

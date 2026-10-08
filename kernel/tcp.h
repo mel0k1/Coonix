@@ -54,6 +54,7 @@ void tcp_destroy(void *p);             // close + release resources
 int tcp_bind(void *p, uint16_t port);
 int tcp_listen(void *p, int backlog);
 int tcp_connect(void *p, uint32_t ip, uint16_t port);
+int tcp_connect6(void *p, const uint8_t *ip6, uint16_t port);
 // returns an established child, fills peer, 0 = none pending yet
 void *tcp_accept(void *p, uint32_t *ip, uint16_t *port);
 // returns bytes buffered (0 = full), < 0 = errno
@@ -61,6 +62,7 @@ long tcp_send(void *p, const void *buf, uint16_t len);
 // returns bytes copied, 0 = eof, -EAGAIN = no data, < 0 = errno
 long tcp_recv(void *p, void *buf, uint16_t len);
 int tcp_peer(void *p, uint32_t *ip, uint16_t *port);
+int tcp_peer6(void *p, uint8_t *ip6, uint16_t *port);
 // pending error, read-and-clear (0 = none)
 int tcp_so_error(void *p);
 // snapshot for getsockopt(TCP_INFO), 0 ok
@@ -69,5 +71,8 @@ int tcp_info(void *p, struct tcp_info_k *out);
 // ingress: one tcp segment (ip header stripped), host-order addrs
 void tcp_input(const uint8_t *seg, uint16_t len,
                uint32_t src, uint32_t dst);
+// ingress: one ipv6 tcp segment; src6/dst6 big endian as on the wire
+void tcp_input6(const uint8_t *seg, uint16_t len,
+                const uint8_t *src6, const uint8_t *dst6);
 // tick hook: retransmits, handshake timers, time_wait expiry
 void tcp_poll(void);

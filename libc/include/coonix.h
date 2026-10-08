@@ -384,6 +384,55 @@ static inline long recv(int fd, void *buf, unsigned long len) {
     return recvfrom(fd, buf, len, 0);
 }
 
+// --- ipv6 ---
+
+#define AF_INET6       10
+#define IPPROTO_ICMPV6 58
+
+struct sockaddr_in6 {
+    unsigned short sin6_family;   // AF_INET6
+    unsigned short sin6_port;     // network byte order
+    unsigned int   sin6_flowinfo;
+    unsigned char  sin6_addr[16]; // network byte order
+    unsigned int   sin6_scope_id;
+};
+
+static inline long sendto6(int fd, const void *buf, unsigned long len,
+                           const struct sockaddr_in6 *to) {
+    register long _d __asm__("r10") = (long)to;
+    long ret;
+    __asm__ volatile("int $0x80"
+                     : "=a"(ret)
+                     : "a"((long)44), "D"((long)fd), "S"((long)buf),
+                       "d"((long)len), "r"(_d)
+                     : "memory");
+    return ret;
+}
+
+static inline long recvfrom6(int fd, void *buf, unsigned long len,
+                             struct sockaddr_in6 *from) {
+    register long _d __asm__("r10") = (long)from;
+    long ret;
+    __asm__ volatile("int $0x80"
+                     : "=a"(ret)
+                     : "a"((long)45), "D"((long)fd), "S"((long)buf),
+                       "d"((long)len), "r"(_d)
+                     : "memory");
+    return ret;
+}
+
+static inline long connect6(int fd, const struct sockaddr_in6 *sa,
+                            unsigned long alen) {
+    (void)alen;
+    return _sys(42, fd, (long)sa, 0);
+}
+
+static inline long bind6(int fd, const struct sockaddr_in6 *sa,
+                         unsigned long alen) {
+    (void)alen;
+    return _sys(49, fd, (long)sa, 0);
+}
+
 // --- scatter-gather socket i/o (linux layout) ---
 
 #define MSG_TRUNC 0x20
