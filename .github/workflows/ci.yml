@@ -10,7 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      # pinned: actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: install toolchain
         run: |
@@ -35,9 +36,16 @@ jobs:
       - name: network stack test
         run: python3 scripts/qnet.py
 
+      - name: tcp loopback test
+        run: python3 scripts/qtcp.py
+
+      - name: dhcp lease test
+        run: python3 scripts/qdhcp.py
+
       - name: upload serial log
         if: always()
-        uses: actions/upload-artifact@v4
+        # pinned: actions/upload-artifact v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: serial-log
           path: /tmp/coonix-ci-serial.log
