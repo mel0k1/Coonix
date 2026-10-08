@@ -1,4 +1,6 @@
 #include "net.h"
+#include "tcp.h"
+#include "dhcp.h"
 #include "sync.h"
 #include "task.h"
 #include "heap.h"
@@ -46,6 +48,7 @@ struct netsock {
     int proto;
     uint16_t port;          // udp: local port; icmp: echo id
     uint16_t seq;
+    void *tcp;              // proto tcp: struct tcpsk
     int rx_head, rx_count;
     struct netpkt ring[NQUEUED];
 };
@@ -106,14 +109,16 @@ static void arp_learn(uint32_t ip, const struct net_mac *mac) {
 // -- wire helpers --------------------------------------------------------
 
 static uint16_t cksum(const void *buf, uint16_t len) {
-    const uint16_t *p = buf;
+    // big-endian words (rfc 1071): wire-compatible with real peers
+    const uint8_t *p = buf;
     uint32_t sum = 0;
     while (len > 1) {
-        sum += *p++;
+        sum += (uint16_t)((p[0] << 8) | p[1]);
+        p += 2;
         len -= 2;
     }
     if (len)
-        sum += *(const uint8_t *)p;
+        sum += p[0];
     while (sum >> 16)
         sum = (sum & 0xffff) + (sum >> 16);
     return (uint16_t)~sum;
@@ -124,24 +129,25 @@ static void *put_mac(void *p, const struct net_mac *m) {
     return (uint8_t *)p + 6;
 }
 
-static uint16_t ip_cksum_with_pseudo(const uint8_t *iphdr,
-                                     const void *payload, uint16_t plen) {
-    // one's complement over pseudo header + payload (udp)
+uint16_t net_pseudo_cksum(uint32_t src, uint32_t dst, uint8_t proto,
+                          const void *payload, uint16_t plen) {
+    // big-endian words (rfc 1071); 0 on receive = valid checksum
     uint32_t sum = 0;
-    sum += (iphdr[12] << 8) | iphdr[13];
-    sum += (iphdr[14] << 8) | iphdr[15];
-    sum += (iphdr[16] << 8) | iphdr[17];
-    sum += (iphdr[18] << 8) | iphdr[19];
-    sum += NET_PROTO_UDP;
+    sum += (src >> 16) & 0xffff;
+    sum += src & 0xffff;
+    sum += (dst >> 16) & 0xffff;
+    sum += dst & 0xffff;
+    sum += proto;
     sum += plen;
-    const uint16_t *p = payload;
+    const uint8_t *p = payload;
     uint16_t n = plen;
     while (n > 1) {
-        sum += *p++;
+        sum += (uint16_t)((p[0] << 8) | p[1]);
+        p += 2;
         n -= 2;
     }
     if (n)
-        sum += *(const uint8_t *)p;
+        sum += p[0];
     while (sum >> 16)
         sum = (sum & 0xffff) + (sum >> 16);
     return (uint16_t)~sum;
@@ -151,11 +157,19 @@ static uint16_t ip_cksum_with_pseudo(const uint8_t *iphdr,
 
 static void ip_output(const uint8_t *payload, uint16_t plen,
                       uint8_t proto, uint32_t dst) {
+    net_ip_output(payload, plen, proto, dst);
+}
+
+void net_ip_output(const void *payload, uint16_t plen,
+                   uint8_t proto, uint32_t dst) {
     // one buffer: ip header + payload (the loopback hands the whole
     // packet straight back to net_input)
     uint8_t pkt[NET_IP_LEN + NET_MTU];
     if (plen > NET_MTU)
         return;
+    // loopback traffic carries the loopback address as source, so a
+    // socket talking to 127.0.0.1 sees replies from its own peer ip
+    uint32_t src = (dst == 0x7f000001) ? 0x7f000001 : net_local_ip;
     uint8_t *ip = pkt;
     ip[0] = 0x45;                    // v4, ihl 5
     ip[1] = 0;                       // tos
@@ -166,10 +180,10 @@ static void ip_output(const uint8_t *payload, uint16_t plen,
     ip[8] = 64;                      // ttl
     ip[9] = proto;
     ip[10] = ip[11] = 0;             // checksum
-    ip[12] = (uint8_t)(net_local_ip >> 24);
-    ip[13] = (uint8_t)(net_local_ip >> 16);
-    ip[14] = (uint8_t)(net_local_ip >> 8);
-    ip[15] = (uint8_t)net_local_ip;
+    ip[12] = (uint8_t)(src >> 24);
+    ip[13] = (uint8_t)(src >> 16);
+    ip[14] = (uint8_t)(src >> 8);
+    ip[15] = (uint8_t)src;
     ip[16] = (uint8_t)(dst >> 24);
     ip[17] = (uint8_t)(dst >> 16);
     ip[18] = (uint8_t)(dst >> 8);
@@ -179,15 +193,17 @@ static void ip_output(const uint8_t *payload, uint16_t plen,
     ip[10] = (uint8_t)(sum >> 8);
     ip[11] = (uint8_t)sum;
 
-    if (proto == NET_PROTO_UDP) {
-        // udp checksum over pseudo header (patched into our copy)
+    if (proto == NET_PROTO_UDP || proto == NET_PROTO_TCP) {
+        // checksum over the pseudo header (patched into our copy);
+        // udp keeps it at offset 6, tcp at 16
         uint8_t *u = pkt + NET_IP_LEN;
-        u[6] = u[7] = 0;
-        uint16_t c = ip_cksum_with_pseudo(ip, u, plen);
+        uint16_t cks = (proto == NET_PROTO_TCP) ? 16 : 6;
+        u[cks] = u[cks + 1] = 0;
+        uint16_t c = net_pseudo_cksum(src, dst, proto, u, plen);
         if (!c)
             c = 0xffff;
-        u[6] = (uint8_t)(c >> 8);
-        u[7] = (uint8_t)c;
+        u[cks] = (uint8_t)(c >> 8);
+        u[cks + 1] = (uint8_t)c;
     }
 
     net_stack_output(pkt, (uint16_t)(plen + NET_IP_LEN), dst);
@@ -197,11 +213,34 @@ static void ip_output(const uint8_t *payload, uint16_t plen,
 
 static void arp_request(uint32_t ip);
 
+// loopback deliveries are deferred to the tick: a synchronous call
+// back into net_input nests tx+rx frames ~12k deep on the 16k kstack
+#define LO_Q 16
+static uint8_t lo_ring[LO_Q][NET_IP_LEN + NET_MTU];
+static uint16_t lo_len[LO_Q];
+static int lo_head, lo_count;
+
+static void net_lo_deliver(void) {
+    while (lo_count) {
+        uint8_t pkt[NET_IP_LEN + NET_MTU];
+        uint16_t n = lo_len[lo_head];
+        memcpy(pkt, lo_ring[lo_head], n);
+        lo_head = (lo_head + 1) % LO_Q;
+        lo_count--;
+        net_input(pkt, n);       // recursive: depth counter handles it
+    }
+}
+
 void net_stack_output(const void *buf, uint16_t len, uint32_t dst_ip) {
     net_lock_enter();
-    // loopback: short-circuit straight back into the stack
+    // loopback: queue for the tick (net_lo_deliver drains it)
     if (dst_ip == net_local_ip || dst_ip == 0x7f000001) {
-        net_input(buf, len);   // recursive: depth counter handles it
+        if (len <= NET_IP_LEN + NET_MTU && lo_count < LO_Q) {
+            int t = (lo_head + lo_count) % LO_Q;
+            memcpy(lo_ring[t], buf, len);
+            lo_len[t] = (uint16_t)len;
+            lo_count++;
+        }
         return;
     }
     if (!net_nic.send) {
@@ -211,8 +250,13 @@ void net_stack_output(const void *buf, uint16_t len, uint32_t dst_ip) {
 
     uint8_t frame[NET_ETH_LEN + NET_MTU];
     struct net_mac dst_mac;
-    if (!arp_lookup(dst_ip, &dst_mac) &&
-        !arp_lookup(net_gw_ip, &dst_mac)) {
+    static const struct net_mac bcast =
+        {{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}};
+    if (dst_ip == 0xffffffff) {
+        // ip broadcast needs no arp
+        dst_mac = bcast;
+    } else if (!arp_lookup(dst_ip, &dst_mac) &&
+               !arp_lookup(net_gw_ip, &dst_mac)) {
         arp_request(dst_ip);   // ask; the caller retries later
         net_lock_leave();
         return;
@@ -277,18 +321,16 @@ static void icmp_input(const uint8_t *ip, uint16_t iplen, uint32_t src_ip) {
 
 // -- udp -----------------------------------------------------------------
 
-static void udp_input(const uint8_t *ip, uint16_t iplen) {
+static void udp_input(const uint8_t *udp, uint16_t iplen, uint32_t src) {
     if (iplen < NET_UDP_LEN)
         return;
-    uint16_t dport = ((uint16_t)ip[2] << 8) | ip[3];
-    uint16_t sport = ((uint16_t)ip[0] << 8) | ip[1];
-    uint16_t ulen = ((uint16_t)ip[4] << 8) | ip[5];
+    uint16_t dport = ((uint16_t)udp[2] << 8) | udp[3];
+    uint16_t sport = ((uint16_t)udp[0] << 8) | udp[1];
+    uint16_t ulen = ((uint16_t)udp[4] << 8) | udp[5];
     if (ulen < NET_UDP_LEN || iplen < ulen)
         return;
     uint16_t plen = ulen - NET_UDP_LEN;
-    uint32_t src = ((uint32_t)ip[12] << 24) | ((uint32_t)ip[13] << 16) |
-                   ((uint32_t)ip[14] << 8) | ip[15];
-    const uint8_t *payload = ip + NET_UDP_LEN;
+    const uint8_t *payload = udp + NET_UDP_LEN;
     for (int i = 0; i < NSOCKS; i++) {
         struct netsock *sk = &socks[i];
         if (!sk->used || sk->proto != NET_PROTO_UDP || sk->port != dport)
@@ -369,8 +411,18 @@ void net_input(const uint8_t *pkt, uint16_t len) {
                        ((uint32_t)pkt[14] << 8) | pkt[15];
         icmp_input(payload, plen, src);
     }
-    else if (proto == NET_PROTO_UDP)
-        udp_input(payload, plen);
+    else if (proto == NET_PROTO_UDP) {
+        uint32_t src = ((uint32_t)pkt[12] << 24) | ((uint32_t)pkt[13] << 16) |
+                       ((uint32_t)pkt[14] << 8) | pkt[15];
+        udp_input(payload, plen, src);
+    }
+    else if (proto == NET_PROTO_TCP) {
+        uint32_t src = ((uint32_t)pkt[12] << 24) | ((uint32_t)pkt[13] << 16) |
+                       ((uint32_t)pkt[14] << 8) | pkt[15];
+        uint32_t dst = ((uint32_t)pkt[16] << 24) | ((uint32_t)pkt[17] << 16) |
+                       ((uint32_t)pkt[18] << 8) | pkt[19];
+        tcp_input(payload, plen, src, dst);
+    }
     net_lock_leave();
 }
 
@@ -385,11 +437,17 @@ void net_arp_input(const uint8_t *pkt, uint16_t len) {
 void net_init(void) {
     memset(socks, 0, sizeof(socks));
     net_nic.send = 0;
+    tcp_init();
+}
+
+uint16_t net_next_port(void) {
+    return next_port++;
 }
 
 int net_socket(int proto) {
     net_lock_enter();
-    if (proto != NET_PROTO_UDP && proto != NET_PROTO_ICMP) {
+    if (proto != NET_PROTO_UDP && proto != NET_PROTO_ICMP &&
+        proto != NET_PROTO_TCP) {
         net_lock_leave();
         return -1;
     }
@@ -398,7 +456,16 @@ int net_socket(int proto) {
             memset(&socks[i], 0, sizeof(socks[i]));
             socks[i].used = 1;
             socks[i].proto = proto;
-            socks[i].port = next_port++;
+            if (proto == NET_PROTO_TCP) {
+                socks[i].tcp = tcp_alloc();
+                if (!socks[i].tcp) {
+                    socks[i].used = 0;
+                    net_lock_leave();
+                    return -1;
+                }
+            } else {
+                socks[i].port = next_port++;
+            }
             net_lock_leave();
             return i;
         }
@@ -409,9 +476,73 @@ int net_socket(int proto) {
 
 void net_close(int fd) {
     net_lock_enter();
-    if (fd >= 0 && fd < NSOCKS)
+    if (fd >= 0 && fd < NSOCKS && socks[fd].used) {
+        if (socks[fd].proto == NET_PROTO_TCP && socks[fd].tcp)
+            tcp_destroy(socks[fd].tcp);
+        socks[fd].tcp = 0;
         socks[fd].used = 0;
+    }
     net_lock_leave();
+}
+
+int net_bind(int fd, uint16_t port) {
+    net_lock_enter();
+    int rc = -1;
+    if (fd >= 0 && fd < NSOCKS && socks[fd].used) {
+        if (socks[fd].proto == NET_PROTO_TCP && socks[fd].tcp)
+            rc = tcp_bind(socks[fd].tcp, port);
+        else if (socks[fd].proto == NET_PROTO_UDP) {
+            socks[fd].port = port;
+            rc = 0;
+        }
+    }
+    net_lock_leave();
+    return rc;
+}
+
+int net_listen(int fd, int backlog) {
+    net_lock_enter();
+    int rc = -1;
+    if (fd >= 0 && fd < NSOCKS && socks[fd].used &&
+        socks[fd].proto == NET_PROTO_TCP && socks[fd].tcp)
+        rc = tcp_listen(socks[fd].tcp, backlog);
+    net_lock_leave();
+    return rc;
+}
+
+int net_connect(int fd, uint32_t ip, uint16_t port) {
+    net_lock_enter();
+    int rc = -1;
+    if (fd >= 0 && fd < NSOCKS && socks[fd].used &&
+        socks[fd].proto == NET_PROTO_TCP && socks[fd].tcp)
+        rc = tcp_connect(socks[fd].tcp, ip, port);
+    net_lock_leave();
+    return rc;
+}
+
+long net_accept(int fd, uint32_t *ip, uint16_t *port) {
+    net_lock_enter();
+    long nfd = -1;
+    if (fd >= 0 && fd < NSOCKS && socks[fd].used &&
+        socks[fd].proto == NET_PROTO_TCP && socks[fd].tcp) {
+        void *ch = tcp_accept(socks[fd].tcp, ip, port);
+        if (ch) {
+            // wrap the child in its own socket slot
+            for (int i = 0; i < NSOCKS && nfd < 0; i++) {
+                if (!socks[i].used) {
+                    memset(&socks[i], 0, sizeof(socks[i]));
+                    socks[i].used = 1;
+                    socks[i].proto = NET_PROTO_TCP;
+                    socks[i].tcp = ch;
+                    nfd = i;
+                }
+            }
+            if (nfd < 0)
+                tcp_destroy(ch);   // no slot: drop the child
+        }
+    }
+    net_lock_leave();
+    return nfd;
 }
 
 static void arp_request(uint32_t ip) {
@@ -450,9 +581,17 @@ int net_sendto(int fd, const void *buf, uint16_t len,
     struct netsock *sk = &socks[fd];
     uint8_t pkt[NET_MTU];
     uint16_t plen;
+    if (sk->proto == NET_PROTO_TCP) {
+        // ip/port args are ignored: the stream uses the connected peer
+        long rc = sk->tcp ? tcp_send(sk->tcp, buf, len) : -1;
+        net_lock_leave();
+        return (int)rc;
+    }
     if (sk->proto == NET_PROTO_UDP) {
-        if (len > NET_MTU - NET_UDP_LEN)
+        if (len > NET_MTU - NET_UDP_LEN) {
+            net_lock_leave();
             return -1;
+        }
         pkt[0] = (uint8_t)(sk->port >> 8);    // src port
         pkt[1] = (uint8_t)sk->port;
         pkt[2] = (uint8_t)(port >> 8);        // dst port
@@ -466,8 +605,10 @@ int net_sendto(int fd, const void *buf, uint16_t len,
         return len;
     }
     // icmp ping: echo request, id = port, seq increments
-    if (len > NET_MTU - NET_ICMP_LEN)
+    if (len > NET_MTU - NET_ICMP_LEN) {
+        net_lock_leave();
         return -1;
+    }
     pkt[0] = NET_ICMP_ECHO_REQUEST;
     pkt[1] = 0;
     pkt[2] = pkt[3] = 0;              // checksum (filled below)
@@ -492,6 +633,13 @@ long net_recvfrom(int fd, void *buf, uint16_t len,
     if (fd < 0 || fd >= NSOCKS || !socks[fd].used)
         return -1;
     struct netsock *sk = &socks[fd];
+    if (sk->proto == NET_PROTO_TCP) {
+        long rc = sk->tcp ? tcp_recv(sk->tcp, buf, len) : -1;
+        if (rc >= 0 && sk->tcp)
+            tcp_peer(sk->tcp, src_ip, src_port);
+        net_lock_leave();
+        return rc;
+    }
     if (!sk->rx_count) {
         net_lock_leave();
         return 0;
@@ -513,4 +661,9 @@ void net_poll(void) {
     // the nic driver drains its rx ring here (timer-tick context)
     extern void virtio_net_poll(void);
     virtio_net_poll();
+    net_lock_enter();
+    net_lo_deliver();
+    tcp_poll();
+    dhcp_poll();
+    net_lock_leave();
 }
