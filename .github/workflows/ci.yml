@@ -42,6 +42,15 @@ jobs:
       - name: dhcp lease test
         run: python3 scripts/qdhcp.py
 
+      - name: dup + sendmsg test
+        run: python3 scripts/qmsg.py
+
+      - name: dns resolver test
+        run: python3 scripts/qdns.py
+
+      - name: ipv6 loopback test
+        run: python3 scripts/qip6.py
+
       - name: upload serial log
         if: always()
         # pinned: actions/upload-artifact v4.6.2
