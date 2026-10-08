@@ -46,7 +46,7 @@ int main(void) {
     char buf[128];
     struct sockaddr_in from;
     long n = -1;
-    for (int t = 0; t < 40 && n < 0; t++) {
+    for (int t = 0; t < 40 && n <= 0; t++) {
         msleep(25);
         n = recvfrom((int)fd, buf, sizeof(buf), &from);
     }
@@ -60,7 +60,7 @@ int main(void) {
     mkaddr(&dst, ipaddr(127, 0, 0, 1), 0);
     check("icmp sendto lo", sendto((int)pf, ping, 17, &dst) == 17);
     n = -1;
-    for (int t = 0; t < 40 && n < 0; t++) {
+    for (int t = 0; t < 40 && n <= 0; t++) {
         msleep(25);
         n = recvfrom((int)pf, buf, sizeof(buf), &from);
     }
@@ -69,10 +69,12 @@ int main(void) {
     // --- nic ping (needs working hardware rx; non-fatal) ---
     pf = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
     mkaddr(&dst, ipaddr(10, 0, 2, 2), 0);
-    long sent = sendto((int)pf, ping, 17, &dst);
     n = -1;
-    for (int t = 0; t < 60 && n < 0; t++) {
+    for (int t = 0; t < 60 && n <= 0; t++) {
         msleep(25);
+        // resend: the first frames race the arp resolution
+        if (t % 10 == 0)
+            sendto((int)pf, ping, 17, &dst);
         n = recvfrom((int)pf, buf, sizeof(buf), &from);
     }
     printf("[nettest] nic ping %s\n",
