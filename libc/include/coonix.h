@@ -384,6 +384,35 @@ static inline long recv(int fd, void *buf, unsigned long len) {
     return recvfrom(fd, buf, len, 0);
 }
 
+// --- scatter-gather socket i/o (linux layout) ---
+
+#define MSG_TRUNC 0x20
+
+struct iovec {
+    void *iov_base;
+    unsigned long iov_len;
+};
+
+struct msghdr {
+    void *msg_name;               // optional sockaddr
+    unsigned int msg_namelen;
+    struct iovec *msg_iov;
+    unsigned long msg_iovlen;
+    void *msg_control;
+    unsigned long msg_controllen;
+    int msg_flags;
+};
+
+static inline long sendmsg(int fd, const struct msghdr *m, int flags) {
+    (void)flags;
+    return _sys(46, fd, (long)m, 0);
+}
+
+static inline long recvmsg(int fd, struct msghdr *m, int flags) {
+    (void)flags;
+    return _sys(47, fd, (long)m, 0);
+}
+
 struct timespec_k_dup { long tv_sec; long tv_nsec; };
 
 static inline long nanosleep(long sec, long nsec) {

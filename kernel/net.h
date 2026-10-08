@@ -49,6 +49,8 @@ uint16_t net_pseudo_cksum(uint32_t src, uint32_t dst, uint8_t proto,
 
 // fresh ephemeral local port
 uint16_t net_next_port(void);
+// protocol of a socket slot (NET_PROTO_*), -1 = bad fd
+int net_proto(int fd);
 
 // ingress: one ip packet (ethernet header stripped by the nic driver);
 // also serves the loopback short-circuit

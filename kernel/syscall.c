@@ -2656,6 +2656,196 @@ static uint64_t sys_recvfrom(struct regs *r) {
     return (uint64_t)r;
 }
 
+// --- sendmsg/recvmsg: scatter-gather iovecs over the socket layer ---
+
+#define MSG_IOV_MAX  16
+#define MSG_TRUNC    0x20
+
+struct iovec_k {
+    void *iov_base;
+    uint64_t iov_len;
+};
+
+struct msghdr_k {
+    void *msg_name;          // optional sockaddr
+    uint32_t msg_namelen;
+    struct iovec_k *msg_iov;
+    uint64_t msg_iovlen;     // size_t on x86_64
+    void *msg_control;
+    uint64_t msg_controllen;
+    int msg_flags;
+};
+
+// copy the user msghdr + iovec array in; wr = 1 makes iov bases writable
+static int msg_copyin(struct msghdr_k *um, struct msghdr_k *km,
+                      struct iovec_k *iov, int wr) {
+    if (!um || !task_user_range_ok(current, (uint64_t)um, sizeof(*um), 0))
+        return -1;
+    *km = *um;
+    if (km->msg_iovlen > MSG_IOV_MAX)
+        return -1;
+    if (km->msg_iovlen &&
+        !task_user_range_ok(current, (uint64_t)km->msg_iov,
+                            (uint64_t)sizeof(*iov) * km->msg_iovlen, 0))
+        return -1;
+    for (uint64_t i = 0; i < km->msg_iovlen; i++) {
+        iov[i] = km->msg_iov[i];
+        if (!iov[i].iov_len || !iov[i].iov_base)
+            continue;
+        if (!task_user_range_ok(current, (uint64_t)iov[i].iov_base,
+                                iov[i].iov_len, wr))
+            return -1;
+        task_prefault_range(current, (uint64_t)iov[i].iov_base,
+                            iov[i].iov_len);
+    }
+    if (km->msg_name &&
+        !task_user_range_ok(current, (uint64_t)km->msg_name,
+                            sizeof(struct sockaddr_in_k), wr))
+        return -1;
+    return 0;
+}
+
+// fill a user sockaddr from host-order ip/port
+static int sock_put_addr(struct sockaddr_in_k *to, uint32_t ip,
+                         uint16_t port) {
+    if (!to)
+        return 0;
+    if (!task_user_range_ok(current, (uint64_t)to, sizeof(*to), 1))
+        return -1;
+    to->family = 2;
+    to->port = __builtin_bswap16(port);
+    to->addr = __builtin_bswap32(ip);
+    return 0;
+}
+
+static uint64_t sys_sendmsg(struct regs *r) {
+    int fd = (int)r->rdi;
+    struct msghdr_k *um = (struct msghdr_k *)r->rsi;
+    struct msghdr_k m;
+    struct iovec_k iov[MSG_IOV_MAX];
+    if (msg_copyin(um, &m, iov, 0) < 0) {
+        r->rax = (uint64_t)-EFAULT;
+        return (uint64_t)r;
+    }
+    int sfd = sock_slot(fd, 0);
+    if (sfd < 0) {
+        r->rax = (uint64_t)-ENOTSOCK;
+        return (uint64_t)r;
+    }
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    if (m.msg_name) {
+        struct sockaddr_in_k *sa = m.msg_name;
+        if (sa->family != 2) {
+            r->rax = (uint64_t)-EAFNOSUPPORT;
+            return (uint64_t)r;
+        }
+        ip = __builtin_bswap32(sa->addr);
+        port = __builtin_bswap16(sa->port);
+    }
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < m.msg_iovlen; i++)
+        total += iov[i].iov_len;
+    if (total > 0xffff) {
+        r->rax = (uint64_t)-EMSGSIZE;
+        return (uint64_t)r;
+    }
+    static uint8_t kbuf[1500];
+    int proto = net_proto(sfd);
+    if (proto != NET_PROTO_TCP) {
+        // datagram: one send, gather into the bounce buffer
+        if (total > sizeof(kbuf)) {
+            r->rax = (uint64_t)-EMSGSIZE;
+            return (uint64_t)r;
+        }
+        uint64_t off = 0;
+        for (uint64_t i = 0; i < m.msg_iovlen; i++) {
+            if (!iov[i].iov_len)
+                continue;
+            memcpy(kbuf + off, iov[i].iov_base, iov[i].iov_len);
+            off += iov[i].iov_len;
+        }
+        long rc = net_sendto(sfd, kbuf, (uint16_t)total, ip, port);
+        if (rc == -1)                // datagram refused by the stack
+            rc = -EMSGSIZE;
+        r->rax = (uint64_t)rc;
+        return (uint64_t)r;
+    }
+    // stream: feed the iovecs in chunks, report what moved
+    long sent = 0;
+    uint64_t off_i = 0, off_b = 0;
+    while (sent < (long)total) {
+        while (off_i < m.msg_iovlen && off_b >= iov[off_i].iov_len) {
+            off_i++;
+            off_b = 0;
+        }
+        if (off_i >= m.msg_iovlen)
+            break;
+        uint64_t n = iov[off_i].iov_len - off_b;
+        if (n > sizeof(kbuf))
+            n = sizeof(kbuf);
+        memcpy(kbuf, (const uint8_t *)iov[off_i].iov_base + off_b, n);
+        long rc = net_sendto(sfd, kbuf, (uint16_t)n, ip, port);
+        if (rc < 0) {
+            if (!sent)
+                sent = rc;
+            break;
+        }
+        if (rc == 0)
+            break;               // sndbuf full, report what moved
+        sent += rc;
+        off_b += (uint64_t)rc;
+    }
+    r->rax = (uint64_t)sent;
+    return (uint64_t)r;
+}
+
+static uint64_t sys_recvmsg(struct regs *r) {
+    int fd = (int)r->rdi;
+    struct msghdr_k *um = (struct msghdr_k *)r->rsi;
+    struct msghdr_k m;
+    struct iovec_k iov[MSG_IOV_MAX];
+    if (msg_copyin(um, &m, iov, 1) < 0) {
+        r->rax = (uint64_t)-EFAULT;
+        return (uint64_t)r;
+    }
+    int sfd = sock_slot(fd, 0);
+    if (sfd < 0) {
+        r->rax = (uint64_t)-ENOTSOCK;
+        return (uint64_t)r;
+    }
+    static uint8_t kbuf[1500];
+    uint32_t sip = 0;
+    uint16_t sport = 0;
+    long total = 0;
+    // one datagram per call: bounce then scatter (excess discarded)
+    long n = net_recvfrom(sfd, kbuf, sizeof(kbuf), &sip, &sport);
+    if (n > 0) {
+        uint64_t left = (uint64_t)n;
+        for (uint64_t i = 0; i < m.msg_iovlen && left; i++) {
+            uint64_t c = iov[i].iov_len < left ? iov[i].iov_len : left;
+            memcpy(iov[i].iov_base, kbuf + (uint64_t)n - left, c);
+            left -= c;
+            total += (long)c;
+        }
+        m.msg_flags = left ? MSG_TRUNC : 0;
+    } else {
+        m.msg_flags = 0;
+        total = n;               // 0 = nothing queued, < 0 = errno
+    }
+    if (m.msg_name && sock_put_addr(m.msg_name, sip, sport) < 0) {
+        r->rax = (uint64_t)-EFAULT;
+        return (uint64_t)r;
+    }
+    m.msg_namelen = m.msg_name ? (uint32_t)sizeof(struct sockaddr_in_k) : 0;
+    if (task_user_range_ok(current, (uint64_t)um, sizeof(*um), 1)) {
+        um->msg_namelen = m.msg_namelen;
+        um->msg_flags = m.msg_flags;
+    }
+    r->rax = (uint64_t)total;
+    return (uint64_t)r;
+}
+
 static uint64_t sys_bind(struct regs *r) {
     int fd = (int)r->rdi;
     struct sockaddr_in_k *sa = (struct sockaddr_in_k *)r->rsi;
@@ -2936,6 +3126,8 @@ uint64_t syscall_dispatch(struct regs *r) {
     case 43 /* accept */:    fr = sys_accept(r); break;
     case 44 /* sendto */:    fr = sys_sendto(r); break;
     case 45 /* recvfrom */:  fr = sys_recvfrom(r); break;
+    case 46 /* sendmsg */:   fr = sys_sendmsg(r); break;
+    case 47 /* recvmsg */:   fr = sys_recvmsg(r); break;
     case 49 /* bind */:      fr = sys_bind(r); break;
     case 50 /* listen */:    fr = sys_listen(r); break;
     default:

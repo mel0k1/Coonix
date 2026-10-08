@@ -447,6 +447,16 @@ uint16_t net_next_port(void) {
     return next_port++;
 }
 
+// protocol of a socket slot, -1 = bad fd
+int net_proto(int fd) {
+    net_lock_enter();
+    int p = -1;
+    if (fd >= 0 && fd < NSOCKS && socks[fd].used)
+        p = socks[fd].proto;
+    net_lock_leave();
+    return p;
+}
+
 int net_socket(int proto) {
     net_lock_enter();
     if (proto != NET_PROTO_UDP && proto != NET_PROTO_ICMP &&

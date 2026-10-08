@@ -25,7 +25,7 @@ KSRC  := $(wildcard kernel/*.c)
 KASM  := $(wildcard kernel/*.asm)
 KOBJ  := $(KSRC:%.c=$(BUILD)/%.o) $(KASM:%.asm=$(BUILD)/%.o)
 
-USERS := shell hello forktest mtest fstest dtest fsx ps nicetest dpagetest nettest tcptest
+USERS := shell hello forktest mtest fstest dtest fsx ps nicetest dpagetest nettest tcptest msgtest
 ULIBC := $(BUILD)/libc/string.o $(BUILD)/libc/stdio.o
 UELF  := $(USERS:%=$(BUILD)/user/%.elf)
 
